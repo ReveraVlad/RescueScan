@@ -141,6 +141,7 @@ namespace RescueScan
         CheckBox chkTop, chkWatch;
         Button btnQuar, btnWho, btnQuarFile;
         string quarDir = "";
+        ListView lvRepair; CheckBox chkGuard; bool guarding = false; Thread guardThread;
 
         public MainForm()
         {
@@ -152,7 +153,8 @@ namespace RescueScan
             TabPage tp1 = new TabPage("Автозагрузка");
             TabPage tp2 = new TabPage("Диспетчер задач");
             TabPage tp3 = new TabPage("Проводник");
-            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3);
+            TabPage tp4 = new TabPage("Ремонт");
+            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tp4);
             Controls.Add(tabs);
 
             // ---- TAB 1: autoruns scanner ----
@@ -223,6 +225,24 @@ namespace RescueScan
             lvFiles.DoubleClick += delegate { OpenSelected(); };
             txtPath.KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Enter) { Nav(txtPath.Text); e.SuppressKeyPress = true; } };
 
+            // ---- TAB 4: repair (restore Shell/Userinit/cmd/AppInit to default or custom) ----
+            Panel rbar = new Panel(); rbar.Dock = DockStyle.Top; rbar.Height = 36;
+            Button rref = new Button(); rref.Text = "Обновить"; rref.Left = 8; rref.Top = 6; rref.Width = 90;
+            Button rdef = new Button(); rdef.Text = "→ Дефолт"; rdef.Left = 102; rdef.Top = 6; rdef.Width = 100;
+            Button rcus = new Button(); rcus.Text = "→ Своё…"; rcus.Left = 206; rcus.Top = 6; rcus.Width = 100;
+            chkGuard = new CheckBox(); chkGuard.Text = "Стеречь Winlogon (live: вернуть дефолт при подмене)"; chkGuard.Left = 320; chkGuard.Top = 9; chkGuard.Width = 380;
+            rbar.Controls.Add(rref); rbar.Controls.Add(rdef); rbar.Controls.Add(rcus); rbar.Controls.Add(chkGuard);
+            lvRepair = new ListView(); lvRepair.Dock = DockStyle.Fill; lvRepair.View = View.Details; lvRepair.FullRowSelect = true; lvRepair.GridLines = true; lvRepair.MultiSelect = true;
+            lvRepair.Columns.Add("Якорь", 200); lvRepair.Columns.Add("Текущее значение (offline)", 440); lvRepair.Columns.Add("Дефолт", 320);
+            Panel rbot = new Panel(); rbot.Dock = DockStyle.Bottom; rbot.Height = 30;
+            Label rlbl = new Label(); rlbl.Left = 8; rlbl.Top = 7; rlbl.Width = 1000; rlbl.Text = "Красным — значение отличается от дефолта (возможная подмена). Правит офлайн-куст (нужен «Сканировать»). Guard работает на ЖИВОЙ ОС.";
+            rbot.Controls.Add(rlbl);
+            tp4.Controls.Add(lvRepair); tp4.Controls.Add(rbar); tp4.Controls.Add(rbot);
+            rref.Click += delegate { RepairRefresh(); };
+            rdef.Click += delegate { RepairSet(false); };
+            rcus.Click += delegate { RepairSet(true); };
+            chkGuard.CheckedChanged += delegate { GuardToggle(); };
+
             // wiring tab1
             btnDetect.Click += delegate { Detect(); };
             btnScan.Click += delegate { Scan(); };
@@ -232,7 +252,7 @@ namespace RescueScan
             btnDelete.Click += delegate { DeleteChecked(); };
             btnExport.Click += delegate { Export(); };
             this.TopMost = true;
-            this.FormClosing += delegate { stopping = true; StopWatchdog(); UnloadAll(); };
+            this.FormClosing += delegate { stopping = true; guarding = false; StopWatchdog(); UnloadAll(); };
             this.Shown += delegate { Detect(); RefreshProcs(); ShowDrives(); };
         }
 
@@ -650,6 +670,7 @@ namespace RescueScan
             Cursor.Current = Cursors.Default;
             int susp = 0; foreach (Finding x in f) if (x.Risk == "SUSPECT") susp++;
             lblStatus.Text = "Записей: " + f.Count + "   подозрительных: " + susp + "   (ControlSet: " + ccs + ")";
+            RepairRefresh();
         }
 
         void AddValues(List<Finding> f, string cat, string key)
@@ -1049,6 +1070,116 @@ namespace RescueScan
             if (lastFindings.Count == 0) { MessageBox.Show("Сначала выполни «Сканировать» на вкладке Автозагрузка."); return; }
             if (hits.Count == 0) { MessageBox.Show("Ссылок на этот файл в автозагрузке не найдено:\r\n" + full, "Кто ссылается"); return; }
             MessageBox.Show("Файл: " + full + "\r\n\r\nНайден в точках автозапуска (" + hits.Count + "):\r\n\r\n" + string.Join("\r\n\r\n", hits.ToArray()), "Кто ссылается на файл");
+        }
+
+        // ================= REPAIR (Shell/Userinit/cmd/AppInit -> default or custom) =================
+        // {name, subkey(under hive), valueName, default, "1"=delete-for-default}
+        static string[][] Anchors()
+        {
+            return new string[][] {
+                new string[]{ "Winlogon Shell",    "Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "Shell",    "explorer.exe", "0" },
+                new string[]{ "Winlogon Userinit", "Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "Userinit", "C:\\Windows\\system32\\userinit.exe,", "0" },
+                new string[]{ "Winlogon Taskman",  "Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "Taskman",  "", "1" },
+                new string[]{ "AppInit_DLLs",      "Microsoft\\Windows NT\\CurrentVersion\\Windows",  "AppInit_DLLs", "", "0" },
+                new string[]{ "cmd AutoRun",       "Microsoft\\Command Processor",                    "AutoRun",  "", "1" },
+            };
+        }
+
+        void RepairRefresh()
+        {
+            lvRepair.Items.Clear();
+            bool ok = mounted.Contains("RS_SOFT");
+            foreach (string[] a in Anchors())
+            {
+                string cur = "(нажми «Сканировать» на вкладке Автозагрузка)";
+                if (ok)
+                {
+                    cur = "(нет значения)";
+                    foreach (string[] v in Reg.Values("HKLM\\RS_SOFT\\" + a[1]))
+                        if (v[0].Equals(a[2], StringComparison.OrdinalIgnoreCase)) cur = v[1];
+                }
+                string def = a[4] == "1" ? "(удалить значение)" : (a[3].Length == 0 ? "(пусто)" : a[3]);
+                ListViewItem it = new ListViewItem(new string[] { a[0], cur, def });
+                it.Tag = a;
+                if (ok)
+                {
+                    bool good = a[4] == "1" ? (cur == "(нет значения)") : string.Equals(cur.Trim(), a[3], StringComparison.OrdinalIgnoreCase);
+                    if (!good) it.BackColor = Color.FromArgb(255, 220, 220);
+                }
+                lvRepair.Items.Add(it);
+            }
+        }
+
+        void RepairSet(bool custom)
+        {
+            if (!mounted.Contains("RS_SOFT")) { MessageBox.Show("Сначала «Сканировать» на вкладке Автозагрузка (нужен смонтированный куст)."); return; }
+            if (lvRepair.SelectedItems.Count == 0) { MessageBox.Show("Выбери строку."); return; }
+            foreach (ListViewItem it in lvRepair.SelectedItems)
+            {
+                string[] a = (string[])it.Tag;
+                string key = "HKLM\\RS_SOFT\\" + a[1]; string o;
+                if (custom)
+                {
+                    string val = Prompt("Своё значение для «" + a[0] + "»", a[3]);
+                    if (val == null) continue;
+                    Reg.RunCode("add \"" + key + "\" /v \"" + a[2] + "\" /t REG_SZ /d \"" + val + "\" /f", out o);
+                }
+                else
+                {
+                    if (a[4] == "1") Reg.RunCode("delete \"" + key + "\" /v \"" + a[2] + "\" /f", out o);
+                    else Reg.RunCode("add \"" + key + "\" /v \"" + a[2] + "\" /t REG_SZ /d \"" + a[3] + "\" /f", out o);
+                }
+            }
+            RepairRefresh();
+            lblStatus.Text = "Ремонт применён к офлайн-кусту.";
+        }
+
+        static string Prompt(string title, string def)
+        {
+            Form f = new Form(); f.Text = title; f.Width = 540; f.Height = 150;
+            f.StartPosition = FormStartPosition.CenterParent; f.FormBorderStyle = FormBorderStyle.FixedDialog;
+            f.MinimizeBox = false; f.MaximizeBox = false;
+            TextBox tb = new TextBox(); tb.Left = 12; tb.Top = 20; tb.Width = 500; tb.Text = def;
+            Button ok = new Button(); ok.Text = "OK"; ok.Left = 336; ok.Top = 60; ok.Width = 80; ok.DialogResult = DialogResult.OK;
+            Button cc = new Button(); cc.Text = "Отмена"; cc.Left = 432; cc.Top = 60; cc.Width = 80; cc.DialogResult = DialogResult.Cancel;
+            f.Controls.Add(tb); f.Controls.Add(ok); f.Controls.Add(cc); f.AcceptButton = ok; f.CancelButton = cc;
+            return f.ShowDialog() == DialogResult.OK ? tb.Text : null;
+        }
+
+        // ---- live guard: keep Winlogon Shell/Userinit at default while running on the infected OS ----
+        void GuardToggle()
+        {
+            if (chkGuard.Checked)
+            {
+                if (guarding) return;
+                guarding = true;
+                guardThread = new Thread(GuardLoop); guardThread.IsBackground = true; guardThread.Start();
+                Watchdog.Log("guard: слежение за Winlogon (live) включено");
+                lblStatus.Text = "Guard включён — Winlogon Shell/Userinit возвращаются к дефолту при подмене. Лог: " + Watchdog.LogPath;
+            }
+            else { guarding = false; Watchdog.Log("guard: слежение выключено"); }
+        }
+
+        void GuardLoop()
+        {
+            string wl = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
+            string[][] want = { new string[] { "Shell", "explorer.exe" },
+                                new string[] { "Userinit", "C:\\Windows\\system32\\userinit.exe," } };
+            while (guarding)
+            {
+                foreach (string[] w in want)
+                {
+                    string cur = null;
+                    foreach (string[] v in Reg.Values(wl))
+                        if (v[0].Equals(w[0], StringComparison.OrdinalIgnoreCase)) cur = v[1];
+                    if (cur != null && !string.Equals(cur.Trim(), w[1], StringComparison.OrdinalIgnoreCase))
+                    {
+                        string o; Reg.RunCode("add \"" + wl + "\" /v " + w[0] + " /t REG_SZ /d \"" + w[1] + "\" /f", out o);
+                        Watchdog.Log("guard: Winlogon " + w[0] + " подменён на '" + cur + "' -> вернул '" + w[1] + "'");
+                    }
+                }
+                for (int i = 0; i < 30 && guarding; i++) Thread.Sleep(100);
+            }
         }
 
         void DeleteChecked()
