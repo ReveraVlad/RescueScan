@@ -144,6 +144,7 @@ namespace RescueScan
         ListView lvRepair; CheckBox chkGuard; bool guarding = false; Thread guardThread;
         ListView lvSimple;
         ListView lvQuar; string quarViewDir = ""; Label lblQuar;
+        ListView lvAcc; Label lblAcc;
         Button btnDefuse;
         CheckBox oScan, oWinlogon, oIFEO, oRestrict, oAssoc, oDefuse, oQuar, oWatch, oShell, oBoot;
         Label lblEasy;
@@ -161,9 +162,10 @@ namespace RescueScan
             TabPage tp3 = new TabPage("Проводник");
             TabPage tpQ = new TabPage("Карантин");
             TabPage tp4 = new TabPage("Ремонт");
+            TabPage tpA = new TabPage("Аккаунты");
             TabPage tpE = new TabPage("Изи-кнопка");
             TabPage tp5 = new TabPage("Справка");
-            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tpS); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tpQ); tabs.TabPages.Add(tp4); tabs.TabPages.Add(tpE); tabs.TabPages.Add(tp5);
+            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tpS); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tpQ); tabs.TabPages.Add(tp4); tabs.TabPages.Add(tpA); tabs.TabPages.Add(tpE); tabs.TabPages.Add(tp5);
             Controls.Add(tabs);
 
             // ---- TAB 1: autoruns scanner ----
@@ -278,14 +280,38 @@ namespace RescueScan
             rbar.Controls.Add(rref); rbar.Controls.Add(rdef); rbar.Controls.Add(rcus); rbar.Controls.Add(chkGuard);
             lvRepair = new ListView(); lvRepair.Dock = DockStyle.Fill; lvRepair.View = View.Details; lvRepair.FullRowSelect = true; lvRepair.GridLines = true; lvRepair.MultiSelect = true;
             lvRepair.Columns.Add("Якорь", 200); lvRepair.Columns.Add("Текущее значение (offline)", 440); lvRepair.Columns.Add("Дефолт", 320);
-            Panel rbot = new Panel(); rbot.Dock = DockStyle.Bottom; rbot.Height = 30;
-            Label rlbl = new Label(); rlbl.Left = 8; rlbl.Top = 7; rlbl.Width = 1000; rlbl.Text = "Красным — значение отличается от дефолта (возможная подмена). Правит офлайн-куст (нужен «Сканировать»). Guard работает на ЖИВОЙ ОС.";
-            rbot.Controls.Add(rlbl);
+            Panel rbot = new Panel(); rbot.Dock = DockStyle.Bottom; rbot.Height = 62;
+            Button bunlock = new Button(); bunlock.Text = "Снять блокировки (политики + IFEO)"; bunlock.Left = 8; bunlock.Top = 6; bunlock.Width = 250;
+            Button bassoc = new Button(); bassoc.Text = "Вернуть ассоциации (.exe/.bat/.lnk)"; bassoc.Left = 262; bassoc.Top = 6; bassoc.Width = 250;
+            Label rlbl = new Label(); rlbl.Left = 8; rlbl.Top = 38; rlbl.Width = 1030; rlbl.Text = "Красным — значение ≠ дефолт (подмена). «Снять блокировки» = убрать DisableTaskMgr/DisableRegistryTools/NoRun + IFEO-дебагеры. Работает офлайн и на живой ОС.";
+            rbot.Controls.Add(bunlock); rbot.Controls.Add(bassoc); rbot.Controls.Add(rlbl);
             tp4.Controls.Add(lvRepair); tp4.Controls.Add(rbar); tp4.Controls.Add(rbot);
             rref.Click += delegate { RepairRefresh(); };
             rdef.Click += delegate { RepairSet(false); };
             rcus.Click += delegate { RepairSet(true); };
             chkGuard.CheckedChanged += delegate { GuardToggle(); };
+            bunlock.Click += delegate { int a = RestoreRestrictions(); int b = ClearIFEODirect(); MessageBox.Show("Снято ограничений политик: " + a + "\r\nСнято IFEO-блокировок: " + b, "Разблокировка"); };
+            bassoc.Click += delegate { int a = RestoreAssoc(); MessageBox.Show("Восстановлено ассоциаций/иконок: " + a, "Ассоциации"); };
+
+            // ---- TAB (accounts): live net user ops ----
+            Panel abar = new Panel(); abar.Dock = DockStyle.Top; abar.Height = 36;
+            Button aref = new Button(); aref.Text = "Обновить"; aref.Left = 8; aref.Top = 6; aref.Width = 90;
+            Button apass = new Button(); apass.Text = "Сменить пароль"; apass.Left = 102; apass.Top = 6; apass.Width = 130;
+            Button aen = new Button(); aen.Text = "Включить/разблок."; aen.Left = 236; aen.Top = 6; aen.Width = 140;
+            Button adel = new Button(); adel.Text = "Удалить юзера"; adel.Left = 380; adel.Top = 6; adel.Width = 120;
+            Button aprof = new Button(); aprof.Text = "Удалить профиль"; aprof.Left = 504; aprof.Top = 6; aprof.Width = 130;
+            abar.Controls.Add(aref); abar.Controls.Add(apass); abar.Controls.Add(aen); abar.Controls.Add(adel); abar.Controls.Add(aprof);
+            lvAcc = new ListView(); lvAcc.Dock = DockStyle.Fill; lvAcc.View = View.Details; lvAcc.FullRowSelect = true; lvAcc.GridLines = true;
+            lvAcc.Columns.Add("Пользователь", 200); lvAcc.Columns.Add("Отключён", 90); lvAcc.Columns.Add("Заблокирован", 110); lvAcc.Columns.Add("SID", 320);
+            Panel abot = new Panel(); abot.Dock = DockStyle.Bottom; abot.Height = 30;
+            lblAcc = new Label(); lblAcc.Left = 8; lblAcc.Top = 7; lblAcc.Width = 1030; lblAcc.Text = "Только ЖИВАЯ ОС (нужна работающая система + WMI). В WinPE не работает — там сброс пароля делай через chntpw / MS DaRT.";
+            abot.Controls.Add(lblAcc);
+            tpA.Controls.Add(lvAcc); tpA.Controls.Add(abar); tpA.Controls.Add(abot);
+            aref.Click += delegate { AccRefresh(); };
+            apass.Click += delegate { AccSetPass(); };
+            aen.Click += delegate { AccEnable(); };
+            adel.Click += delegate { AccDelUser(); };
+            aprof.Click += delegate { AccDelProfile(); };
 
             // ---- TAB (easy): one-button cleanup with toggles ----
             Panel eopt = new Panel(); eopt.Dock = DockStyle.Bottom; eopt.Height = 210;
@@ -333,7 +359,7 @@ namespace RescueScan
             this.TopMost = true;
             this.FormClosing += delegate { stopping = true; guarding = false; StopWatchdog(); UnloadAll(); };
             this.Load += delegate { StartupPick(); };
-            this.Shown += delegate { RefreshProcs(); ShowDrives(); RepairRefresh(); QuarAutoFind(); };
+            this.Shown += delegate { RefreshProcs(); ShowDrives(); RepairRefresh(); QuarAutoFind(); AccRefresh(); };
         }
 
         // ================= STARTUP DISK PICKER =================
@@ -1538,12 +1564,15 @@ namespace RescueScan
             }
         }
 
-        int ClearAllIFEO()
+        // снять все IFEO-Debugger блокировки напрямую (не требует предыдущего скана)
+        int ClearIFEODirect()
         {
             int n = 0; string o;
-            foreach (Finding x in lastFindings)
-                if (x.Category.StartsWith("IFEO"))
-                { Reg.RunCode("delete \"" + (x.DelKey != null ? x.DelKey : x.Location) + "\" /v Debugger /f", out o); n++; }
+            string ifeo = SoftRoot() + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+            foreach (string sk in Reg.Subkeys(ifeo))
+                foreach (string[] v in Reg.Values(sk))
+                    if (v[0].Equals("Debugger", StringComparison.OrdinalIgnoreCase))
+                    { Reg.RunCode("delete \"" + sk + "\" /v Debugger /f", out o); n++; }
             return n;
         }
 
@@ -1623,7 +1652,7 @@ namespace RescueScan
             StringBuilder r = new StringBuilder();
             if (oScan.Checked) { Scan(); r.AppendLine("Скан: записей " + lastFindings.Count); }
             if (oWinlogon.Checked) { RestoreWinlogonDefaults(); r.AppendLine("Winlogon Shell/Userinit -> дефолт"); }
-            if (oIFEO.Checked) { int i = ClearAllIFEO(); r.AppendLine("Снято IFEO-блокировок: " + i); }
+            if (oIFEO.Checked) { int i = ClearIFEODirect(); r.AppendLine("Снято IFEO-блокировок: " + i); }
             if (oRestrict.Checked) { int i = RestoreRestrictions(); r.AppendLine("Снято ограничений политик: " + i); }
             if (oAssoc.Checked) { int i = RestoreAssoc(); r.AppendLine("Ассоциации/иконки восстановлены (" + i + ")"); }
             if (oDefuse.Checked) { int d = 0; foreach (Finding x in lastFindings) if (x.Risk == "SUSPECT" && DefuseOne(x)) d++; r.AppendLine("Обезврежено якорей: " + d); }
@@ -1633,6 +1662,82 @@ namespace RescueScan
             QuarAutoFind();
             Cursor.Current = Cursors.Default;
             MessageBox.Show("Готово:\r\n\r\n" + r.ToString(), "Изи-очистка");
+        }
+
+        // ================= ACCOUNTS (live, net user + WMI) =================
+        void AccRefresh()
+        {
+            lvAcc.Items.Clear();
+            try
+            {
+                System.Management.ManagementObjectSearcher s = new System.Management.ManagementObjectSearcher(
+                    "SELECT Name,Disabled,Lockout,SID FROM Win32_UserAccount WHERE LocalAccount=True");
+                foreach (System.Management.ManagementObject u in s.Get())
+                {
+                    string name = "" + u["Name"];
+                    string dis = (u["Disabled"] != null && (bool)u["Disabled"]) ? "да" : "нет";
+                    string lo = (u["Lockout"] != null && (bool)u["Lockout"]) ? "да" : "нет";
+                    string sid = "" + u["SID"];
+                    ListViewItem it = new ListViewItem(new string[] { name, dis, lo, sid });
+                    if (dis == "да" || lo == "да") it.BackColor = Color.FromArgb(255, 245, 205);
+                    lvAcc.Items.Add(it);
+                }
+                lblAcc.Text = "Локальных аккаунтов: " + lvAcc.Items.Count + " (живая ОС).";
+            }
+            catch (Exception ex) { lblAcc.Text = "WMI недоступен (WinPE или служба выключена): " + ex.Message; }
+        }
+
+        string AccName()
+        {
+            if (lvAcc.SelectedItems.Count == 0) { MessageBox.Show("Выбери пользователя."); return null; }
+            return lvAcc.SelectedItems[0].SubItems[0].Text;
+        }
+
+        void AccSetPass()
+        {
+            string n = AccName(); if (n == null) return;
+            string p = Prompt("Новый пароль для «" + n + "» (пусто = снять пароль)", "");
+            if (p == null) return;
+            string o; int rc = RunProc("net", "user \"" + n + "\" \"" + p + "\"", out o);
+            MessageBox.Show(rc == 0 ? "Пароль изменён для " + n : "Ошибка:\r\n" + o, "Пароль");
+            AccRefresh();
+        }
+
+        void AccEnable()
+        {
+            string n = AccName(); if (n == null) return;
+            string o; int rc = RunProc("net", "user \"" + n + "\" /active:yes", out o);
+            MessageBox.Show(rc == 0 ? "Аккаунт включён/разблокирован: " + n : "Ошибка:\r\n" + o, "Включение");
+            AccRefresh();
+        }
+
+        void AccDelUser()
+        {
+            string n = AccName(); if (n == null) return;
+            if (MessageBox.Show("Удалить пользователя «" + n + "»? (профиль на диске останется)", "Удаление",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            string o; int rc = RunProc("net", "user \"" + n + "\" /delete", out o);
+            MessageBox.Show(rc == 0 ? "Пользователь удалён: " + n : "Ошибка:\r\n" + o, "Удаление");
+            AccRefresh();
+        }
+
+        void AccDelProfile()
+        {
+            if (lvAcc.SelectedItems.Count == 0) { MessageBox.Show("Выбери пользователя."); return; }
+            string n = lvAcc.SelectedItems[0].SubItems[0].Text;
+            string sid = lvAcc.SelectedItems[0].SubItems[3].Text;
+            string pk = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\" + sid;
+            string path = "";
+            foreach (string[] v in Reg.Values(pk))
+                if (v[0].Equals("ProfileImagePath", StringComparison.OrdinalIgnoreCase)) path = Environment.ExpandEnvironmentVariables(v[1]);
+            if (MessageBox.Show("Удалить ПРОФИЛЬ пользователя «" + n + "»?\r\nПапка: " + (path.Length > 0 ? path : "(не найдена)") + "\r\n+ запись ProfileList. Необратимо.",
+                "Удаление профиля", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            string msg = "";
+            try { if (path.Length > 0 && Directory.Exists(path)) { Directory.Delete(path, true); msg += "Папка удалена. "; } }
+            catch (Exception ex) { msg += "Папка: " + ex.Message + " "; }
+            string o; if (Reg.RunCode("delete \"" + pk + "\" /f", out o) == 0) msg += "ProfileList очищен.";
+            MessageBox.Show(msg, "Профиль");
+            AccRefresh();
         }
 
         void DeleteChecked(ListView target)
