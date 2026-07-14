@@ -144,6 +144,9 @@ namespace RescueScan
         ListView lvRepair; CheckBox chkGuard; bool guarding = false; Thread guardThread;
         ListView lvSimple;
         ListView lvQuar; string quarViewDir = ""; Label lblQuar;
+        Button btnDefuse;
+        CheckBox oScan, oWinlogon, oIFEO, oRestrict, oAssoc, oDefuse, oQuar, oWatch, oShell, oBoot;
+        Label lblEasy;
 
         public MainForm()
         {
@@ -158,8 +161,9 @@ namespace RescueScan
             TabPage tp3 = new TabPage("Проводник");
             TabPage tpQ = new TabPage("Карантин");
             TabPage tp4 = new TabPage("Ремонт");
+            TabPage tpE = new TabPage("Изи-кнопка");
             TabPage tp5 = new TabPage("Справка");
-            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tpS); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tpQ); tabs.TabPages.Add(tp4); tabs.TabPages.Add(tp5);
+            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tpS); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tpQ); tabs.TabPages.Add(tp4); tabs.TabPages.Add(tpE); tabs.TabPages.Add(tp5);
             Controls.Add(tabs);
 
             // ---- TAB 1: autoruns scanner ----
@@ -178,11 +182,12 @@ namespace RescueScan
             lv.Columns.Add("Команда / путь", 380); lv.Columns.Add("Расположение", 250); lv.Columns.Add("Риск", 80);
 
             Panel bot = new Panel(); bot.Dock = DockStyle.Bottom; bot.Height = 40;
-            btnQuar = new Button(); btnQuar.Text = "Карантин отмеч."; btnQuar.Left = 8; btnQuar.Top = 7; btnQuar.Width = 130;
-            btnDelete = new Button(); btnDelete.Text = "Удалить отмеч."; btnDelete.Left = 144; btnDelete.Top = 7; btnDelete.Width = 130;
-            btnExport = new Button(); btnExport.Text = "Экспорт отчёта"; btnExport.Left = 280; btnExport.Top = 7; btnExport.Width = 120;
-            lblStatus = new Label(); lblStatus.Left = 408; lblStatus.Top = 12; lblStatus.Width = 640; lblStatus.Text = "Готово.";
-            bot.Controls.Add(btnQuar); bot.Controls.Add(btnDelete); bot.Controls.Add(btnExport); bot.Controls.Add(lblStatus);
+            btnDefuse = new Button(); btnDefuse.Text = "Обезвредить"; btnDefuse.Left = 8; btnDefuse.Top = 7; btnDefuse.Width = 104;
+            btnQuar = new Button(); btnQuar.Text = "Карантин отм."; btnQuar.Left = 116; btnQuar.Top = 7; btnQuar.Width = 116;
+            btnDelete = new Button(); btnDelete.Text = "Удалить отм."; btnDelete.Left = 236; btnDelete.Top = 7; btnDelete.Width = 110;
+            btnExport = new Button(); btnExport.Text = "Экспорт"; btnExport.Left = 350; btnExport.Top = 7; btnExport.Width = 90;
+            lblStatus = new Label(); lblStatus.Left = 446; lblStatus.Top = 12; lblStatus.Width = 600; lblStatus.Text = "Готово.";
+            bot.Controls.Add(btnDefuse); bot.Controls.Add(btnQuar); bot.Controls.Add(btnDelete); bot.Controls.Add(btnExport); bot.Controls.Add(lblStatus);
             tp1.Controls.Add(lv); tp1.Controls.Add(top); tp1.Controls.Add(bot);
 
             // ---- TAB (simple): user-focused autoruns like Simple Unlocker ----
@@ -222,10 +227,11 @@ namespace RescueScan
             // ---- TAB 3: explorer (shows hidden + system by default, red = suspicious) ----
             Panel ebar = new Panel(); ebar.Dock = DockStyle.Top; ebar.Height = 36;
             Button bup = new Button(); bup.Text = "Вверх"; bup.Left = 8; bup.Top = 6; bup.Width = 70;
-            txtPath = new TextBox(); txtPath.Left = 82; txtPath.Top = 8; txtPath.Width = 610;
-            Button bgo = new Button(); bgo.Text = "Перейти"; bgo.Left = 698; bgo.Top = 6; bgo.Width = 80;
-            Button bref = new Button(); bref.Text = "Обновить"; bref.Left = 782; bref.Top = 6; bref.Width = 90;
-            ebar.Controls.Add(bup); ebar.Controls.Add(txtPath); ebar.Controls.Add(bgo); ebar.Controls.Add(bref);
+            txtPath = new TextBox(); txtPath.Left = 82; txtPath.Top = 8; txtPath.Width = 520;
+            Button bgo = new Button(); bgo.Text = "Перейти"; bgo.Left = 608; bgo.Top = 6; bgo.Width = 78;
+            Button bref = new Button(); bref.Text = "Обновить"; bref.Left = 690; bref.Top = 6; bref.Width = 82;
+            Button brun = new Button(); brun.Text = "Запустить"; brun.Left = 776; brun.Top = 6; brun.Width = 90;
+            ebar.Controls.Add(bup); ebar.Controls.Add(txtPath); ebar.Controls.Add(bgo); ebar.Controls.Add(bref); ebar.Controls.Add(brun);
             lvFiles = new ListView(); lvFiles.Dock = DockStyle.Fill; lvFiles.View = View.Details; lvFiles.FullRowSelect = true; lvFiles.GridLines = true; lvFiles.MultiSelect = true;
             lvFiles.Columns.Add("Имя", 320); lvFiles.Columns.Add("Тип", 70); lvFiles.Columns.Add("Размер", 100); lvFiles.Columns.Add("Атрибуты", 100); lvFiles.Columns.Add("Изменён", 130);
             Panel ebot = new Panel(); ebot.Dock = DockStyle.Bottom; ebot.Height = 36;
@@ -240,6 +246,7 @@ namespace RescueScan
             bup.Click += delegate { NavUp(); };
             bgo.Click += delegate { Nav(txtPath.Text); };
             bref.Click += delegate { Nav(curPath); };
+            brun.Click += delegate { LaunchSelected(); };
             bdel.Click += delegate { DeleteFile(); };
             bren.Click += delegate { RenameSelected(); };
             btnQuarFile.Click += delegate { QuarantineSelectedFiles(); };
@@ -280,6 +287,34 @@ namespace RescueScan
             rcus.Click += delegate { RepairSet(true); };
             chkGuard.CheckedChanged += delegate { GuardToggle(); };
 
+            // ---- TAB (easy): one-button cleanup with toggles ----
+            Panel eopt = new Panel(); eopt.Dock = DockStyle.Bottom; eopt.Height = 210;
+            oScan = EasyChk("Сканировать", 8, 8, true);
+            oWinlogon = EasyChk("Вернуть Winlogon Shell/Userinit в дефолт", 8, 32, true);
+            oIFEO = EasyChk("Снять IFEO-блокировки (разблокировать Диспетчер/regedit)", 8, 56, true);
+            oRestrict = EasyChk("Вернуть дефолт: ограничения политик (DisableTaskMgr и т.п.)", 8, 80, true);
+            oAssoc = EasyChk("Вернуть дефолт: ассоциации .exe/.bat/.lnk + иконки", 8, 104, true);
+            oDefuse = EasyChk("Обезвредить якоря (службы Start=4, IFEO) перед удалением", 8, 128, true);
+            oQuar = EasyChk("Подозрительное -> в Карантин (с бэкапом, не удалять насовсем)", 8, 152, true);
+            oWatch = EasyChk("Включить Watchdog (самолечение окна)", 8, 176, false);
+            oShell = EasyChk("Запуск вместо Explorer  (после одобрения CVP)", 520, 128, false); oShell.Enabled = false;
+            oBoot = EasyChk("Запуск до Windows + пре-бут скан  (после одобрения CVP)", 520, 152, false); oBoot.Enabled = false;
+            eopt.Controls.Add(oScan); eopt.Controls.Add(oWinlogon); eopt.Controls.Add(oIFEO); eopt.Controls.Add(oRestrict);
+            eopt.Controls.Add(oAssoc); eopt.Controls.Add(oDefuse); eopt.Controls.Add(oQuar); eopt.Controls.Add(oWatch);
+            eopt.Controls.Add(oShell); eopt.Controls.Add(oBoot);
+            Panel ecent = new Panel(); ecent.Dock = DockStyle.Fill;
+            Button big = new Button(); big.Text = "ОЧИСТИТЬ\r\n(EASY)"; big.Font = new Font("Segoe UI", 15f, FontStyle.Bold);
+            big.Width = 300; big.Height = 110; big.BackColor = Color.FromArgb(70, 160, 90); big.ForeColor = Color.White;
+            lblEasy = new Label(); lblEasy.AutoSize = false; lblEasy.Width = 600; lblEasy.Height = 40; lblEasy.TextAlign = ContentAlignment.MiddleCenter;
+            lblEasy.Text = "Одна кнопка: скан -> вернуть дефолты -> обезвредить -> карантин (по тумблерам ниже).";
+            ecent.Controls.Add(big); ecent.Controls.Add(lblEasy);
+            ecent.Resize += delegate {
+                big.Left = (ecent.Width - big.Width) / 2; big.Top = (ecent.Height - big.Height) / 2 - 10;
+                lblEasy.Left = (ecent.Width - lblEasy.Width) / 2; lblEasy.Top = big.Top + big.Height + 12;
+            };
+            tpE.Controls.Add(ecent); tpE.Controls.Add(eopt);
+            big.Click += delegate { DoEasy(); };
+
             // ---- TAB 5: help ----
             TextBox help = new TextBox(); help.Dock = DockStyle.Fill; help.Multiline = true; help.ReadOnly = true;
             help.ScrollBars = ScrollBars.Vertical; help.BackColor = Color.White; help.Font = new Font("Segoe UI", 9f);
@@ -291,6 +326,7 @@ namespace RescueScan
             btnScan.Click += delegate { Scan(); };
             btnMark.Click += delegate { MarkSuspect(lv); };
             btnPreboot.Click += delegate { PrebootScan(); };
+            btnDefuse.Click += delegate { DefuseChecked(lv); };
             btnQuar.Click += delegate { QuarantineChecked(lv); };
             btnDelete.Click += delegate { DeleteChecked(lv); };
             btnExport.Click += delegate { Export(); };
@@ -1421,6 +1457,182 @@ namespace RescueScan
                 }
                 for (int i = 0; i < 30 && guarding; i++) Thread.Sleep(100);
             }
+        }
+
+        static CheckBox EasyChk(string text, int left, int top, bool chk)
+        {
+            CheckBox c = new CheckBox(); c.Text = text; c.Left = left; c.Top = top; c.Width = 500; c.Checked = chk;
+            return c;
+        }
+
+        void LaunchSelected()
+        {
+            if (lvFiles.SelectedItems.Count != 1) { MessageBox.Show("Выбери один файл."); return; }
+            string tag = (string)lvFiles.SelectedItems[0].Tag;
+            if (!tag.StartsWith("F|")) { MessageBox.Show("Это папка — выбери файл (напр. cmd.exe, regedit.exe)."); return; }
+            string p = tag.Substring(2);
+            if (MessageBox.Show("Запустить файл?\r\n" + p + "\r\n\r\nЗапускай только доверенные программы (cmd, regedit, свои тулзы).", "Запуск",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            try { Process.Start(p); lblFiles.Text = "Запущено: " + Path.GetFileName(p); }
+            catch (Exception ex) { MessageBox.Show(ex.Message); }
+        }
+
+        // ================= DEFUSE (снять критичность/привязки перед удалением) =================
+        static string ServiceKeyOf(string k)
+        {
+            if (k == null) return k;
+            int i = k.IndexOf("\\Services\\", StringComparison.OrdinalIgnoreCase);
+            if (i < 0) return k;
+            int j = k.IndexOf('\\', i + 10);
+            return j > 0 ? k.Substring(0, j) : k;
+        }
+
+        bool DefuseOne(Finding x)
+        {
+            if (x == null) return false;
+            string c = x.Category; string o;
+            if (c.StartsWith("Service") || c.StartsWith("svchost"))
+            {
+                string root = ServiceKeyOf(x.DelKey != null ? x.DelKey : x.Location);
+                Reg.RunCode("add \"" + root + "\" /v Start /t REG_DWORD /d 4 /f", out o);
+                Reg.RunCode("add \"" + root + "\" /v ErrorControl /t REG_DWORD /d 1 /f", out o);
+                return true;
+            }
+            if (c.StartsWith("IFEO"))
+            {
+                Reg.RunCode("delete \"" + (x.DelKey != null ? x.DelKey : x.Location) + "\" /v Debugger /f", out o);
+                return true;
+            }
+            if (c.StartsWith("Winlogon Shell"))
+            {
+                Reg.RunCode("add \"" + x.DelKey + "\" /v Shell /t REG_SZ /d \"explorer.exe\" /f", out o); return true;
+            }
+            if (c.StartsWith("Winlogon Userinit"))
+            {
+                Reg.RunCode("add \"" + x.DelKey + "\" /v Userinit /t REG_SZ /d \"C:\\Windows\\system32\\userinit.exe,\" /f", out o); return true;
+            }
+            return false;
+        }
+
+        void DefuseChecked(ListView target)
+        {
+            int done = 0, skip = 0;
+            foreach (ListViewItem it in target.Items)
+            {
+                if (!it.Checked) continue;
+                if (DefuseOne((Finding)it.Tag)) done++; else skip++;
+            }
+            if (done == 0 && skip == 0) { MessageBox.Show("Отметь службы / IFEO / Winlogon, которые обезвредить."); return; }
+            lblStatus.Text = "Обезврежено якорей: " + done + "   (не применимо: " + skip + "). Теперь можно удалять/карантинить файл.";
+        }
+
+        // ================= RESTORE DEFAULTS =================
+        void RestoreWinlogonDefaults()
+        {
+            string root = SoftRoot(); string o;
+            foreach (string[] a in Anchors())
+            {
+                string key = root + "\\" + a[1];
+                if (a[4] == "1") Reg.RunCode("delete \"" + key + "\" /v \"" + a[2] + "\" /f", out o);
+                else Reg.RunCode("add \"" + key + "\" /v \"" + a[2] + "\" /t REG_SZ /d \"" + a[3] + "\" /f", out o);
+            }
+        }
+
+        int ClearAllIFEO()
+        {
+            int n = 0; string o;
+            foreach (Finding x in lastFindings)
+                if (x.Category.StartsWith("IFEO"))
+                { Reg.RunCode("delete \"" + (x.DelKey != null ? x.DelKey : x.Location) + "\" /v Debugger /f", out o); n++; }
+            return n;
+        }
+
+        List<string> PolicyBases()
+        {
+            List<string> b = new List<string>();
+            b.Add(SoftRoot() + "\\Microsoft\\Windows\\CurrentVersion\\Policies");
+            foreach (string m in mounted) if (m.StartsWith("RS_U")) b.Add("HKLM\\" + m + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies");
+            if (!IsOffline()) b.Add("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies");
+            return b;
+        }
+
+        int RestoreRestrictions()
+        {
+            int n = 0; string o;
+            string[] sysVals = { "DisableTaskMgr", "DisableRegistryTools", "DisableCMD", "DisableChangePassword" };
+            string[] expVals = { "NoRun", "NoFolderOptions", "NoControlPanel", "NoDesktop", "NoViewContextMenu", "NoFind", "NoClose", "RestrictRun" };
+            foreach (string b in PolicyBases())
+            {
+                foreach (string v in sysVals) if (Reg.RunCode("delete \"" + b + "\\System\" /v " + v + " /f", out o) == 0) n++;
+                foreach (string v in expVals) if (Reg.RunCode("delete \"" + b + "\\Explorer\" /v " + v + " /f", out o) == 0) n++;
+            }
+            return n;
+        }
+
+        int RestoreAssoc()
+        {
+            int n = 0; string o; string root = SoftRoot() + "\\Classes";
+            string cmd = "\\\"%1\\\" %*";  // -> "%1" %*
+            string[][] map = { new string[]{".exe","exefile"}, new string[]{".com","comfile"}, new string[]{".bat","batfile"}, new string[]{".cmd","cmdfile"} };
+            foreach (string[] m in map)
+            {
+                if (Reg.RunCode("add \"" + root + "\\" + m[0] + "\" /ve /d \"" + m[1] + "\" /f", out o) == 0) n++;
+                if (Reg.RunCode("add \"" + root + "\\" + m[1] + "\\shell\\open\\command\" /ve /d \"" + cmd + "\" /f", out o) == 0) n++;
+            }
+            Reg.RunCode("add \"" + root + "\\.lnk\" /ve /d \"lnkfile\" /f", out o);
+            // иконки: чистим кэш (офлайн — файлы юзеров; живьём — тоже файлы)
+            try
+            {
+                string users = curDrive.Length == 2 ? curDrive + "\\Users" : "C:\\Users";
+                if (Directory.Exists(users))
+                    foreach (string ud in Directory.GetDirectories(users))
+                    {
+                        string ic = ud + "\\AppData\\Local\\IconCache.db";
+                        try { if (File.Exists(ic)) { File.SetAttributes(ic, FileAttributes.Normal); File.Delete(ic); n++; } } catch { }
+                        string exDir = ud + "\\AppData\\Local\\Microsoft\\Windows\\Explorer";
+                        if (Directory.Exists(exDir))
+                            foreach (string cf in Directory.GetFiles(exDir, "iconcache*"))
+                                try { File.SetAttributes(cf, FileAttributes.Normal); File.Delete(cf); n++; } catch { }
+                    }
+            }
+            catch { }
+            return n;
+        }
+
+        void QuarantineSuspectAll(out int ok, out int fail)
+        {
+            ok = 0; fail = 0;
+            foreach (Finding x in new List<Finding>(lastFindings))
+            {
+                if (x.Risk != "SUSPECT") continue;
+                bool r = false; string o;
+                if (x.Kind == 2) r = QuarFile(x.DelPath);
+                else if (x.Kind == 0) { if (QuarReg(x.DelKey)) r = Reg.RunCode("delete \"" + x.DelKey + "\" /v \"" + x.DelName + "\" /f", out o) == 0; }
+                else if (x.Kind == 1) { if (QuarReg(x.DelKey)) r = Reg.RunCode("delete \"" + x.DelKey + "\" /f", out o) == 0; }
+                else continue;
+                if (r) ok++; else fail++;
+            }
+        }
+
+        // ================= EASY BUTTON =================
+        void DoEasy()
+        {
+            if (MessageBox.Show("Запустить авто-очистку по выбранным тумблерам?\r\nПодозрительное уйдёт в Карантин (можно вернуть). Дефолты будут восстановлены.",
+                "Изи-очистка", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            Cursor.Current = Cursors.WaitCursor;
+            StringBuilder r = new StringBuilder();
+            if (oScan.Checked) { Scan(); r.AppendLine("Скан: записей " + lastFindings.Count); }
+            if (oWinlogon.Checked) { RestoreWinlogonDefaults(); r.AppendLine("Winlogon Shell/Userinit -> дефолт"); }
+            if (oIFEO.Checked) { int i = ClearAllIFEO(); r.AppendLine("Снято IFEO-блокировок: " + i); }
+            if (oRestrict.Checked) { int i = RestoreRestrictions(); r.AppendLine("Снято ограничений политик: " + i); }
+            if (oAssoc.Checked) { int i = RestoreAssoc(); r.AppendLine("Ассоциации/иконки восстановлены (" + i + ")"); }
+            if (oDefuse.Checked) { int d = 0; foreach (Finding x in lastFindings) if (x.Risk == "SUSPECT" && DefuseOne(x)) d++; r.AppendLine("Обезврежено якорей: " + d); }
+            if (oQuar.Checked) { int ok, fail; QuarantineSuspectAll(out ok, out fail); r.AppendLine("В карантин: " + ok + "  (ошибок " + fail + ")  -> " + quarDir); }
+            if (oWatch.Checked) { chkWatch.Checked = true; r.AppendLine("Watchdog включён"); }
+            if (oScan.Checked) { Scan(); } // пересканировать, чтобы список отражал результат
+            QuarAutoFind();
+            Cursor.Current = Cursors.Default;
+            MessageBox.Show("Готово:\r\n\r\n" + r.ToString(), "Изи-очистка");
         }
 
         void DeleteChecked(ListView target)
