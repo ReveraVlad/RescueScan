@@ -1,0 +1,11 @@
+# build output (build from source with build.ps1)
+RescueScan.exe
+RS_test.exe
+*.pdb
+*.log
+
+# editor / OS
+.vs/
+*.user
+Thumbs.db
+desktop.ini
