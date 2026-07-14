@@ -302,7 +302,7 @@ namespace RescueScan
             Button aprof = new Button(); aprof.Text = "Удалить профиль"; aprof.Left = 504; aprof.Top = 6; aprof.Width = 130;
             abar.Controls.Add(aref); abar.Controls.Add(apass); abar.Controls.Add(aen); abar.Controls.Add(adel); abar.Controls.Add(aprof);
             lvAcc = new ListView(); lvAcc.Dock = DockStyle.Fill; lvAcc.View = View.Details; lvAcc.FullRowSelect = true; lvAcc.GridLines = true;
-            lvAcc.Columns.Add("Пользователь", 200); lvAcc.Columns.Add("Отключён", 90); lvAcc.Columns.Add("Заблокирован", 110); lvAcc.Columns.Add("SID", 320);
+            lvAcc.Columns.Add("Пользователь", 180); lvAcc.Columns.Add("Отключён", 80); lvAcc.Columns.Add("Заблокирован", 100); lvAcc.Columns.Add("Пароль нужен", 100); lvAcc.Columns.Add("SID", 300);
             Panel abot = new Panel(); abot.Dock = DockStyle.Bottom; abot.Height = 30;
             lblAcc = new Label(); lblAcc.Left = 8; lblAcc.Top = 7; lblAcc.Width = 1030; lblAcc.Text = "Только ЖИВАЯ ОС (нужна работающая система + WMI). В WinPE не работает — там сброс пароля делай через chntpw / MS DaRT.";
             abot.Controls.Add(lblAcc);
@@ -387,35 +387,39 @@ namespace RescueScan
         static string HelpText()
         {
             return
-"RescueScan — защитный инструмент для чистки заражённой Windows.\r\n" +
-"Работает в двух режимах: ОФЛАЙН (загрузился в WinRE/WinPE — цель выключена, вирус не сопротивляется) и ЖИВОЙ (запущен прямо в заражённой ОС от админа).\r\n" +
+"RescueScan — защитный инструмент для чистки заражённой Windows. Написан на C# (.NET Framework 4.x, WinForms).\r\n" +
+"Два режима: ОФЛАЙН (загрузился в WinRE/WinPE, цель выключена — вирус не сопротивляется) и ЖИВОЙ (запущен в заражённой ОС от админа).\r\n" +
+"Требуется .NET Framework 4.x. В WinPE НЕ запустится без компонентов WinPE-WMI + WinPE-NetFx в boot.wim (стоковый WinPE не содержит .NET).\r\n" +
 "\r\n" +
-"ЦВЕТА:\r\n" +
-"  Красный  = SUSPECT, сильный признак вредоноса (temp, -enc/hidden, интерпретатор+загрузка, двойное расширение, exe в drivers).\r\n" +
-"  Жёлтый   = REVIEW, ЛЕГИТИМНОЕ но частое у малвари место (AppData, ProgramData, Downloads, автозагрузка) — просто глянь, не паникуй.\r\n" +
-"  Красный часто = ложные срабатывания на своих программах в AppData. Это норма, смотри путь.\r\n" +
+"ЦВЕТА: Красный = SUSPECT (сильный признак: temp, -enc/hidden, интерпретатор+загрузка, двойное расширение, exe в drivers).\r\n" +
+"       Жёлтый = REVIEW (легит, но частое у малвари место: AppData/ProgramData/Downloads/автозагрузка) — просто глянь.\r\n" +
 "\r\n" +
-"ВКЛАДКА «Автозагрузка»:\r\n" +
-"  1) «Найти ОС» -> «Сканировать». Показывает ВСЕ точки автозапуска (Run/Службы/Задачи/IFEO/Winlogon/ESP...).\r\n" +
-"  2) «Отметить подозрительные» -> проверь галочки глазами.\r\n" +
-"  3) «Карантин отмеч.» (перенос+бэкап, безопасно) ИЛИ «Удалить отмеч.».\r\n" +
-"  ВАЖНО: если файл висит на boot-критичном якоре (служба/Userinit), удаление может убить загрузку.\r\n" +
-"         Сначала почини якорь на вкладке «Ремонт», потом убирай файл.\r\n" +
+"1) АВТОЗАГРУЗКА (полная): «Найти ОС» -> «Сканировать» -> ВСЕ точки автозапуска. Кнопки: Обезвредить / Карантин / Удалить / Экспорт / Pre-boot.\r\n" +
+"   Pre-boot (ESP/BCD): проверяет загрузчик и ESP \\EFI\\ — ловит дисковый буткит («вирус до BIOS»).\r\n" +
+"   ОБЕЗВРЕДИТЬ (defuse): службе -> Start=4/ErrorControl=1, IFEO -> убрать Debugger, Winlogon -> дефолт. Делай ПЕРЕД удалением файла,\r\n" +
+"   иначе удаление boot-критичного бинаря даёт BSOD 0x7B (винда не грузится).\r\n" +
 "\r\n" +
-"ВКЛАДКА «Диспетчер задач»: процессы с путём и риском; «Завершить» и «Завершить дерево».\r\n" +
-"  «Поверх всех окон» — чтобы вирусный интерфейс не перекрывал. «Watchdog» — самовосстановление окна, если вирус его убьёт (лог в temp).\r\n" +
+"2) АВТОЗАПУСК (кратко): только Run/RunOnce/Планировщик/Startup — как «Автозагрузка» в Диспетчере задач Windows.\r\n" +
 "\r\n" +
-"ВКЛАДКА «Проводник»: видит СКРЫТЫЕ и СИСТЕМНЫЕ файлы. Красный = найден сканом.\r\n" +
-"  «Кто ссылается» — из какой точки автозапуска стартует выбранный файл. «Снять скрытие» — убрать атрибуты H/S. «Карантин»/«Удалить».\r\n" +
+"3) ДИСПЕТЧЕР ЗАДАЧ: процессы с путём и риском. Завершить / Завершить дерево. «Поверх всех окон». «Watchdog» — если вирус\r\n" +
+"   закроет RescueScan, напарник его перезапустит и запишет в лог (%TEMP%\\rescuescan.log). По умолчанию выключен.\r\n" +
 "\r\n" +
-"ВКЛАДКА «Ремонт» (как пользоваться):\r\n" +
-"  Список Winlogon Shell/Userinit/AppInit/cmd AutoRun. Красная строка = значение отличается от дефолта (подмена).\r\n" +
-"  ВЫДЕЛИ строку -> «→ Дефолт» (вернуть штатное) или «→ Своё…» (ввести своё значение).\r\n" +
-"  Работает и офлайн (правит смонтированный куст), и на живой ОС (правит HKLM напрямую).\r\n" +
-"  «Стеречь Winlogon» — фоновый страж: если вирус подменит Shell/Userinit, вернёт дефолт (только живая ОС).\r\n" +
+"4) ПРОВОДНИК: видит СКРЫТЫЕ и СИСТЕМНЫЕ файлы (серым/оранжевым). Красный = найден сканом. Кнопки: Запустить (ручной запуск exe,\r\n" +
+"   если сломан шелл), Переименовать, Карантин, Удалить, Снять скрытие (убрать H/S), Кто ссылается (из какой автозагрузки стартует файл).\r\n" +
 "\r\n" +
-"ГРАНИЦЫ: RescueScan чистит уровень ОС + загрузчик/ESP. Имплант в прошивку (BIOS/SPI) НЕ трогает — только перепрошивка.\r\n" +
-"Сброс пароля офлайн (правка SAM) НЕ входит — используй chntpw / MS DaRT. Аккаунт-операции живьём — через net user (пока не встроено).\r\n";
+"5) КАРАНТИН: список из manifest.txt. «Восстановить» — файлы возвращаются на место, ветки реестра импортируются из .reg. «Найти последний»/«Открыть папку…».\r\n" +
+"\r\n" +
+"6) РЕМОНТ: Winlogon Shell/Userinit/AppInit/cmd AutoRun. Красная строка = подмена. ВЫДЕЛИ строку -> «→ Дефолт» или «→ Своё…».\r\n" +
+"   Кнопки: «Снять блокировки (политики+IFEO)» (убрать DisableTaskMgr/DisableRegistryTools/NoRun + дебагеры), «Вернуть ассоциации» (.exe/.bat/.lnk+иконки).\r\n" +
+"   «Стеречь Winlogon» — фоновый страж возвращает дефолт при подмене (живая ОС).\r\n" +
+"\r\n" +
+"7) АККАУНТЫ (только живая ОС + WMI): локальные юзеры. Колонки Отключён/Заблокирован/Пароль нужен (НЕ «есть ли пароль»!).\r\n" +
+"   Сменить пароль / Включить-разблок / Удалить юзера / Удалить профиль. В WinPE не работает — офлайн-сброс пароля делай chntpw / MS DaRT.\r\n" +
+"\r\n" +
+"8) ИЗИ-КНОПКА: одна кнопка по тумблерам: скан -> вернуть Winlogon/IFEO/ограничения/ассоциации+иконки -> обезвредить -> подозрительное в карантин -> watchdog.\r\n" +
+"   Тумблеры «Запуск вместо Explorer» и «Запуск до Windows/пре-бут» ВЫКЛЮЧЕНЫ (shell-hijack + boot-персистентность) — включим после одобрения CVP.\r\n" +
+"\r\n" +
+"ГРАНИЦЫ: чистит уровень ОС + загрузчик/ESP. Имплант в прошивку (BIOS/SPI) НЕ трогает — только перепрошивка. Офлайн-сброс пароля (правка SAM) — chntpw/DaRT.\r\n";
         }
 
         // ================= WATCHDOG control (user-mode) =================
@@ -1671,14 +1675,15 @@ namespace RescueScan
             try
             {
                 System.Management.ManagementObjectSearcher s = new System.Management.ManagementObjectSearcher(
-                    "SELECT Name,Disabled,Lockout,SID FROM Win32_UserAccount WHERE LocalAccount=True");
+                    "SELECT Name,Disabled,Lockout,PasswordRequired,SID FROM Win32_UserAccount WHERE LocalAccount=True");
                 foreach (System.Management.ManagementObject u in s.Get())
                 {
                     string name = "" + u["Name"];
                     string dis = (u["Disabled"] != null && (bool)u["Disabled"]) ? "да" : "нет";
                     string lo = (u["Lockout"] != null && (bool)u["Lockout"]) ? "да" : "нет";
+                    string pw = (u["PasswordRequired"] != null && (bool)u["PasswordRequired"]) ? "да" : "нет";
                     string sid = "" + u["SID"];
-                    ListViewItem it = new ListViewItem(new string[] { name, dis, lo, sid });
+                    ListViewItem it = new ListViewItem(new string[] { name, dis, lo, pw, sid });
                     if (dis == "да" || lo == "да") it.BackColor = Color.FromArgb(255, 245, 205);
                     lvAcc.Items.Add(it);
                 }
@@ -1725,7 +1730,7 @@ namespace RescueScan
         {
             if (lvAcc.SelectedItems.Count == 0) { MessageBox.Show("Выбери пользователя."); return; }
             string n = lvAcc.SelectedItems[0].SubItems[0].Text;
-            string sid = lvAcc.SelectedItems[0].SubItems[3].Text;
+            string sid = lvAcc.SelectedItems[0].SubItems[4].Text;
             string pk = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\" + sid;
             string path = "";
             foreach (string[] v in Reg.Values(pk))
