@@ -142,6 +142,7 @@ namespace RescueScan
         Button btnQuar, btnWho, btnQuarFile;
         string quarDir = "";
         ListView lvRepair; CheckBox chkGuard; bool guarding = false; Thread guardThread;
+        ListView lvSimple;
 
         public MainForm()
         {
@@ -150,12 +151,13 @@ namespace RescueScan
             MinimumSize = new Size(860, 500);
 
             tabs = new TabControl(); tabs.Dock = DockStyle.Fill;
-            TabPage tp1 = new TabPage("Автозагрузка");
+            TabPage tp1 = new TabPage("Автозагрузка (полная)");
+            TabPage tpS = new TabPage("Автозапуск (кратко)");
             TabPage tp2 = new TabPage("Диспетчер задач");
             TabPage tp3 = new TabPage("Проводник");
             TabPage tp4 = new TabPage("Ремонт");
             TabPage tp5 = new TabPage("Справка");
-            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tp4); tabs.TabPages.Add(tp5);
+            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tpS); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tp4); tabs.TabPages.Add(tp5);
             Controls.Add(tabs);
 
             // ---- TAB 1: autoruns scanner ----
@@ -180,6 +182,22 @@ namespace RescueScan
             lblStatus = new Label(); lblStatus.Left = 408; lblStatus.Top = 12; lblStatus.Width = 640; lblStatus.Text = "Готово.";
             bot.Controls.Add(btnQuar); bot.Controls.Add(btnDelete); bot.Controls.Add(btnExport); bot.Controls.Add(lblStatus);
             tp1.Controls.Add(lv); tp1.Controls.Add(top); tp1.Controls.Add(bot);
+
+            // ---- TAB (simple): user-focused autoruns like Simple Unlocker ----
+            Panel sbar = new Panel(); sbar.Dock = DockStyle.Top; sbar.Height = 38;
+            Button sscan = new Button(); sscan.Text = "Сканировать"; sscan.Left = 8; sscan.Top = 7; sscan.Width = 110;
+            Button smark = new Button(); smark.Text = "Отметить подозрит."; smark.Left = 122; smark.Top = 7; smark.Width = 140;
+            Button squar = new Button(); squar.Text = "Карантин"; squar.Left = 266; squar.Top = 7; squar.Width = 100;
+            Button sdel = new Button(); sdel.Text = "Удалить"; sdel.Left = 370; sdel.Top = 7; sdel.Width = 100;
+            Label slbl = new Label(); slbl.Left = 480; slbl.Top = 12; slbl.Width = 560; slbl.Text = "Только Run / RunOnce / Планировщик / Startup (что видит «Автозагрузка» Диспетчера задач).";
+            sbar.Controls.Add(sscan); sbar.Controls.Add(smark); sbar.Controls.Add(squar); sbar.Controls.Add(sdel); sbar.Controls.Add(slbl);
+            lvSimple = new ListView(); lvSimple.Dock = DockStyle.Fill; lvSimple.View = View.Details; lvSimple.CheckBoxes = true; lvSimple.FullRowSelect = true; lvSimple.GridLines = true;
+            lvSimple.Columns.Add("Тип", 170); lvSimple.Columns.Add("Имя", 190); lvSimple.Columns.Add("Команда / путь", 470); lvSimple.Columns.Add("Риск", 80);
+            tpS.Controls.Add(lvSimple); tpS.Controls.Add(sbar);
+            sscan.Click += delegate { Scan(); SimpleRefresh(); };
+            smark.Click += delegate { MarkSuspect(lvSimple); };
+            squar.Click += delegate { QuarantineChecked(lvSimple); };
+            sdel.Click += delegate { DeleteChecked(lvSimple); };
 
             // ---- TAB 2: task manager ----
             Panel tbar = new Panel(); tbar.Dock = DockStyle.Top; tbar.Height = 36;
@@ -253,10 +271,10 @@ namespace RescueScan
             // wiring tab1
             btnDetect.Click += delegate { Detect(); };
             btnScan.Click += delegate { Scan(); };
-            btnMark.Click += delegate { MarkSuspect(); };
+            btnMark.Click += delegate { MarkSuspect(lv); };
             btnPreboot.Click += delegate { PrebootScan(); };
-            btnQuar.Click += delegate { QuarantineChecked(); };
-            btnDelete.Click += delegate { DeleteChecked(); };
+            btnQuar.Click += delegate { QuarantineChecked(lv); };
+            btnDelete.Click += delegate { DeleteChecked(lv); };
             btnExport.Click += delegate { Export(); };
             this.TopMost = true;
             this.FormClosing += delegate { stopping = true; guarding = false; StopWatchdog(); UnloadAll(); };
@@ -270,7 +288,7 @@ namespace RescueScan
             Detect(); // fills cboWin with detected installs
             Form f = new Form(); f.Text = "RescueScan — выбор системы"; f.Width = 500; f.Height = 300;
             f.StartPosition = FormStartPosition.CenterScreen; f.FormBorderStyle = FormBorderStyle.FixedDialog;
-            f.MinimizeBox = false; f.MaximizeBox = false;
+            f.MinimizeBox = false; f.MaximizeBox = false; f.TopMost = true;
             Label l = new Label(); l.Left = 12; l.Top = 12; l.Width = 460; l.Height = 56;
             l.Text = "На каком диске установлена Windows для проверки?\r\n• в WinRE — выбери офлайн-установку (напр. D:\\Windows)\r\n• на живой ОС — свою (C:\\Windows)";
             ListBox lb = new ListBox(); lb.Left = 12; lb.Top = 72; lb.Width = 460; lb.Height = 130;
@@ -735,6 +753,7 @@ namespace RescueScan
             int susp = 0; foreach (Finding x in f) if (x.Risk == "SUSPECT") susp++;
             lblStatus.Text = "Записей: " + f.Count + "   подозрительных: " + susp + "   (ControlSet: " + ccs + ")";
             RepairRefresh();
+            SimpleRefresh();
         }
 
         void AddValues(List<Finding> f, string cat, string key)
@@ -1030,9 +1049,9 @@ namespace RescueScan
             return "";
         }
 
-        void MarkSuspect()
+        void MarkSuspect(ListView target)
         {
-            foreach (ListViewItem it in lv.Items)
+            foreach (ListViewItem it in target.Items)
             {
                 Finding x = (Finding)it.Tag;
                 it.Checked = (x.Risk == "SUSPECT");
@@ -1091,15 +1110,15 @@ namespace RescueScan
             catch (Exception ex) { QLog("REG-FAIL\t" + key + "\t" + ex.Message); return false; }
         }
 
-        void QuarantineChecked()
+        void QuarantineChecked(ListView target)
         {
-            int n = 0; foreach (ListViewItem it in lv.Items) if (it.Checked) n++;
+            int n = 0; foreach (ListViewItem it in target.Items) if (it.Checked) n++;
             if (n == 0) { MessageBox.Show("Ничего не отмечено."); return; }
             if (MessageBox.Show("Карантин отмеченных (" + n + ")? Файлы будут перенесены, ветки реестра — забэкаплены в .reg и удалены.\nПапка карантина создастся рядом с программой.", "Карантин",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             List<ListViewItem> done = new List<ListViewItem>();
             int ok = 0, fail = 0, skip = 0;
-            foreach (ListViewItem it in lv.Items)
+            foreach (ListViewItem it in target.Items)
             {
                 if (!it.Checked) continue;
                 Finding x = (Finding)it.Tag;
@@ -1110,7 +1129,7 @@ namespace RescueScan
                 else { skip++; continue; }
                 if (r) { ok++; done.Add(it); } else fail++;
             }
-            foreach (ListViewItem it in done) lv.Items.Remove(it);
+            foreach (ListViewItem it in done) target.Items.Remove(it);
             lblStatus.Text = "Карантин: " + ok + "   ошибок: " + fail + "   пропущено: " + skip + "   -> " + quarDir;
         }
 
@@ -1168,6 +1187,25 @@ namespace RescueScan
             };
         }
 
+        // simplified autoruns: Run/RunOnce/Startup/Scheduled Tasks only (like Task Manager Startup / Simple Unlocker)
+        void SimpleRefresh()
+        {
+            if (lvSimple == null) return;
+            lvSimple.Items.Clear();
+            foreach (Finding x in lastFindings)
+            {
+                string c = x.Category;
+                bool inc = c.StartsWith("Run") || c.StartsWith("Startup") || c.StartsWith("Scheduled Task") || c.StartsWith("Task ");
+                if (!inc) continue;
+                ListViewItem it = new ListViewItem(new string[] { c, x.Name, x.Value, x.Risk });
+                it.Tag = x;
+                if (x.Risk == "SUSPECT") it.BackColor = Color.FromArgb(255, 205, 205);
+                else if (x.Risk == "REVIEW") it.BackColor = Color.FromArgb(255, 248, 205);
+                lvSimple.Items.Add(it);
+            }
+            if (lastFindings.Count == 0) lblStatus.Text = "Нажми «Сканировать».";
+        }
+
         // офлайн-куст если смонтирован, иначе живой HKLM\SOFTWARE
         string SoftRoot() { return mounted.Contains("RS_SOFT") ? "HKLM\\RS_SOFT" : "HKLM\\SOFTWARE"; }
         bool IsOffline() { return mounted.Contains("RS_SOFT"); }
@@ -1217,8 +1255,8 @@ namespace RescueScan
         static string Prompt(string title, string def)
         {
             Form f = new Form(); f.Text = title; f.Width = 540; f.Height = 150;
-            f.StartPosition = FormStartPosition.CenterParent; f.FormBorderStyle = FormBorderStyle.FixedDialog;
-            f.MinimizeBox = false; f.MaximizeBox = false;
+            f.StartPosition = FormStartPosition.CenterScreen; f.FormBorderStyle = FormBorderStyle.FixedDialog;
+            f.MinimizeBox = false; f.MaximizeBox = false; f.TopMost = true;
             TextBox tb = new TextBox(); tb.Left = 12; tb.Top = 20; tb.Width = 500; tb.Text = def;
             Button ok = new Button(); ok.Text = "OK"; ok.Left = 336; ok.Top = 60; ok.Width = 80; ok.DialogResult = DialogResult.OK;
             Button cc = new Button(); cc.Text = "Отмена"; cc.Left = 432; cc.Top = 60; cc.Width = 80; cc.DialogResult = DialogResult.Cancel;
@@ -1262,16 +1300,16 @@ namespace RescueScan
             }
         }
 
-        void DeleteChecked()
+        void DeleteChecked(ListView target)
         {
-            int n = 0; foreach (ListViewItem it in lv.Items) if (it.Checked) n++;
+            int n = 0; foreach (ListViewItem it in target.Items) if (it.Checked) n++;
             if (n == 0) { MessageBox.Show("Ничего не отмечено."); return; }
             if (MessageBox.Show("Удалить отмеченных записей: " + n + " ?\nОперация необратима.", "Подтверждение",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
 
             List<ListViewItem> done = new List<ListViewItem>();
             int ok = 0, fail = 0, skip = 0;
-            foreach (ListViewItem it in lv.Items)
+            foreach (ListViewItem it in target.Items)
             {
                 if (!it.Checked) continue;
                 Finding x = (Finding)it.Tag;
@@ -1286,7 +1324,7 @@ namespace RescueScan
                 catch { r = false; }
                 if (r) { ok++; done.Add(it); } else fail++;
             }
-            foreach (ListViewItem it in done) lv.Items.Remove(it);
+            foreach (ListViewItem it in done) target.Items.Remove(it);
             lblStatus.Text = "Удалено: " + ok + "   ошибок: " + fail + "   пропущено (info): " + skip;
         }
 
