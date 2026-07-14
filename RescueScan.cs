@@ -136,8 +136,11 @@ namespace RescueScan
         string curDrive = "";
         string curPath = "";
         HashSet<string> flagged = new HashSet<string>();
+        List<Finding> lastFindings = new List<Finding>();
         Process watchdogProc; EventWaitHandle stopEvt; bool stopping = false;
         CheckBox chkTop, chkWatch;
+        Button btnQuar, btnWho, btnQuarFile;
+        string quarDir = "";
 
         public MainForm()
         {
@@ -168,10 +171,11 @@ namespace RescueScan
             lv.Columns.Add("Команда / путь", 380); lv.Columns.Add("Расположение", 250); lv.Columns.Add("Риск", 80);
 
             Panel bot = new Panel(); bot.Dock = DockStyle.Bottom; bot.Height = 40;
-            btnDelete = new Button(); btnDelete.Text = "Удалить отмеченное"; btnDelete.Left = 8; btnDelete.Top = 7; btnDelete.Width = 150;
-            btnExport = new Button(); btnExport.Text = "Экспорт отчёта"; btnExport.Left = 164; btnExport.Top = 7; btnExport.Width = 120;
-            lblStatus = new Label(); lblStatus.Left = 296; lblStatus.Top = 12; lblStatus.Width = 740; lblStatus.Text = "Готово.";
-            bot.Controls.Add(btnDelete); bot.Controls.Add(btnExport); bot.Controls.Add(lblStatus);
+            btnQuar = new Button(); btnQuar.Text = "Карантин отмеч."; btnQuar.Left = 8; btnQuar.Top = 7; btnQuar.Width = 130;
+            btnDelete = new Button(); btnDelete.Text = "Удалить отмеч."; btnDelete.Left = 144; btnDelete.Top = 7; btnDelete.Width = 130;
+            btnExport = new Button(); btnExport.Text = "Экспорт отчёта"; btnExport.Left = 280; btnExport.Top = 7; btnExport.Width = 120;
+            lblStatus = new Label(); lblStatus.Left = 408; lblStatus.Top = 12; lblStatus.Width = 640; lblStatus.Text = "Готово.";
+            bot.Controls.Add(btnQuar); bot.Controls.Add(btnDelete); bot.Controls.Add(btnExport); bot.Controls.Add(lblStatus);
             tp1.Controls.Add(lv); tp1.Controls.Add(top); tp1.Controls.Add(bot);
 
             // ---- TAB 2: task manager ----
@@ -202,16 +206,20 @@ namespace RescueScan
             lvFiles = new ListView(); lvFiles.Dock = DockStyle.Fill; lvFiles.View = View.Details; lvFiles.FullRowSelect = true; lvFiles.GridLines = true; lvFiles.MultiSelect = true;
             lvFiles.Columns.Add("Имя", 320); lvFiles.Columns.Add("Тип", 70); lvFiles.Columns.Add("Размер", 100); lvFiles.Columns.Add("Атрибуты", 100); lvFiles.Columns.Add("Изменён", 130);
             Panel ebot = new Panel(); ebot.Dock = DockStyle.Bottom; ebot.Height = 36;
-            Button bdel = new Button(); bdel.Text = "Удалить"; bdel.Left = 8; bdel.Top = 6; bdel.Width = 90;
-            Button buh = new Button(); buh.Text = "Снять скрытие"; buh.Left = 104; buh.Top = 6; buh.Width = 120;
-            lblFiles = new Label(); lblFiles.Left = 234; lblFiles.Top = 11; lblFiles.Width = 800; lblFiles.Text = "Показаны скрытые (серым) и системные. Красный = подозрительный / найден сканом.";
-            ebot.Controls.Add(bdel); ebot.Controls.Add(buh); ebot.Controls.Add(lblFiles);
+            Button bdel = new Button(); bdel.Text = "Удалить"; bdel.Left = 8; bdel.Top = 6; bdel.Width = 80;
+            btnQuarFile = new Button(); btnQuarFile.Text = "Карантин"; btnQuarFile.Left = 92; btnQuarFile.Top = 6; btnQuarFile.Width = 90;
+            Button buh = new Button(); buh.Text = "Снять скрытие"; buh.Left = 186; buh.Top = 6; buh.Width = 110;
+            btnWho = new Button(); btnWho.Text = "Кто ссылается"; btnWho.Left = 300; btnWho.Top = 6; btnWho.Width = 120;
+            lblFiles = new Label(); lblFiles.Left = 426; lblFiles.Top = 11; lblFiles.Width = 620; lblFiles.Text = "Скрытые (серым) и системные видны. Красный = найден сканом.";
+            ebot.Controls.Add(bdel); ebot.Controls.Add(btnQuarFile); ebot.Controls.Add(buh); ebot.Controls.Add(btnWho); ebot.Controls.Add(lblFiles);
             tp3.Controls.Add(lvFiles); tp3.Controls.Add(ebar); tp3.Controls.Add(ebot);
             bup.Click += delegate { NavUp(); };
             bgo.Click += delegate { Nav(txtPath.Text); };
             bref.Click += delegate { Nav(curPath); };
             bdel.Click += delegate { DeleteFile(); };
+            btnQuarFile.Click += delegate { QuarantineSelectedFiles(); };
             buh.Click += delegate { Unhide(); };
+            btnWho.Click += delegate { WhoReferences(); };
             lvFiles.DoubleClick += delegate { OpenSelected(); };
             txtPath.KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Enter) { Nav(txtPath.Text); e.SuppressKeyPress = true; } };
 
@@ -220,6 +228,7 @@ namespace RescueScan
             btnScan.Click += delegate { Scan(); };
             btnMark.Click += delegate { MarkSuspect(); };
             btnPreboot.Click += delegate { PrebootScan(); };
+            btnQuar.Click += delegate { QuarantineChecked(); };
             btnDelete.Click += delegate { DeleteChecked(); };
             btnExport.Click += delegate { Export(); };
             this.TopMost = true;
@@ -630,6 +639,7 @@ namespace RescueScan
             }
 
             // populate + build flagged-path set for the Explorer highlight
+            lastFindings = f;
             flagged.Clear();
             foreach (Finding x in f)
             {
@@ -923,6 +933,122 @@ namespace RescueScan
                 Finding x = (Finding)it.Tag;
                 it.Checked = (x.Risk == "SUSPECT");
             }
+        }
+
+        // ================= QUARANTINE (safe removal with backup) =================
+        bool EnsureQuar()
+        {
+            if (quarDir.Length > 0 && Directory.Exists(quarDir)) return true;
+            string bas = Path.GetDirectoryName(Application.ExecutablePath);
+            string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string[] cands = { Path.Combine(bas, "Quarantine_" + stamp),
+                               Path.Combine(curDrive.Length == 2 ? curDrive + "\\" : "C:\\", "RescueScan_Quarantine\\" + stamp),
+                               Path.Combine(Path.GetTempPath(), "RescueScan_Quarantine_" + stamp) };
+            foreach (string c in cands)
+                try { Directory.CreateDirectory(c); quarDir = c; return true; } catch { }
+            MessageBox.Show("Не удалось создать папку карантина."); return false;
+        }
+
+        void QLog(string line)
+        {
+            try { File.AppendAllText(Path.Combine(quarDir, "manifest.txt"), line + "\r\n", Encoding.UTF8); } catch { }
+        }
+
+        // move a file into quarantine; returns true on success
+        bool QuarFile(string path)
+        {
+            if (!EnsureQuar()) return false;
+            try
+            {
+                string name = Path.GetFileName(path);
+                string dst = Path.Combine(quarDir, name);
+                int n = 1; while (File.Exists(dst)) { dst = Path.Combine(quarDir, "(" + (n++) + ")" + name); }
+                try { File.SetAttributes(path, FileAttributes.Normal); } catch { }
+                File.Move(path, dst);
+                QLog("FILE\t" + path + "\t=>\t" + dst);
+                return true;
+            }
+            catch (Exception ex) { QLog("FILE-FAIL\t" + path + "\t" + ex.Message); return false; }
+        }
+
+        // export a reg key to .reg (backup) then return true; caller deletes afterwards
+        bool QuarReg(string key)
+        {
+            if (!EnsureQuar()) return false;
+            try
+            {
+                string safe = key.Replace("\\", "_").Replace("\"", "");
+                if (safe.Length > 80) safe = safe.Substring(safe.Length - 80);
+                string dst = Path.Combine(quarDir, "reg_" + safe + ".reg");
+                string o; Reg.RunCode("export \"" + key + "\" \"" + dst + "\" /y", out o);
+                QLog("REG\t" + key + "\t=>\t" + dst);
+                return true;
+            }
+            catch (Exception ex) { QLog("REG-FAIL\t" + key + "\t" + ex.Message); return false; }
+        }
+
+        void QuarantineChecked()
+        {
+            int n = 0; foreach (ListViewItem it in lv.Items) if (it.Checked) n++;
+            if (n == 0) { MessageBox.Show("Ничего не отмечено."); return; }
+            if (MessageBox.Show("Карантин отмеченных (" + n + ")? Файлы будут перенесены, ветки реестра — забэкаплены в .reg и удалены.\nПапка карантина создастся рядом с программой.", "Карантин",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            List<ListViewItem> done = new List<ListViewItem>();
+            int ok = 0, fail = 0, skip = 0;
+            foreach (ListViewItem it in lv.Items)
+            {
+                if (!it.Checked) continue;
+                Finding x = (Finding)it.Tag;
+                bool r = false;
+                if (x.Kind == 2) r = QuarFile(x.DelPath);
+                else if (x.Kind == 0) { if (QuarReg(x.DelKey)) { string o; r = Reg.RunCode("delete \"" + x.DelKey + "\" /v \"" + x.DelName + "\" /f", out o) == 0; } }
+                else if (x.Kind == 1) { if (QuarReg(x.DelKey)) { string o; r = Reg.RunCode("delete \"" + x.DelKey + "\" /f", out o) == 0; } }
+                else { skip++; continue; }
+                if (r) { ok++; done.Add(it); } else fail++;
+            }
+            foreach (ListViewItem it in done) lv.Items.Remove(it);
+            lblStatus.Text = "Карантин: " + ok + "   ошибок: " + fail + "   пропущено: " + skip + "   -> " + quarDir;
+        }
+
+        void QuarantineSelectedFiles()
+        {
+            if (lvFiles.SelectedItems.Count == 0) { MessageBox.Show("Выбери файл."); return; }
+            int ok = 0, fail = 0;
+            List<ListViewItem> done = new List<ListViewItem>();
+            foreach (ListViewItem it in lvFiles.SelectedItems)
+            {
+                string tag = (string)it.Tag;
+                if (!tag.StartsWith("F|")) continue;   // только файлы
+                if (QuarFile(tag.Substring(2))) { ok++; done.Add(it); } else fail++;
+            }
+            lblFiles.Text = "В карантин: " + ok + "   ошибок: " + fail + "   -> " + quarDir;
+            Nav(curPath);
+        }
+
+        // ================= WHO REFERENCES A FILE =================
+        void WhoReferences()
+        {
+            if (lvFiles.SelectedItems.Count == 0) { MessageBox.Show("Выбери файл в проводнике."); return; }
+            string tag = (string)lvFiles.SelectedItems[0].Tag;
+            string full = tag.Substring(2);
+            string low = full.ToLowerInvariant();
+            string fname = Path.GetFileName(full).ToLowerInvariant();
+            List<string> hits = new List<string>();
+            foreach (Finding x in lastFindings)
+            {
+                bool match = false;
+                if (x.Kind == 2 && x.DelPath != null && x.DelPath.ToLowerInvariant() == low) match = true;
+                else
+                {
+                    string vp = ExtractPath(x.Value).ToLowerInvariant();
+                    if (vp == low) match = true;
+                    else if (x.Value != null && x.Value.ToLowerInvariant().Contains(fname) && fname.Length > 3) match = true;
+                }
+                if (match) hits.Add("[" + x.Risk + "] " + x.Category + "  —  " + x.Name + "\r\n      " + x.Location);
+            }
+            if (lastFindings.Count == 0) { MessageBox.Show("Сначала выполни «Сканировать» на вкладке Автозагрузка."); return; }
+            if (hits.Count == 0) { MessageBox.Show("Ссылок на этот файл в автозагрузке не найдено:\r\n" + full, "Кто ссылается"); return; }
+            MessageBox.Show("Файл: " + full + "\r\n\r\nНайден в точках автозапуска (" + hits.Count + "):\r\n\r\n" + string.Join("\r\n\r\n", hits.ToArray()), "Кто ссылается на файл");
         }
 
         void DeleteChecked()
