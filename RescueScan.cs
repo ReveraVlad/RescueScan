@@ -143,6 +143,7 @@ namespace RescueScan
         string quarDir = "";
         ListView lvRepair; CheckBox chkGuard; bool guarding = false; Thread guardThread;
         ListView lvSimple;
+        ListView lvQuar; string quarViewDir = ""; Label lblQuar;
 
         public MainForm()
         {
@@ -155,9 +156,10 @@ namespace RescueScan
             TabPage tpS = new TabPage("Автозапуск (кратко)");
             TabPage tp2 = new TabPage("Диспетчер задач");
             TabPage tp3 = new TabPage("Проводник");
+            TabPage tpQ = new TabPage("Карантин");
             TabPage tp4 = new TabPage("Ремонт");
             TabPage tp5 = new TabPage("Справка");
-            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tpS); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tp4); tabs.TabPages.Add(tp5);
+            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tpS); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tpQ); tabs.TabPages.Add(tp4); tabs.TabPages.Add(tp5);
             Controls.Add(tabs);
 
             // ---- TAB 1: autoruns scanner ----
@@ -227,22 +229,38 @@ namespace RescueScan
             lvFiles = new ListView(); lvFiles.Dock = DockStyle.Fill; lvFiles.View = View.Details; lvFiles.FullRowSelect = true; lvFiles.GridLines = true; lvFiles.MultiSelect = true;
             lvFiles.Columns.Add("Имя", 320); lvFiles.Columns.Add("Тип", 70); lvFiles.Columns.Add("Размер", 100); lvFiles.Columns.Add("Атрибуты", 100); lvFiles.Columns.Add("Изменён", 130);
             Panel ebot = new Panel(); ebot.Dock = DockStyle.Bottom; ebot.Height = 36;
-            Button bdel = new Button(); bdel.Text = "Удалить"; bdel.Left = 8; bdel.Top = 6; bdel.Width = 80;
-            btnQuarFile = new Button(); btnQuarFile.Text = "Карантин"; btnQuarFile.Left = 92; btnQuarFile.Top = 6; btnQuarFile.Width = 90;
-            Button buh = new Button(); buh.Text = "Снять скрытие"; buh.Left = 186; buh.Top = 6; buh.Width = 110;
-            btnWho = new Button(); btnWho.Text = "Кто ссылается"; btnWho.Left = 300; btnWho.Top = 6; btnWho.Width = 120;
-            lblFiles = new Label(); lblFiles.Left = 426; lblFiles.Top = 11; lblFiles.Width = 620; lblFiles.Text = "Скрытые (серым) и системные видны. Красный = найден сканом.";
-            ebot.Controls.Add(bdel); ebot.Controls.Add(btnQuarFile); ebot.Controls.Add(buh); ebot.Controls.Add(btnWho); ebot.Controls.Add(lblFiles);
+            Button bdel = new Button(); bdel.Text = "Удалить"; bdel.Left = 8; bdel.Top = 6; bdel.Width = 76;
+            Button bren = new Button(); bren.Text = "Переименовать"; bren.Left = 88; bren.Top = 6; bren.Width = 116;
+            btnQuarFile = new Button(); btnQuarFile.Text = "Карантин"; btnQuarFile.Left = 208; btnQuarFile.Top = 6; btnQuarFile.Width = 84;
+            Button buh = new Button(); buh.Text = "Снять скрытие"; buh.Left = 296; buh.Top = 6; buh.Width = 104;
+            btnWho = new Button(); btnWho.Text = "Кто ссылается"; btnWho.Left = 404; btnWho.Top = 6; btnWho.Width = 114;
+            lblFiles = new Label(); lblFiles.Left = 524; lblFiles.Top = 11; lblFiles.Width = 520; lblFiles.Text = "Скрытые (серым) и системные видны. Красный = найден сканом.";
+            ebot.Controls.Add(bdel); ebot.Controls.Add(bren); ebot.Controls.Add(btnQuarFile); ebot.Controls.Add(buh); ebot.Controls.Add(btnWho); ebot.Controls.Add(lblFiles);
             tp3.Controls.Add(lvFiles); tp3.Controls.Add(ebar); tp3.Controls.Add(ebot);
             bup.Click += delegate { NavUp(); };
             bgo.Click += delegate { Nav(txtPath.Text); };
             bref.Click += delegate { Nav(curPath); };
             bdel.Click += delegate { DeleteFile(); };
+            bren.Click += delegate { RenameSelected(); };
             btnQuarFile.Click += delegate { QuarantineSelectedFiles(); };
             buh.Click += delegate { Unhide(); };
             btnWho.Click += delegate { WhoReferences(); };
             lvFiles.DoubleClick += delegate { OpenSelected(); };
             txtPath.KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Enter) { Nav(txtPath.Text); e.SuppressKeyPress = true; } };
+
+            // ---- TAB (quarantine): view backed-up items and restore ----
+            Panel qbar = new Panel(); qbar.Dock = DockStyle.Top; qbar.Height = 36;
+            Button qfind = new Button(); qfind.Text = "Найти последний"; qfind.Left = 8; qfind.Top = 6; qfind.Width = 130;
+            Button qbrowse = new Button(); qbrowse.Text = "Открыть папку…"; qbrowse.Left = 142; qbrowse.Top = 6; qbrowse.Width = 120;
+            Button qrestore = new Button(); qrestore.Text = "Восстановить"; qrestore.Left = 266; qrestore.Top = 6; qrestore.Width = 120;
+            lblQuar = new Label(); lblQuar.Left = 396; lblQuar.Top = 11; lblQuar.Width = 640; lblQuar.Text = "Папка карантина не выбрана.";
+            qbar.Controls.Add(qfind); qbar.Controls.Add(qbrowse); qbar.Controls.Add(qrestore); qbar.Controls.Add(lblQuar);
+            lvQuar = new ListView(); lvQuar.Dock = DockStyle.Fill; lvQuar.View = View.Details; lvQuar.CheckBoxes = true; lvQuar.FullRowSelect = true; lvQuar.GridLines = true;
+            lvQuar.Columns.Add("Тип", 70); lvQuar.Columns.Add("Оригинал / ключ", 560); lvQuar.Columns.Add("Бэкап", 340);
+            tpQ.Controls.Add(lvQuar); tpQ.Controls.Add(qbar);
+            qfind.Click += delegate { QuarAutoFind(); };
+            qbrowse.Click += delegate { QuarBrowse(); };
+            qrestore.Click += delegate { QuarRestore(); };
 
             // ---- TAB 4: repair (restore Shell/Userinit/cmd/AppInit to default or custom) ----
             Panel rbar = new Panel(); rbar.Dock = DockStyle.Top; rbar.Height = 36;
@@ -279,7 +297,7 @@ namespace RescueScan
             this.TopMost = true;
             this.FormClosing += delegate { stopping = true; guarding = false; StopWatchdog(); UnloadAll(); };
             this.Load += delegate { StartupPick(); };
-            this.Shown += delegate { RefreshProcs(); ShowDrives(); RepairRefresh(); };
+            this.Shown += delegate { RefreshProcs(); ShowDrives(); RepairRefresh(); QuarAutoFind(); };
         }
 
         // ================= STARTUP DISK PICKER =================
@@ -569,6 +587,22 @@ namespace RescueScan
             Nav(curPath);
         }
 
+        void RenameSelected()
+        {
+            if (lvFiles.SelectedItems.Count != 1) { MessageBox.Show("Выбери ровно один элемент."); return; }
+            string tag = (string)lvFiles.SelectedItems[0].Tag;
+            if (!tag.StartsWith("F|") && !tag.StartsWith("D|")) return;
+            string p = tag.Substring(2);
+            string old = Path.GetFileName(p.TrimEnd('\\'));
+            string nn = Prompt("Новое имя для «" + old + "»", old);
+            if (nn == null) return; nn = nn.Trim();
+            if (nn.Length == 0 || nn == old) return;
+            string dst = Path.Combine(Path.GetDirectoryName(p.TrimEnd('\\')), nn);
+            try { if (tag.StartsWith("F|")) File.Move(p, dst); else Directory.Move(p, dst); }
+            catch (Exception ex) { MessageBox.Show(ex.Message); }
+            Nav(curPath);
+        }
+
         static string ExtractPath(string s)
         {
             if (s == null) return "";
@@ -735,8 +769,15 @@ namespace RescueScan
                     string cmd = ExtractTag(body, "Command");
                     string args = ExtractTag(body, "Arguments");
                     string shown = (cmd + " " + args).Trim();
+                    if (shown.Length == 0)
+                    {
+                        string cls = ExtractTag(body, "ClassId");
+                        if (cls.Length > 0) shown = "COM-обработчик " + cls;
+                        else if (body.IndexOf("<ComHandler", StringComparison.OrdinalIgnoreCase) >= 0) shown = "(COM-обработчик)";
+                        else shown = "(нет exec-команды)";
+                    }
                     string cat = wd == "SUSPECT" ? "Task *checker?*" : "Scheduled Task";
-                    Add(f, cat, rel, shown.Length > 0 ? shown : "(task)", tf, risk, 2, null, null, tf);
+                    Add(f, cat, rel, shown, tf, risk, 2, null, null, tf);
                 }
             }
 
@@ -1146,6 +1187,88 @@ namespace RescueScan
             }
             lblFiles.Text = "В карантин: " + ok + "   ошибок: " + fail + "   -> " + quarDir;
             Nav(curPath);
+        }
+
+        // ---- Quarantine viewer / restore ----
+        void QuarAutoFind()
+        {
+            string bas = Path.GetDirectoryName(Application.ExecutablePath);
+            string best = ""; DateTime bestT = DateTime.MinValue;
+            try
+            {
+                foreach (string d in Directory.GetDirectories(bas, "Quarantine_*"))
+                {
+                    DateTime t = Directory.GetLastWriteTime(d);
+                    if (t > bestT && File.Exists(Path.Combine(d, "manifest.txt"))) { bestT = t; best = d; }
+                }
+            }
+            catch { }
+            if (best.Length == 0) { lblQuar.Text = "Рядом с программой нет папок Quarantine_* с manifest.txt. Нажми «Открыть папку…»."; lvQuar.Items.Clear(); return; }
+            QuarLoad(best);
+        }
+
+        void QuarBrowse()
+        {
+            FolderBrowserDialog d = new FolderBrowserDialog();
+            d.Description = "Выбери папку карантина (в ней должен быть manifest.txt)";
+            if (d.ShowDialog() == DialogResult.OK) QuarLoad(d.SelectedPath);
+        }
+
+        void QuarLoad(string dir)
+        {
+            lvQuar.Items.Clear(); quarViewDir = dir;
+            string mf = Path.Combine(dir, "manifest.txt");
+            if (!File.Exists(mf)) { lblQuar.Text = "Нет manifest.txt в " + dir; return; }
+            int cnt = 0;
+            foreach (string line in File.ReadAllLines(mf))
+            {
+                string[] p = line.Split('\t');
+                if (p.Length < 4) continue;
+                if (p[0] != "FILE" && p[0] != "REG") continue;   // пропускаем *-FAIL
+                string type = p[0]; string orig = p[1]; string backup = p[3];
+                ListViewItem it = new ListViewItem(new string[] { type, orig, backup });
+                it.Tag = new string[] { type, orig, backup };
+                if (!File.Exists(backup)) it.ForeColor = Color.Gray;   // бэкап уже убран
+                lvQuar.Items.Add(it); cnt++;
+            }
+            lblQuar.Text = "Карантин: " + dir + "   (записей: " + cnt + ")";
+        }
+
+        void QuarRestore()
+        {
+            int n = 0; foreach (ListViewItem it in lvQuar.Items) if (it.Checked) n++;
+            if (n == 0) { MessageBox.Show("Отметь, что восстановить."); return; }
+            if (MessageBox.Show("Восстановить отмеченные (" + n + ") на исходные места?", "Восстановление",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            int ok = 0, fail = 0;
+            List<ListViewItem> done = new List<ListViewItem>();
+            foreach (ListViewItem it in lvQuar.Items)
+            {
+                if (!it.Checked) continue;
+                string[] e = (string[])it.Tag; bool r = false;
+                try
+                {
+                    if (e[0] == "FILE")
+                    {
+                        string orig = e[1], backup = e[2];
+                        if (File.Exists(backup))
+                        {
+                            string od = Path.GetDirectoryName(orig);
+                            if (od.Length > 0 && !Directory.Exists(od)) Directory.CreateDirectory(od);
+                            if (File.Exists(orig)) File.Delete(orig);
+                            File.Move(backup, orig); r = true;
+                        }
+                    }
+                    else if (e[0] == "REG")
+                    {
+                        string o; r = Reg.RunCode("import \"" + e[2] + "\"", out o) == 0;
+                    }
+                }
+                catch { r = false; }
+                if (r) { ok++; done.Add(it); } else fail++;
+            }
+            foreach (ListViewItem it in done) lvQuar.Items.Remove(it);
+            lblQuar.Text = "Восстановлено: " + ok + "   ошибок: " + fail;
         }
 
         // ================= WHO REFERENCES A FILE =================
