@@ -154,7 +154,8 @@ namespace RescueScan
             TabPage tp2 = new TabPage("Диспетчер задач");
             TabPage tp3 = new TabPage("Проводник");
             TabPage tp4 = new TabPage("Ремонт");
-            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tp4);
+            TabPage tp5 = new TabPage("Справка");
+            tabs.TabPages.Add(tp1); tabs.TabPages.Add(tp2); tabs.TabPages.Add(tp3); tabs.TabPages.Add(tp4); tabs.TabPages.Add(tp5);
             Controls.Add(tabs);
 
             // ---- TAB 1: autoruns scanner ----
@@ -243,6 +244,12 @@ namespace RescueScan
             rcus.Click += delegate { RepairSet(true); };
             chkGuard.CheckedChanged += delegate { GuardToggle(); };
 
+            // ---- TAB 5: help ----
+            TextBox help = new TextBox(); help.Dock = DockStyle.Fill; help.Multiline = true; help.ReadOnly = true;
+            help.ScrollBars = ScrollBars.Vertical; help.BackColor = Color.White; help.Font = new Font("Segoe UI", 9f);
+            help.Text = HelpText();
+            tp5.Controls.Add(help);
+
             // wiring tab1
             btnDetect.Click += delegate { Detect(); };
             btnScan.Click += delegate { Scan(); };
@@ -253,7 +260,64 @@ namespace RescueScan
             btnExport.Click += delegate { Export(); };
             this.TopMost = true;
             this.FormClosing += delegate { stopping = true; guarding = false; StopWatchdog(); UnloadAll(); };
-            this.Shown += delegate { Detect(); RefreshProcs(); ShowDrives(); };
+            this.Load += delegate { StartupPick(); };
+            this.Shown += delegate { RefreshProcs(); ShowDrives(); RepairRefresh(); };
+        }
+
+        // ================= STARTUP DISK PICKER =================
+        void StartupPick()
+        {
+            Detect(); // fills cboWin with detected installs
+            Form f = new Form(); f.Text = "RescueScan — выбор системы"; f.Width = 500; f.Height = 300;
+            f.StartPosition = FormStartPosition.CenterScreen; f.FormBorderStyle = FormBorderStyle.FixedDialog;
+            f.MinimizeBox = false; f.MaximizeBox = false;
+            Label l = new Label(); l.Left = 12; l.Top = 12; l.Width = 460; l.Height = 56;
+            l.Text = "На каком диске установлена Windows для проверки?\r\n• в WinRE — выбери офлайн-установку (напр. D:\\Windows)\r\n• на живой ОС — свою (C:\\Windows)";
+            ListBox lb = new ListBox(); lb.Left = 12; lb.Top = 72; lb.Width = 460; lb.Height = 130;
+            foreach (object it in cboWin.Items) lb.Items.Add(it);
+            if (lb.Items.Count == 0) lb.Items.Add("(Windows не найдена — выберешь вручную в приложении)");
+            if (lb.Items.Count > 0) lb.SelectedIndex = 0;
+            Button ok = new Button(); ok.Text = "Открыть"; ok.Left = 392; ok.Top = 214; ok.Width = 80; ok.DialogResult = DialogResult.OK;
+            Button rescan = new Button(); rescan.Text = "Обновить список"; rescan.Left = 12; rescan.Top = 214; rescan.Width = 130;
+            rescan.Click += delegate { Detect(); lb.Items.Clear(); foreach (object it in cboWin.Items) lb.Items.Add(it); if (lb.Items.Count > 0) lb.SelectedIndex = 0; };
+            f.Controls.Add(l); f.Controls.Add(lb); f.Controls.Add(ok); f.Controls.Add(rescan);
+            f.AcceptButton = ok;
+            f.ShowDialog(this);
+            if (lb.SelectedIndex >= 0 && lb.SelectedIndex < cboWin.Items.Count) cboWin.SelectedIndex = lb.SelectedIndex;
+        }
+
+        static string HelpText()
+        {
+            return
+"RescueScan — защитный инструмент для чистки заражённой Windows.\r\n" +
+"Работает в двух режимах: ОФЛАЙН (загрузился в WinRE/WinPE — цель выключена, вирус не сопротивляется) и ЖИВОЙ (запущен прямо в заражённой ОС от админа).\r\n" +
+"\r\n" +
+"ЦВЕТА:\r\n" +
+"  Красный  = SUSPECT, сильный признак вредоноса (temp, -enc/hidden, интерпретатор+загрузка, двойное расширение, exe в drivers).\r\n" +
+"  Жёлтый   = REVIEW, ЛЕГИТИМНОЕ но частое у малвари место (AppData, ProgramData, Downloads, автозагрузка) — просто глянь, не паникуй.\r\n" +
+"  Красный часто = ложные срабатывания на своих программах в AppData. Это норма, смотри путь.\r\n" +
+"\r\n" +
+"ВКЛАДКА «Автозагрузка»:\r\n" +
+"  1) «Найти ОС» -> «Сканировать». Показывает ВСЕ точки автозапуска (Run/Службы/Задачи/IFEO/Winlogon/ESP...).\r\n" +
+"  2) «Отметить подозрительные» -> проверь галочки глазами.\r\n" +
+"  3) «Карантин отмеч.» (перенос+бэкап, безопасно) ИЛИ «Удалить отмеч.».\r\n" +
+"  ВАЖНО: если файл висит на boot-критичном якоре (служба/Userinit), удаление может убить загрузку.\r\n" +
+"         Сначала почини якорь на вкладке «Ремонт», потом убирай файл.\r\n" +
+"\r\n" +
+"ВКЛАДКА «Диспетчер задач»: процессы с путём и риском; «Завершить» и «Завершить дерево».\r\n" +
+"  «Поверх всех окон» — чтобы вирусный интерфейс не перекрывал. «Watchdog» — самовосстановление окна, если вирус его убьёт (лог в temp).\r\n" +
+"\r\n" +
+"ВКЛАДКА «Проводник»: видит СКРЫТЫЕ и СИСТЕМНЫЕ файлы. Красный = найден сканом.\r\n" +
+"  «Кто ссылается» — из какой точки автозапуска стартует выбранный файл. «Снять скрытие» — убрать атрибуты H/S. «Карантин»/«Удалить».\r\n" +
+"\r\n" +
+"ВКЛАДКА «Ремонт» (как пользоваться):\r\n" +
+"  Список Winlogon Shell/Userinit/AppInit/cmd AutoRun. Красная строка = значение отличается от дефолта (подмена).\r\n" +
+"  ВЫДЕЛИ строку -> «→ Дефолт» (вернуть штатное) или «→ Своё…» (ввести своё значение).\r\n" +
+"  Работает и офлайн (правит смонтированный куст), и на живой ОС (правит HKLM напрямую).\r\n" +
+"  «Стеречь Winlogon» — фоновый страж: если вирус подменит Shell/Userinit, вернёт дефолт (только живая ОС).\r\n" +
+"\r\n" +
+"ГРАНИЦЫ: RescueScan чистит уровень ОС + загрузчик/ESP. Имплант в прошивку (BIOS/SPI) НЕ трогает — только перепрошивка.\r\n" +
+"Сброс пароля офлайн (правка SAM) НЕ входит — используй chntpw / MS DaRT. Аккаунт-операции живьём — через net user (пока не встроено).\r\n";
         }
 
         // ================= WATCHDOG control (user-mode) =================
@@ -817,13 +881,18 @@ namespace RescueScan
         {
             string dir = winDir + "\\System32\\drivers";
             if (!Directory.Exists(dir)) return;
+            string[] benign = { ".dat", ".dls", ".wdf", ".txt", ".mui", ".bin", ".din", ".cat", ".inf", ".ini", ".xml", ".json", ".etl" };
+            string[] exe = { ".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".scr", ".com", ".pif", ".js", ".hta" };
             foreach (string fp in Directory.GetFiles(dir))
             {
                 string ext = Path.GetExtension(fp).ToLower();
                 string nm = Path.GetFileName(fp);
                 if (ext == ".sys") continue;
                 if (nm.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase)) continue;
-                Add(f, "drivers\\ (не .sys!)", nm, fp, fp, "SUSPECT", 2, null, null, fp);
+                bool isExe = false; foreach (string e in exe) if (ext == e) isExe = true;
+                bool isBenign = false; foreach (string b in benign) if (ext == b) isBenign = true;
+                if (isExe) Add(f, "drivers\\ (исполняемый!)", nm, fp, fp, ext == ".dll" ? "REVIEW" : "SUSPECT", 2, null, null, fp);
+                else if (!isBenign) Add(f, "drivers\\ (нетипичный)", nm, fp, fp, "REVIEW", 2, null, null, fp);
             }
         }
 
@@ -831,7 +900,9 @@ namespace RescueScan
         {
             if (body == null) return "";
             string l = body.ToLowerInvariant();
-            string[] kw = { "check", "chk", "watch", "guard", "restore", "reg add", "reg import", "schtasks", "bcdedit", ".ps1", ".bat", ".vbs", "-enc", "-w hidden", "-windowstyle hidden", "mshta" };
+            // сильные индикаторы самовосстановления/перезаписи автозагрузки (без общих слов вроде "check")
+            string[] kw = { "reg add ", "reg import", "schtasks /create", "bcdedit", "-enc", "-encodedcommand",
+                "-w hidden", "-windowstyle hidden", "frombase64", "downloadstring", "mshta", "\\temp\\", "\\appdata\\local\\temp\\" };
             foreach (string k in kw) if (l.Contains(k)) return "SUSPECT";
             return "";
         }
@@ -940,10 +1011,22 @@ namespace RescueScan
         {
             if (s == null) return "";
             string l = s.ToLowerInvariant();
-            string[] bad = { "\\temp\\", "\\appdata\\", "\\programdata\\", "\\users\\public", "\\downloads\\",
-                "%temp%", "%appdata%", ".scr", ".pif", ".tmp\"", "powershell", "-enc", "-w hidden", "-windowstyle hidden",
-                "mshta", "wscript", "cscript", "rundll32", "regsvr32", "certutil", "bitsadmin", "\\public\\" };
-            foreach (string b in bad) if (l.Contains(b)) return "SUSPECT";
+            // STRONG -> SUSPECT (red): почти всегда вредонос
+            string[] strong = { "\\temp\\", "\\appdata\\local\\temp\\", "%temp%", ".scr", ".pif",
+                "-enc", "-encodedcommand", "-w hidden", "-windowstyle hidden", "frombase64string",
+                "invoke-expression", "iex(", "iex ", "downloadstring", "downloadfile",
+                ".txt.exe", ".pdf.exe", ".doc.exe", ".jpg.exe", ".png.exe", ".scr.exe" };
+            foreach (string b in strong) if (l.Contains(b)) return "SUSPECT";
+            // интерпретатор + подозрительное использование (а не просто путь к нему)
+            bool interp = l.Contains("powershell") || l.Contains("mshta") || l.Contains("wscript")
+                || l.Contains("cscript") || l.Contains("rundll32") || l.Contains("regsvr32")
+                || l.Contains("certutil") || l.Contains("bitsadmin");
+            if (interp && (l.Contains("http") || l.Contains("\\temp\\") || l.Contains("%temp%")
+                || l.Contains("\\appdata\\") || l.Contains("javascript:") || l.Contains("/i:") || l.Contains(".hta")))
+                return "SUSPECT";
+            // SOFT -> REVIEW (yellow): легитимные места, где ТОЖЕ часто прячется малварь — просто «глянь»
+            string[] soft = { "\\appdata\\", "%appdata%", "\\programdata\\", "\\downloads\\", "\\users\\public", "\\public\\" };
+            foreach (string b in soft) if (l.Contains(b)) return "REVIEW";
             return "";
         }
 
@@ -1085,39 +1168,36 @@ namespace RescueScan
             };
         }
 
+        // офлайн-куст если смонтирован, иначе живой HKLM\SOFTWARE
+        string SoftRoot() { return mounted.Contains("RS_SOFT") ? "HKLM\\RS_SOFT" : "HKLM\\SOFTWARE"; }
+        bool IsOffline() { return mounted.Contains("RS_SOFT"); }
+
         void RepairRefresh()
         {
             lvRepair.Items.Clear();
-            bool ok = mounted.Contains("RS_SOFT");
+            string root = SoftRoot();
             foreach (string[] a in Anchors())
             {
-                string cur = "(нажми «Сканировать» на вкладке Автозагрузка)";
-                if (ok)
-                {
-                    cur = "(нет значения)";
-                    foreach (string[] v in Reg.Values("HKLM\\RS_SOFT\\" + a[1]))
-                        if (v[0].Equals(a[2], StringComparison.OrdinalIgnoreCase)) cur = v[1];
-                }
+                string cur = "(нет значения)";
+                foreach (string[] v in Reg.Values(root + "\\" + a[1]))
+                    if (v[0].Equals(a[2], StringComparison.OrdinalIgnoreCase)) cur = v[1];
                 string def = a[4] == "1" ? "(удалить значение)" : (a[3].Length == 0 ? "(пусто)" : a[3]);
                 ListViewItem it = new ListViewItem(new string[] { a[0], cur, def });
                 it.Tag = a;
-                if (ok)
-                {
-                    bool good = a[4] == "1" ? (cur == "(нет значения)") : string.Equals(cur.Trim(), a[3], StringComparison.OrdinalIgnoreCase);
-                    if (!good) it.BackColor = Color.FromArgb(255, 220, 220);
-                }
+                bool good = a[4] == "1" ? (cur == "(нет значения)") : string.Equals(cur.Trim(), a[3], StringComparison.OrdinalIgnoreCase);
+                if (!good) it.BackColor = Color.FromArgb(255, 220, 220);
                 lvRepair.Items.Add(it);
             }
         }
 
         void RepairSet(bool custom)
         {
-            if (!mounted.Contains("RS_SOFT")) { MessageBox.Show("Сначала «Сканировать» на вкладке Автозагрузка (нужен смонтированный куст)."); return; }
-            if (lvRepair.SelectedItems.Count == 0) { MessageBox.Show("Выбери строку."); return; }
+            if (lvRepair.SelectedItems.Count == 0) { MessageBox.Show("Выбери строку в списке, потом жми «→ Дефолт» или «→ Своё…»."); return; }
+            string root = SoftRoot();
             foreach (ListViewItem it in lvRepair.SelectedItems)
             {
                 string[] a = (string[])it.Tag;
-                string key = "HKLM\\RS_SOFT\\" + a[1]; string o;
+                string key = root + "\\" + a[1]; string o;
                 if (custom)
                 {
                     string val = Prompt("Своё значение для «" + a[0] + "»", a[3]);
@@ -1131,7 +1211,7 @@ namespace RescueScan
                 }
             }
             RepairRefresh();
-            lblStatus.Text = "Ремонт применён к офлайн-кусту.";
+            lblStatus.Text = IsOffline() ? "Ремонт применён к офлайн-кусту." : "Ремонт применён к ЖИВОЙ системе (HKLM\\SOFTWARE).";
         }
 
         static string Prompt(string title, string def)
