@@ -345,6 +345,103 @@ namespace RescueScan
             }
         }
 
+        // ================= registry writes (exact names/data; no command line involved) =================
+        // = reg delete KEY /v NAME /f. false if the key or the value does not exist or the delete failed.
+        public static bool DeleteValue(string key, string name)
+        {
+            if (name == null) return false;
+            try
+            {
+                using (RegistryKey k = OpenKey(key, true))
+                {
+                    if (k == null || !ValueExists(k, name)) return false;
+                    k.DeleteValue(name, false);
+                    return !ValueExists(k, name);   // RegistryKey.DeleteValue ignores most RegDeleteValue errors: verify
+                }
+            }
+            catch { return false; }
+        }
+
+        static bool ValueExists(RegistryKey k, string name)
+        {
+            string d, t;
+            return TryGetValue(k, name, out d, out t);
+        }
+
+        // = reg delete KEY /f: the key with all its subkeys. Registry symbolic links inside the tree are removed as
+        // links; their targets are never touched. Refuses hive roots and first-level keys (ROOT\x) and paths ending
+        // with "\" (an empty last component). false if the key is missing or was not (completely) deleted.
+        public static bool DeleteKey(string key)
+        {
+            RegistryHive hive; string sub;
+            if (key == null || key.EndsWith("\\") || !SplitRoot(key, out hive, out sub)) return false;
+            int cut = sub.LastIndexOf('\\');
+            if (cut <= 0) return false;
+            string parentSub = sub.Substring(0, cut), name = sub.Substring(cut + 1);
+            try
+            {
+                using (RegistryKey b = RegistryKey.OpenBaseKey(hive, View))
+                using (RegistryKey parent = b.OpenSubKey(parentSub, !IsWindows))
+                {
+                    if (parent == null) return false;
+                    if (IsWindows) return DeleteTree(parent, name, 0);
+                    using (RegistryKey k = parent.OpenSubKey(name)) if (k == null) return false;   // Mono: no links
+                    parent.DeleteSubKeyTree(name, false);
+                    using (RegistryKey k = parent.OpenSubKey(name)) return k == null;
+                }
+            }
+            catch { return false; }
+        }
+
+        // Windows: depth-first; each key is opened WITHOUT following a link and deleted through its own handle.
+        static bool DeleteTree(RegistryKey parent, string name, int depth)
+        {
+            if (depth > 512) return false;   // deeper than the registry allows
+            using (RegistryKey k = OpenChild(parent, name, true))
+            {
+                if (k == null) return false;
+                bool ok = true;
+                if (!IsLink(k))
+                    foreach (string s in Names(k, true))
+                        if (!DeleteTree(k, s, depth + 1)) ok = false;
+                return ok && NtDeleteKey(k.Handle) == 0;
+            }
+        }
+
+        // = reg add KEY /v NAME /t REG_SZ (expand: REG_EXPAND_SZ) /d DATA /f: creates the key if needed.
+        public static bool SetString(string key, string name, string data)
+        {
+            return SetString(key, name, data, false);
+        }
+
+        public static bool SetString(string key, string name, string data, bool expand)
+        {
+            return SetValue(key, name, data, expand ? RegistryValueKind.ExpandString : RegistryValueKind.String);
+        }
+
+        // = reg add KEY /v NAME /t REG_DWORD /d VALUE /f
+        public static bool SetDword(string key, string name, int value)
+        {
+            return SetValue(key, name, value, RegistryValueKind.DWord);
+        }
+
+        static bool SetValue(string key, string name, object data, RegistryValueKind kind)
+        {
+            RegistryHive hive; string sub;
+            if (name == null || data == null || !SplitRoot(key, out hive, out sub) || sub.Trim('\\').Length == 0) return false;
+            try
+            {
+                using (RegistryKey b = RegistryKey.OpenBaseKey(hive, View))
+                using (RegistryKey k = b.CreateSubKey(sub))
+                {
+                    if (k == null) return false;
+                    k.SetValue(name, data, kind);
+                    return true;
+                }
+            }
+            catch { return false; }
+        }
+
         // ---- Windows-only native helpers: recursion and deletion never follow registry symbolic links ----
         // (a link stored in an OFFLINE hive points into the registry of the running WinPE; a link loop would make the
         // recursion endless; RegistryKey.DeleteSubKeyTree follows links and would delete the link TARGET's subtree).
@@ -1518,8 +1615,8 @@ namespace RescueScan
                 Finding x = (Finding)it.Tag;
                 bool r = false;
                 if (x.Kind == 2) r = QuarFile(x.DelPath);
-                else if (x.Kind == 0) { if (QuarReg(x.DelKey)) { string o; r = Reg.RunCode("delete \"" + x.DelKey + "\" /v \"" + x.DelName + "\" /f", out o) == 0; } }
-                else if (x.Kind == 1) { if (QuarReg(x.DelKey)) { string o; r = Reg.RunCode("delete \"" + x.DelKey + "\" /f", out o) == 0; } }
+                else if (x.Kind == 0) { if (QuarReg(x.DelKey)) r = Reg.DeleteValue(x.DelKey, x.DelName); }
+                else if (x.Kind == 1) { if (QuarReg(x.DelKey)) r = Reg.DeleteKey(x.DelKey); }
                 else { skip++; continue; }
                 if (r) { ok++; done.Add(it); } else fail++;
             }
@@ -1711,17 +1808,17 @@ namespace RescueScan
             foreach (ListViewItem it in lvRepair.SelectedItems)
             {
                 string[] a = (string[])it.Tag;
-                string key = root + "\\" + a[1]; string o;
+                string key = root + "\\" + a[1];
                 if (custom)
                 {
                     string val = Prompt("Своё значение для «" + a[0] + "»", a[3]);
                     if (val == null) continue;
-                    Reg.RunCode("add \"" + key + "\" /v \"" + a[2] + "\" /t REG_SZ /d \"" + val + "\" /f", out o);
+                    Reg.SetString(key, a[2], val);
                 }
                 else
                 {
-                    if (a[4] == "1") Reg.RunCode("delete \"" + key + "\" /v \"" + a[2] + "\" /f", out o);
-                    else Reg.RunCode("add \"" + key + "\" /v \"" + a[2] + "\" /t REG_SZ /d \"" + a[3] + "\" /f", out o);
+                    if (a[4] == "1") Reg.DeleteValue(key, a[2]);
+                    else Reg.SetString(key, a[2], a[3]);
                 }
             }
             RepairRefresh();
@@ -1768,7 +1865,7 @@ namespace RescueScan
                         if (v[0].Equals(w[0], StringComparison.OrdinalIgnoreCase)) cur = v[1];
                     if (cur != null && !string.Equals(cur.Trim(), w[1], StringComparison.OrdinalIgnoreCase))
                     {
-                        string o; Reg.RunCode("add \"" + wl + "\" /v " + w[0] + " /t REG_SZ /d \"" + w[1] + "\" /f", out o);
+                        Reg.SetString(wl, w[0], w[1]);
                         Watchdog.Log("guard: Winlogon " + w[0] + " подменён на '" + cur + "' -> вернул '" + w[1] + "'");
                     }
                 }
@@ -1807,26 +1904,26 @@ namespace RescueScan
         bool DefuseOne(Finding x)
         {
             if (x == null) return false;
-            string c = x.Category; string o;
+            string c = x.Category;
             if (c.StartsWith("Service") || c.StartsWith("svchost"))
             {
                 string root = ServiceKeyOf(x.DelKey != null ? x.DelKey : x.Location);
-                Reg.RunCode("add \"" + root + "\" /v Start /t REG_DWORD /d 4 /f", out o);
-                Reg.RunCode("add \"" + root + "\" /v ErrorControl /t REG_DWORD /d 1 /f", out o);
+                Reg.SetDword(root, "Start", 4);
+                Reg.SetDword(root, "ErrorControl", 1);
                 return true;
             }
             if (c.StartsWith("IFEO"))
             {
-                Reg.RunCode("delete \"" + (x.DelKey != null ? x.DelKey : x.Location) + "\" /v Debugger /f", out o);
+                Reg.DeleteValue(x.DelKey != null ? x.DelKey : x.Location, "Debugger");
                 return true;
             }
             if (c.StartsWith("Winlogon Shell"))
             {
-                Reg.RunCode("add \"" + x.DelKey + "\" /v Shell /t REG_SZ /d \"explorer.exe\" /f", out o); return true;
+                Reg.SetString(x.DelKey, "Shell", "explorer.exe"); return true;
             }
             if (c.StartsWith("Winlogon Userinit"))
             {
-                Reg.RunCode("add \"" + x.DelKey + "\" /v Userinit /t REG_SZ /d \"C:\\Windows\\system32\\userinit.exe,\" /f", out o); return true;
+                Reg.SetString(x.DelKey, "Userinit", "C:\\Windows\\system32\\userinit.exe,"); return true;
             }
             return false;
         }
@@ -1846,24 +1943,24 @@ namespace RescueScan
         // ================= RESTORE DEFAULTS =================
         void RestoreWinlogonDefaults()
         {
-            string root = SoftRoot(); string o;
+            string root = SoftRoot();
             foreach (string[] a in Anchors())
             {
                 string key = root + "\\" + a[1];
-                if (a[4] == "1") Reg.RunCode("delete \"" + key + "\" /v \"" + a[2] + "\" /f", out o);
-                else Reg.RunCode("add \"" + key + "\" /v \"" + a[2] + "\" /t REG_SZ /d \"" + a[3] + "\" /f", out o);
+                if (a[4] == "1") Reg.DeleteValue(key, a[2]);
+                else Reg.SetString(key, a[2], a[3]);
             }
         }
 
         // снять все IFEO-Debugger блокировки напрямую (не требует предыдущего скана)
         int ClearIFEODirect()
         {
-            int n = 0; string o;
+            int n = 0;
             string ifeo = SoftRoot() + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
             foreach (string sk in Reg.Subkeys(ifeo))
                 foreach (string[] v in Reg.Values(sk))
                     if (v[0].Equals("Debugger", StringComparison.OrdinalIgnoreCase))
-                    { Reg.RunCode("delete \"" + sk + "\" /v Debugger /f", out o); n++; }
+                    { if (Reg.DeleteValue(sk, v[0])) n++; }
             return n;
         }
 
@@ -1878,28 +1975,28 @@ namespace RescueScan
 
         int RestoreRestrictions()
         {
-            int n = 0; string o;
+            int n = 0;
             string[] sysVals = { "DisableTaskMgr", "DisableRegistryTools", "DisableCMD", "DisableChangePassword" };
             string[] expVals = { "NoRun", "NoFolderOptions", "NoControlPanel", "NoDesktop", "NoViewContextMenu", "NoFind", "NoClose", "RestrictRun" };
             foreach (string b in PolicyBases())
             {
-                foreach (string v in sysVals) if (Reg.RunCode("delete \"" + b + "\\System\" /v " + v + " /f", out o) == 0) n++;
-                foreach (string v in expVals) if (Reg.RunCode("delete \"" + b + "\\Explorer\" /v " + v + " /f", out o) == 0) n++;
+                foreach (string v in sysVals) if (Reg.DeleteValue(b + "\\System", v)) n++;
+                foreach (string v in expVals) if (Reg.DeleteValue(b + "\\Explorer", v)) n++;
             }
             return n;
         }
 
         int RestoreAssoc()
         {
-            int n = 0; string o; string root = SoftRoot() + "\\Classes";
-            string cmd = "\\\"%1\\\" %*";  // -> "%1" %*
+            int n = 0; string root = SoftRoot() + "\\Classes";
+            string cmd = "\"%1\" %*";
             string[][] map = { new string[]{".exe","exefile"}, new string[]{".com","comfile"}, new string[]{".bat","batfile"}, new string[]{".cmd","cmdfile"} };
             foreach (string[] m in map)
             {
-                if (Reg.RunCode("add \"" + root + "\\" + m[0] + "\" /ve /d \"" + m[1] + "\" /f", out o) == 0) n++;
-                if (Reg.RunCode("add \"" + root + "\\" + m[1] + "\\shell\\open\\command\" /ve /d \"" + cmd + "\" /f", out o) == 0) n++;
+                if (Reg.SetString(root + "\\" + m[0], "", m[1])) n++;
+                if (Reg.SetString(root + "\\" + m[1] + "\\shell\\open\\command", "", cmd)) n++;
             }
-            Reg.RunCode("add \"" + root + "\\.lnk\" /ve /d \"lnkfile\" /f", out o);
+            Reg.SetString(root + "\\.lnk", "", "lnkfile");
             // иконки: чистим кэш (офлайн — файлы юзеров; живьём — тоже файлы)
             try
             {
@@ -1925,10 +2022,10 @@ namespace RescueScan
             foreach (Finding x in new List<Finding>(lastFindings))
             {
                 if (x.Risk != "SUSPECT") continue;
-                bool r = false; string o;
+                bool r = false;
                 if (x.Kind == 2) r = QuarFile(x.DelPath);
-                else if (x.Kind == 0) { if (QuarReg(x.DelKey)) r = Reg.RunCode("delete \"" + x.DelKey + "\" /v \"" + x.DelName + "\" /f", out o) == 0; }
-                else if (x.Kind == 1) { if (QuarReg(x.DelKey)) r = Reg.RunCode("delete \"" + x.DelKey + "\" /f", out o) == 0; }
+                else if (x.Kind == 0) { if (QuarReg(x.DelKey)) r = Reg.DeleteValue(x.DelKey, x.DelName); }
+                else if (x.Kind == 1) { if (QuarReg(x.DelKey)) r = Reg.DeleteKey(x.DelKey); }
                 else continue;
                 if (r) ok++; else fail++;
             }
@@ -2027,7 +2124,7 @@ namespace RescueScan
             string msg = "";
             try { if (path.Length > 0 && Directory.Exists(path)) { Directory.Delete(path, true); msg += "Папка удалена. "; } }
             catch (Exception ex) { msg += "Папка: " + ex.Message + " "; }
-            string o; if (Reg.RunCode("delete \"" + pk + "\" /f", out o) == 0) msg += "ProfileList очищен.";
+            if (Reg.DeleteKey(pk)) msg += "ProfileList очищен.";
             MessageBox.Show(msg, "Профиль");
             AccRefresh();
         }
@@ -2049,8 +2146,8 @@ namespace RescueScan
                 bool r = false;
                 try
                 {
-                    if (x.Kind == 0) { string o; r = Reg.RunCode("delete \"" + x.DelKey + "\" /v \"" + x.DelName + "\" /f", out o) == 0; }
-                    else if (x.Kind == 1) { string o; r = Reg.RunCode("delete \"" + x.DelKey + "\" /f", out o) == 0; }
+                    if (x.Kind == 0) r = Reg.DeleteValue(x.DelKey, x.DelName);
+                    else if (x.Kind == 1) r = Reg.DeleteKey(x.DelKey);
                     else if (x.Kind == 2) { File.Delete(x.DelPath); r = true; }
                 }
                 catch { r = false; }
