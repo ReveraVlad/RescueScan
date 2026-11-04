@@ -1,6 +1,7 @@
 # Builds RescueScan.cs + tests\RescueScan.Tests.cs with the in-box .NET Framework C# compiler (C# 5) and runs the tests.
-# Registry tests write only to HKCU\Software\RescueScanTests\<guid> (and one HKCU\RescueScanTests_<guid> key) and
-# remove them afterwards. No administrator rights needed.
+# Registry tests write only to HKCU\Software\RescueScanTests\<guid> and remove it afterwards. No administrator rights
+# needed; run elevated to include the real reg.exe save/load/unload test (a temporary hive file mounted at an unusual
+# HKLM\RS_U9<random> name and unloaded again; it never touches the RS_* mounts of a RescueScan that is running).
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here

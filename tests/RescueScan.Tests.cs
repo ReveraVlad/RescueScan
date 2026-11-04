@@ -1,7 +1,8 @@
 // Self-contained tests for RescueScan's registry / process helpers and scan-side filters (C# 5, no frameworks).
 // Compiled TOGETHER with RescueScan.cs using -main:RescueScan.Tests.TestMain:
 //   Linux/Mono : tests/run-tests.sh          Windows : tests/run-tests.ps1 (in-box csc)
-// Registry tests use a throwaway key HKCU\Software\RescueScanTests\<guid> that is always removed at the end.
+// Registry tests use a throwaway key HKCU\Software\RescueScanTests\<guid> that is always removed at the end (the one
+// Windows-only mount test also uses a temporary hive file and an HKLM\RS_U9<random> mount point, both removed).
 // Tests named "[win]" need real Windows (P/Invoke, reg.exe, registry symbolic links) and are skipped elsewhere.
 using System;
 using System.Collections.Generic;
@@ -22,7 +23,6 @@ namespace RescueScan.Tests
         static readonly string Id = Guid.NewGuid().ToString("N");
         static readonly string Sub = "Software\\RescueScanTests\\" + Id;   // relative to HKCU
         static readonly string Root = "HKCU\\" + Sub;
-        static readonly string TopLevel = "RescueScanTests_" + Id;          // directly under HKCU (DeleteKey must refuse it)
 
         static int Main()
         {
@@ -75,6 +75,8 @@ namespace RescueScan.Tests
                 Run("Pairs/DeleteKey: registry symbolic links are not followed [win]", LinksWin);
                 Run("Export: exit code AND file [win]", ExportWin);
                 Run("Values/Pairs: a key with a deny-ACL is noted, not silently skipped [win]", DeniedWin);
+                Run("QuoteArg: round trip through the real CommandLineToArgvW [win]", QuoteArgWin);
+                Run("Mounts: real reg.exe save / load / read / unload [win, admin]", MountWin);
             }
             finally
             {
@@ -134,7 +136,6 @@ namespace RescueScan.Tests
             using (RegistryKey b = HKCU())
             {
                 try { b.DeleteSubKeyTree(Sub, false); } catch { }
-                try { b.DeleteSubKeyTree(TopLevel, false); } catch { }
                 try
                 {
                     using (RegistryKey p = b.OpenSubKey("Software\\RescueScanTests"))
@@ -589,10 +590,15 @@ namespace RescueScan.Tests
             True(Reg.KeyExists(Root + "\\keep"), "...and nothing was deleted");
             True(!Reg.DeleteKey("XYZ\\a\\b"), "bad root");
             True(!Reg.DeleteKey(null), "null");
-            using (RegistryKey b = HKCU()) b.CreateSubKey(TopLevel).Close();
-            True(!Reg.DeleteKey("HKCU\\" + TopLevel), "first-level key refused");
-            True(ManagedExists(TopLevel), "...and still there");
-            True(!Reg.DeleteKey("HKCU"), "hive root refused");
+            // refusals are checked on the path alone (no real first-level key is created or touched for this)
+            RegistryHive h; string parent, name;
+            foreach (string bad in new string[] { "HKCU", "HKCU\\", "HKCU\\Software", "HKLM\\SOFTWARE", "HKLM\\RS_SOFT", "HKEY_USERS\\S-1-5-21-1",
+                                                  "HKLM\\SOFTWARE\\x\\", "HKLM\\\\x", "XYZ\\a\\b", "", null, "HKLM\\SOFTWARE\\x\0" })
+                True(!Reg.DeletablePath(bad, out h, out parent, out name), "refused: " + Show(bad));
+            True(Reg.DeletablePath("HKLM\\RS_SYS\\ControlSet001\\Services\\evil", out h, out parent, out name), "deep key accepted");
+            Eq("RS_SYS\\ControlSet001\\Services", parent, "parent");
+            Eq("evil", name, "name");
+            Eq(RegistryHive.LocalMachine, h, "hive");
         }
 
         static void KeyExistsCases()
@@ -1185,6 +1191,83 @@ namespace RescueScan.Tests
             True(!Reg.KeyExists(Root + "\\lnk\\holder"), "holder gone");
             True(Reg.KeyExists(Root + "\\lnk\\target\\child"), "link target's subtree untouched");
             Eq("T", Find(Reg.Values(Root + "\\lnk\\target"), "Debugger")[1], "link target's values untouched");
+        }
+
+        [DllImport("shell32.dll", SetLastError = true)]
+        static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string cmdLine, out int numArgs);
+        [DllImport("kernel32.dll")]
+        static extern IntPtr LocalFree(IntPtr hMem);
+
+        static List<string> WinArgv(string cmd)
+        {
+            int n;
+            IntPtr p = CommandLineToArgvW(cmd, out n);
+            if (p == IntPtr.Zero) throw new Exception("CommandLineToArgvW failed: " + Marshal.GetLastWin32Error());
+            try
+            {
+                List<string> r = new List<string>();
+                for (int i = 0; i < n; i++) r.Add(Marshal.PtrToStringUni(Marshal.ReadIntPtr(p, i * IntPtr.Size)));
+                return r;
+            }
+            finally { LocalFree(p); }
+        }
+
+        // QuoteArg against the REAL Windows parser, not only the test's own reference parser (CommandLineToArgvW follows
+        // the same backslash / quote rules as the UCRT argv parser of reg.exe and bcdedit.exe; net1.exe's older msvcrt
+        // copy differs only for "" inside quotes, which QuoteArg never emits).
+        static void QuoteArgWin()
+        {
+            WindowsOnly();
+            string[] tricky = { "", " ", "\"", "\\", "\\\\", "\"\"", "a\\", "\\\"", "HKLM\\RS_SOFT\\x\\", "q\"uote", "trail ", "Кириллица\\",
+                                "\"%1\" %*", "C:\\Program Files\\x.exe", "a\tb", "%TEMP%\\x\\\"" };
+            foreach (string t in tricky)
+            {
+                List<string> got = WinArgv("reg.exe export " + Reg.QuoteArg(t) + " " + Reg.QuoteArg("f.reg") + " /y");
+                Eq(5, got.Count, "argc for [" + Show(t) + "]");
+                Eq(t, got[2], "round trip");
+                Eq("f.reg", got[3], "next argument intact after [" + Show(t) + "]");
+            }
+            Random r = new Random(54321);
+            char[] alphabet = { 'a', 'Z', ' ', '\t', '\\', '\\', '"', '"', 'Я', '%', '/', ':' };
+            for (int i = 0; i < 3000; i++)
+            {
+                string a = RandomString(r, alphabet), b = RandomString(r, alphabet);
+                List<string> got = WinArgv("x.exe " + Reg.QuoteArg(a) + " " + Reg.QuoteArg(b));
+                if (got.Count != 3 || got[1] != a || got[2] != b)
+                    throw new Exception("CommandLineToArgvW round trip failed for [" + Show(a) + "] [" + Show(b) + "]");
+            }
+        }
+
+        // The real reg.exe through HiveMounts: a hive file (saved from a throwaway HKCU key) is mounted under an unusual
+        // RS_U name, read through the registry API, and unloaded. Needs administrator rights (reg save/load); skipped
+        // otherwise. CleanupStale is NOT called here: it would unload a RescueScan running on this machine.
+        static void MountWin()
+        {
+            WindowsOnly();
+            using (RegistryKey k = Make("hivesrc\\Software\\Microsoft\\Windows\\CurrentVersion\\Run")) k.SetValue("q\"uote", "C:\\x.exe");
+            string dir = Path.Combine(Path.GetTempPath(), "rs hive " + Id);
+            Directory.CreateDirectory(dir);
+            tempDirs.Add(dir);
+            string file = Path.Combine(dir, "NTUSER test.DAT"), o;
+            if (Reg.RunCode("save " + Reg.QuoteArg(Root + "\\hivesrc") + " " + Reg.QuoteArg(file) + " /y", out o) != 0)
+                throw new SkipException("reg save failed (administrator rights needed): " + Reg.OneLine(o, 120));
+            string name = "RS_U9" + new Random().Next(100000, 999999);
+            HiveMounts m = new HiveMounts(Reg.RunCode, Reg.KeyExists, File.Exists, delegate { return Reg.SubkeyNames("HKLM"); }, delegate { return false; });
+            StringBuilder w = new StringBuilder();
+            try
+            {
+                Eq(0, m.Mount(name, file, w), "mounted (" + w + ")");
+                List<string[]> v = Reg.Values("HKLM\\" + name + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+                True(Find(v, "q\"uote") != null, "the hive's value is readable at HKLM\\" + name);
+                True(Array.IndexOf(Reg.SubkeyNames("HKLM"), name) >= 0, "listed under HKLM");
+                Eq(1, m.Mount(name + "x", Path.Combine(dir, "missing.DAT"), w), "missing file: not created by reg load");
+                True(!File.Exists(Path.Combine(dir, "missing.DAT")), "...no empty hive file was created");
+            }
+            finally
+            {
+                Eq("", m.UnloadAll(), "unloaded");
+                True(!Reg.KeyExists("HKLM\\" + name), "mount point gone");
+            }
         }
 
         // A key whose DACL denies reading: Values/Pairs see nothing (like reg.exe did), but the key is noted for the scan.

@@ -593,11 +593,8 @@ namespace RescueScan
         // with "\" (an empty last component). false if the key is missing or was not (completely) deleted.
         public static bool DeleteKey(string key)
         {
-            RegistryHive hive; string sub;
-            if (key == null || key.EndsWith("\\") || !SplitRoot(key, out hive, out sub)) return false;
-            int cut = sub.LastIndexOf('\\');
-            if (cut <= 0) return false;
-            string parentSub = sub.Substring(0, cut), name = sub.Substring(cut + 1);
+            RegistryHive hive; string parentSub, name;
+            if (!DeletablePath(key, out hive, out parentSub, out name)) return false;
             try
             {
                 using (RegistryKey b = RegistryKey.OpenBaseKey(hive, View))
@@ -611,6 +608,19 @@ namespace RescueScan
                 }
             }
             catch { return false; }
+        }
+
+        // The paths DeleteKey accepts: a known root and at least two levels below it (never a hive root or a first-level
+        // key such as HKLM\SOFTWARE or a mounted HKLM\RS_SOFT), no trailing "\" (an empty last component), no NUL.
+        internal static bool DeletablePath(string key, out RegistryHive hive, out string parentSub, out string name)
+        {
+            string sub;
+            parentSub = ""; name = "";
+            if (key == null || key.EndsWith("\\") || !SplitRoot(key, out hive, out sub)) { hive = RegistryHive.LocalMachine; return false; }
+            int cut = sub.LastIndexOf('\\');
+            if (cut <= 0) return false;
+            parentSub = sub.Substring(0, cut); name = sub.Substring(cut + 1);
+            return name.Length > 0 && parentSub.Trim('\\').Length > 0;
         }
 
         // Windows: depth-first; each key is opened WITHOUT following a link and deleted through its own handle.
