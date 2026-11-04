@@ -23,10 +23,14 @@ namespace RescueScan
         public string Value;      // command / path / data
         public string Location;   // reg key or file path used for deletion display
         public string Risk;       // "", "SUSPECT", "REVIEW"
-        public int Kind;          // 0=regvalue 1=regkey 2=file
+        public int Kind;          // 0=regvalue 1=regkey 2=file 3=info only (fix by hand) 4=reset value to its default
         public string DelKey;     // reg key for delete
         public string DelName;    // value name (for regvalue)
         public string DelPath;    // file path (for file)
+        // Kind 4: values that must never be deleted (Winlogon Shell/Userinit/VMApplet, BootExecute, SetupExecute,
+        // SafeBoot AlternateShell): «Удалить», «Карантин», «Обезвредить» and the Easy button write this back instead.
+        public object ResetData;  // string or string[]
+        public RegistryValueKind ResetType = RegistryValueKind.String;
     }
 
     static class Reg
@@ -491,7 +495,7 @@ namespace RescueScan
             string s = o as string;
             if (s != null) { int z = s.IndexOf('\0'); return z >= 0 ? s.Substring(0, z) : s; }
             string[] m = o as string[];
-            if (m != null) return string.Join("\\0", Array.FindAll(m, delegate(string e) { return e.Length > 0; }));   // reg.exe skips empty items
+            if (m != null) return string.Join("\\0", Array.FindAll(m, delegate(string e) { return !string.IsNullOrEmpty(e); }));   // reg.exe skips empty items
             if (o is int) return "0x" + ((uint)(int)o).ToString("x");
             if (o is long) return "0x" + ((ulong)(long)o).ToString("x");
             byte[] b = o as byte[];
@@ -507,7 +511,7 @@ namespace RescueScan
             return sb.ToString();
         }
 
-        static string KindName(RegistryValueKind k)
+        internal static string KindName(RegistryValueKind k)
         {
             switch (k)
             {
@@ -657,7 +661,7 @@ namespace RescueScan
             return SetValue(key, name, value, RegistryValueKind.DWord);
         }
 
-        static bool SetValue(string key, string name, object data, RegistryValueKind kind)
+        internal static bool SetValue(string key, string name, object data, RegistryValueKind kind)
         {
             RegistryHive hive; string sub;
             if (name == null || name.IndexOf('\0') >= 0 || data == null || !SplitRoot(key, out hive, out sub) || sub.Trim('\\').Length == 0) return false;
@@ -672,6 +676,179 @@ namespace RescueScan
                 }
             }
             catch { return false; }
+        }
+
+        // REG_MULTI_SZ (or a single REG_SZ / REG_EXPAND_SZ) as its items, empty items kept; null = no such value / not
+        // a string type. Unlike Values() this keeps an item that contains the two characters "\0" intact.
+        internal static string[] ReadMulti(string key, string name)
+        {
+            using (RegistryKey k = OpenKey(key, false))
+            {
+                if (k == null || name == null || name.IndexOf('\0') >= 0) return null;
+                object o;
+                try { o = k.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames); } catch { return null; }
+                string[] m = o as string[];
+                if (m != null) return m;
+                string s = o as string;
+                return s != null ? new string[] { s } : null;
+            }
+        }
+
+        // ================= exact backups: raw type + bytes (quarantine .reg files, typed restore) =================
+        // Raw registry type and bytes of one value. Windows: RegQueryValueEx (any type, exact bytes); elsewhere (Mono,
+        // tests) rebuilt from the managed value. false = no such value / unreadable.
+        internal static bool ReadRaw(RegistryKey k, string name, out int type, out byte[] data)
+        {
+            type = 0; data = null;
+            if (k == null || name == null || name.IndexOf('\0') >= 0) return false;
+            if (UseNative) return RawValue(k, name, out type, out data);
+            RegistryValueKind kind;
+            object o;
+            try { kind = k.GetValueKind(name); o = k.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames); }
+            catch { return false; }
+            if (o == null) return false;
+            switch (kind)
+            {
+                case RegistryValueKind.String: type = 1; data = Encoding.Unicode.GetBytes((string)o + "\0"); return true;
+                case RegistryValueKind.ExpandString: type = 2; data = Encoding.Unicode.GetBytes((string)o + "\0"); return true;
+                case RegistryValueKind.Binary: type = 3; data = (byte[])o; return true;
+                case RegistryValueKind.DWord: type = 4; data = BitConverter.GetBytes((int)o); return true;
+                case RegistryValueKind.MultiString:
+                    StringBuilder sb = new StringBuilder();
+                    foreach (string e in (string[])o) sb.Append(e).Append('\0');
+                    sb.Append('\0');
+                    type = 7; data = Encoding.Unicode.GetBytes(sb.ToString()); return true;
+                case RegistryValueKind.QWord: type = 11; data = BitConverter.GetBytes((long)o); return true;
+                case RegistryValueKind.None: type = 0; data = o as byte[] ?? new byte[0]; return true;
+            }
+            return false;
+        }
+
+        internal const int SnapshotMaxKeys = 100000;
+
+        // Everything needed to put a value or a key back exactly as it was: valueName != null -> that one value (a
+        // missing value is recorded as "delete on restore"); valueName == null -> the key with its whole subtree.
+        // null + err when the copy would be incomplete (denied subkey, hidden NUL name, unreadable value, too big):
+        // then nothing may be deleted. Registry links are recorded as keys but never followed.
+        internal static List<RegSection> Snapshot(string key, string valueName, out string err)
+        {
+            err = "";
+            List<RegSection> res = new List<RegSection>();
+            if (key == null || key.IndexOf('\0') >= 0 || (valueName != null && valueName.IndexOf('\0') >= 0)) { err = "имя с NUL"; return null; }
+            using (RegistryKey k = OpenKey(key, false))
+            {
+                if (valueName != null)
+                {
+                    RegSection s = new RegSection(key.TrimEnd('\\'));
+                    RegVal v = new RegVal(); v.Name = valueName;
+                    if (k == null)
+                    {
+                        if (KeyExists(key)) { err = "нет доступа к ключу " + key; return null; }
+                        v.Delete = true;
+                    }
+                    else if (!ReadRaw(k, valueName, out v.Type, out v.Data)) v.Delete = true;
+                    s.Values.Add(v);
+                    res.Add(s);
+                    return res;
+                }
+                if (k == null) { err = KeyExists(key) ? "нет доступа к ключу " + key : "нет ключа " + key; return null; }
+                int budget = SnapshotMaxKeys;
+                return SnapRec(k, key.TrimEnd('\\'), 0, ref budget, res, ref err) ? res : null;
+            }
+        }
+
+        static bool SnapRec(RegistryKey k, string path, int depth, ref int budget, List<RegSection> res, ref string err)
+        {
+            if (depth > 512 || --budget < 0) { err = "слишком большая ветка: " + path; return false; }
+            RegSection s = new RegSection(path);
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string n in Names(k, false))
+            {
+                RegVal v = new RegVal(); v.Name = n;
+                if (!seen.Add(n) || !ReadRaw(k, n, out v.Type, out v.Data)) { err = "значение не читается (скрытое имя с NUL?) в " + path; return false; }
+                s.Values.Add(v);
+            }
+            res.Add(s);
+            if (IsLink(k)) return true;   // a link's own values (SymbolicLinkValue) only; never its target
+            foreach (string c in Names(k, true))
+            {
+                if (c.Length == 0) { err = "подключ со скрытым именем (NUL) в " + path; return false; }
+                bool deny;
+                using (RegistryKey ck = OpenChild(k, c, false, out deny))
+                {
+                    if (ck == null) { err = (deny ? "нет доступа к " : "не открывается ") + path + "\\" + c; return false; }
+                    if (!SnapRec(ck, path + "\\" + c, depth + 1, ref budget, res, ref err)) return false;
+                }
+            }
+            return true;
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegSetValueExW")]
+        static extern int NRegSetValueEx(SafeRegistryHandle key, string name, int reserved, int type, byte[] data, int size);
+
+        // Writes one value with its exact raw type and bytes (creates the key). Windows: RegSetValueEx, so any type and
+        // odd strings (no terminator, embedded NUL) come back byte for byte; elsewhere only the standard types.
+        internal static bool SetRaw(string key, string name, int type, byte[] data)
+        {
+            RegistryHive hive; string sub;
+            if (name == null || name.IndexOf('\0') >= 0 || data == null || !SplitRoot(key, out hive, out sub) || sub.Trim('\\').Length == 0) return false;
+            try
+            {
+                using (RegistryKey b = RegistryKey.OpenBaseKey(hive, View))
+                using (RegistryKey k = b.CreateSubKey(sub))
+                {
+                    if (k == null) return false;
+                    if (UseNative) return NRegSetValueEx(k.Handle, name, 0, type, data, data.Length) == 0;
+                    object o; RegistryValueKind kind;
+                    if (!RawToManaged(type, data, out o, out kind)) return false;
+                    k.SetValue(name, o, kind);
+                    return true;
+                }
+            }
+            catch { return false; }
+        }
+
+        // raw (type, bytes) -> a value RegistryKey.SetValue accepts; false for types .NET cannot write.
+        internal static bool RawToManaged(int type, byte[] data, out object o, out RegistryValueKind kind)
+        {
+            o = null; kind = RegistryValueKind.Unknown;
+            switch (type)
+            {
+                case 1: case 2:
+                    o = TrimNul(Encoding.Unicode.GetString(data, 0, data.Length & ~1));
+                    kind = type == 1 ? RegistryValueKind.String : RegistryValueKind.ExpandString; return true;
+                case 7:
+                    string t = Encoding.Unicode.GetString(data, 0, data.Length & ~1);
+                    if (t.EndsWith("\0\0")) t = t.Substring(0, t.Length - 2); else if (t.EndsWith("\0")) t = t.Substring(0, t.Length - 1);
+                    o = t.Length == 0 ? new string[0] : t.Split('\0'); kind = RegistryValueKind.MultiString; return true;
+                case 4: if (data.Length != 4) return false; o = BitConverter.ToInt32(data, 0); kind = RegistryValueKind.DWord; return true;
+                case 11: if (data.Length != 8) return false; o = BitConverter.ToInt64(data, 0); kind = RegistryValueKind.QWord; return true;
+                case 3: o = data; kind = RegistryValueKind.Binary; return true;
+                case 0: o = data; kind = RegistryValueKind.None; return true;
+            }
+            return false;
+        }
+
+        static string TrimNul(string s) { int z = s.IndexOf('\0'); return z >= 0 ? s.Substring(0, z) : s; }
+
+        // = reg add KEY /f (no value): creates the key and its parents. false for a hive root / first level / failure.
+        internal static bool CreateKey(string key)
+        {
+            RegistryHive hive; string sub;
+            if (key == null || key.IndexOf('\0') >= 0 || !SplitRoot(key, out hive, out sub) || sub.Trim('\\').Length == 0) return false;
+            try
+            {
+                using (RegistryKey b = RegistryKey.OpenBaseKey(hive, View))
+                using (RegistryKey k = b.CreateSubKey(sub)) return k != null;
+            }
+            catch { return false; }
+        }
+
+        // true if the value exists (any type).
+        internal static bool HasValue(string key, string name)
+        {
+            using (RegistryKey k = OpenKey(key, false))
+                return k != null && name != null && name.IndexOf('\0') < 0 && ValueExists(k, name);
         }
 
         // ---- Windows-only native helpers: recursion and deletion never follow registry symbolic links ----
@@ -906,6 +1083,723 @@ namespace RescueScan
         }
     }
 
+    // One value of a registry backup: raw type + bytes, or Delete = "the value did not exist" (restore deletes it).
+    class RegVal
+    {
+        public string Name = "";
+        public int Type;
+        public byte[] Data;
+        public bool Delete;
+    }
+
+    // One key of a registry backup (full path) with its values.
+    class RegSection
+    {
+        public string Path;
+        public readonly List<RegVal> Values = new List<RegVal>();
+        public RegSection(string path) { Path = path; }
+    }
+
+    // Our own exact .reg writer and a parser for what it writes (also regedit's REGEDIT5 output): UTF-16LE + BOM,
+    // "Windows Registry Editor Version 5.00", @ = default value, "..." only for REG_SZ that round-trips as text,
+    // dword:xxxxxxxx, hex:, hex(N): for everything else (hex(2) expand, hex(7) multi, hex(b) qword, hex(0) none ...),
+    // "name"=- for a value that did not exist. Never shells out to reg.exe (whose export depends on reg.exe working
+    // and on its own file naming).
+    static class RegFile
+    {
+        internal const string Header = "Windows Registry Editor Version 5.00";
+
+        internal static string Esc(string s) { return s.Replace("\\", "\\\\").Replace("\"", "\\\""); }
+
+        static bool Printable(string s) { return s.IndexOf('\0') < 0 && s.IndexOf('\r') < 0 && s.IndexOf('\n') < 0; }
+
+        // The whole file text, or null + err when something cannot be written faithfully (a name with CR/LF/NUL).
+        internal static string Format(List<RegSection> secs, out string err)
+        {
+            err = "";
+            StringBuilder sb = new StringBuilder();
+            sb.Append(Header).Append("\r\n");
+            foreach (RegSection s in secs)
+            {
+                if (s.Path == null || !Printable(s.Path) || s.Path.Length == 0) { err = "имя ключа не записать в .reg"; return null; }
+                sb.Append("\r\n[").Append(s.Path).Append("]\r\n");
+                foreach (RegVal v in s.Values)
+                {
+                    string line = ValueLine(v);
+                    if (line == null) { err = "имя значения не записать в .reg: " + Reg.OneLine(v.Name, 60); return null; }
+                    sb.Append(line).Append("\r\n");
+                }
+            }
+            sb.Append("\r\n");
+            return sb.ToString();
+        }
+
+        internal static string ValueLine(RegVal v)
+        {
+            if (v.Name == null || !Printable(v.Name)) return null;
+            string name = v.Name.Length == 0 ? "@" : "\"" + Esc(v.Name) + "\"";
+            if (v.Delete) return name + "=-";
+            byte[] d = v.Data ?? new byte[0];
+            if (v.Type == 1 && d.Length >= 2 && d.Length % 2 == 0 && d[d.Length - 1] == 0 && d[d.Length - 2] == 0)
+            {
+                string t = Encoding.Unicode.GetString(d, 0, d.Length - 2);
+                if (Printable(t)) return name + "=\"" + Esc(t) + "\"";
+            }
+            if (v.Type == 4 && d.Length == 4) return name + "=dword:" + BitConverter.ToUInt32(d, 0).ToString("x8");
+            string pre = name + "=" + (v.Type == 3 ? "hex:" : "hex(" + ((uint)v.Type).ToString("x") + "):");
+            StringBuilder sb = new StringBuilder(pre);
+            int col = pre.Length;
+            for (int i = 0; i < d.Length; i++)
+            {
+                if (col > 76) { sb.Append("\\\r\n  "); col = 2; }   // regedit-style continuation lines
+                sb.Append(d[i].ToString("x2"));
+                col += 2;
+                if (i < d.Length - 1) { sb.Append(','); col++; }
+            }
+            return sb.ToString();
+        }
+
+        // Parses a .reg text (REGEDIT5). null + err on anything it does not understand: a backup that cannot be read
+        // exactly is not restored half-way.
+        internal static List<RegSection> Parse(string text, out string err)
+        {
+            err = "";
+            List<RegSection> res = new List<RegSection>();
+            if (text == null) { err = "пустой файл"; return null; }
+            if (text.Length > 0 && text[0] == '\uFEFF') text = text.Substring(1);
+            List<string> lines = new List<string>();
+            StringBuilder cur = null;
+            foreach (string raw in text.Replace("\r\n", "\n").Split('\n'))
+            {
+                string l = cur != null ? raw.TrimStart() : raw;
+                if (cur == null) cur = new StringBuilder();
+                if (l.EndsWith("\\") && IsHexLine(cur.ToString() + l)) { cur.Append(l.Substring(0, l.Length - 1)); continue; }
+                cur.Append(l);
+                lines.Add(cur.ToString());
+                cur = null;
+            }
+            if (cur != null) lines.Add(cur.ToString());
+            bool header = false;
+            RegSection sec = null;
+            foreach (string l0 in lines)
+            {
+                string l = l0.TrimEnd();
+                if (l.Trim().Length == 0 || l.TrimStart().StartsWith(";")) continue;
+                if (!header) { if (l.Trim() != Header) { err = "нет заголовка «" + Header + "»"; return null; } header = true; continue; }
+                if (l.StartsWith("["))
+                {
+                    int e = l.LastIndexOf(']');
+                    if (e < 2 || l.StartsWith("[-")) { err = "строка ключа не понята: " + Reg.OneLine(l, 80); return null; }
+                    sec = new RegSection(l.Substring(1, e - 1));
+                    res.Add(sec);
+                    continue;
+                }
+                if (sec == null) { err = "значение вне ключа"; return null; }
+                RegVal v = ParseValue(l, out err);
+                if (v == null) return null;
+                sec.Values.Add(v);
+            }
+            if (!header) { err = "нет заголовка «" + Header + "»"; return null; }
+            return res;
+        }
+
+        // a line that continues with "\" is a hex list ("=hex"); a quoted string that ends with \ is not continued
+        static bool IsHexLine(string l)
+        {
+            int q = NameEnd(l);
+            return q > 0 && q < l.Length && l[q] == '=' && l.Substring(q + 1).StartsWith("hex", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // index just after the name part ("..." or @), or -1
+        static int NameEnd(string l)
+        {
+            if (l.StartsWith("@")) return 1;
+            if (!l.StartsWith("\"")) return -1;
+            for (int i = 1; i < l.Length; i++)
+            {
+                if (l[i] == '\\') { i++; continue; }
+                if (l[i] == '"') return i + 1;
+            }
+            return -1;
+        }
+
+        static string Unesc(string s, out bool ok)
+        {
+            ok = true;
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (s[i] == '\\')
+                {
+                    if (i + 1 >= s.Length) { ok = false; break; }
+                    char c = s[++i];
+                    if (c != '\\' && c != '"') { ok = false; break; }
+                    sb.Append(c);
+                }
+                else if (s[i] == '"') { ok = false; break; }
+                else sb.Append(s[i]);
+            }
+            return sb.ToString();
+        }
+
+        static RegVal ParseValue(string l, out string err)
+        {
+            err = "";
+            int ne = NameEnd(l);
+            if (ne < 0 || ne >= l.Length || l[ne] != '=') { err = "строка значения не понята: " + Reg.OneLine(l, 80); return null; }
+            RegVal v = new RegVal();
+            bool ok = true;
+            v.Name = l[0] == '@' ? "" : Unesc(l.Substring(1, ne - 2), out ok);
+            if (!ok) { err = "имя значения не понято: " + Reg.OneLine(l, 80); return null; }
+            string d = l.Substring(ne + 1).Trim();
+            if (d == "-") { v.Delete = true; return v; }
+            if (d.StartsWith("\"") && d.EndsWith("\"") && d.Length >= 2)
+            {
+                string t = Unesc(d.Substring(1, d.Length - 2), out ok);
+                if (!ok) { err = "строка не понята: " + Reg.OneLine(l, 80); return null; }
+                v.Type = 1; v.Data = Encoding.Unicode.GetBytes(t + "\0");
+                return v;
+            }
+            if (d.StartsWith("dword:", StringComparison.OrdinalIgnoreCase))
+            {
+                uint n;
+                if (d.Length != 14 || !uint.TryParse(d.Substring(6), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out n))
+                { err = "dword не понят: " + Reg.OneLine(l, 80); return null; }
+                v.Type = 4; v.Data = BitConverter.GetBytes(n);
+                return v;
+            }
+            int type; string list;
+            if (d.StartsWith("hex:", StringComparison.OrdinalIgnoreCase)) { type = 3; list = d.Substring(4); }
+            else if (d.StartsWith("hex(", StringComparison.OrdinalIgnoreCase) && d.IndexOf("):") > 4)
+            {
+                int c = d.IndexOf("):");
+                uint t;
+                if (!uint.TryParse(d.Substring(4, c - 4), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out t))
+                { err = "тип не понят: " + Reg.OneLine(l, 80); return null; }
+                type = (int)t; list = d.Substring(c + 2);
+            }
+            else { err = "данные не поняты: " + Reg.OneLine(l, 80); return null; }
+            List<byte> bytes = new List<byte>();
+            foreach (string p in list.Split(','))
+            {
+                string h = p.Trim();
+                if (h.Length == 0 && list.Trim().Length == 0) break;
+                byte b;
+                if (h.Length != 2 || !byte.TryParse(h, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out b))
+                { err = "байты не поняты: " + Reg.OneLine(l, 80); return null; }
+                bytes.Add(b);
+            }
+            v.Type = type; v.Data = bytes.ToArray();
+            return v;
+        }
+    }
+
+    // Windows defaults and "is this the default / a legitimate Microsoft form" predicates for the values that must be
+    // RESET, never deleted (Winlogon Shell/Userinit/VMApplet, BootExecute, SetupExecute, SafeBoot AlternateShell).
+    // Sources: research windows-semantics Q1/Q2 (defaults observed on Win7 SP1 / Win10 / Server 2016-2022; KB Q160963).
+    static class Defaults
+    {
+        internal const string Shell = "explorer.exe";
+        internal const string VmApplet = "SystemPropertiesPerformance.exe /pagefile";
+        internal const string AlternateShell = "cmd.exe";
+        internal const string BootExecute = "autocheck autochk *";
+
+        // <SystemRoot>\system32\userinit.exe,  (the trailing comma is the Microsoft default form)
+        internal static string Userinit(string systemRoot)
+        {
+            return (string.IsNullOrEmpty(systemRoot) ? "C:\\Windows" : systemRoot.TrimEnd('\\')) + "\\system32\\userinit.exe,";
+        }
+
+        // The target's own %SystemRoot% as Windows sees it when it boots: offline the SOFTWARE value
+        // ...\Windows NT\CurrentVersion\SystemRoot (the drive letter of the installation, not WinPE's letter for that
+        // volume); live the running system's directory. Fallback: C: + the folder of the selected installation.
+        internal static string SystemRootFor(string regValue, bool live, string runWinDir, string tgtWinDir)
+        {
+            if (live && !string.IsNullOrEmpty(runWinDir)) return runWinDir.TrimEnd('\\');
+            string v = (regValue ?? "").Trim().TrimEnd('\\');
+            if (v.Length >= 4 && char.IsLetter(v[0]) && v[1] == ':' && v[2] == '\\' && v.IndexOf('%') < 0 && v.IndexOf('"') < 0) return v;
+            if (!string.IsNullOrEmpty(tgtWinDir) && tgtWinDir.Length >= 3) return "C:" + tgtWinDir.Substring(2).TrimEnd('\\');
+            return "C:\\Windows";
+        }
+
+        // Clean iff, after splitting on ',' (trimmed, empty parts dropped), there is exactly ONE program and it is
+        // <SystemRoot>\system32\userinit.exe or plain userinit.exe / userinit. systemRoot "" = unknown: any
+        // <letter>:\Windows\system32\userinit.exe is accepted.
+        internal static bool UserinitClean(string data, string systemRoot)
+        {
+            List<string> parts = new List<string>();
+            foreach (string p in (data ?? "").Split(',')) if (p.Trim().Length > 0) parts.Add(p.Trim());
+            if (parts.Count != 1) return false;
+            string x = parts[0];
+            if (x.Equals("userinit.exe", StringComparison.OrdinalIgnoreCase) || x.Equals("userinit", StringComparison.OrdinalIgnoreCase)) return true;
+            if (!string.IsNullOrEmpty(systemRoot)) return x.Equals(systemRoot.TrimEnd('\\') + "\\system32\\userinit.exe", StringComparison.OrdinalIgnoreCase);
+            return x.Length > 3 && char.IsLetter(x[0]) && x.Substring(1).Equals(":\\Windows\\system32\\userinit.exe", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Clean iff explorer.exe or <SystemRoot>\explorer.exe.
+        internal static bool ShellClean(string data, string systemRoot)
+        {
+            string x = (data ?? "").Trim();
+            if (x.Equals(Shell, StringComparison.OrdinalIgnoreCase)) return true;
+            return !string.IsNullOrEmpty(systemRoot) && x.Equals(systemRoot.TrimEnd('\\') + "\\explorer.exe", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // VMApplet: the Win7-11 default and the W2K/XP one.
+        internal static bool VmAppletClean(string data)
+        {
+            string x = string.Join(" ", (data ?? "").Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries));
+            return x.Equals(VmApplet, StringComparison.OrdinalIgnoreCase)
+                || x.Equals("rundll32 shell32,Control_RunDLL \"sysdm.cpl\"", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool AlternateShellClean(string data) { return (data ?? "").Trim().Equals(AlternateShell, StringComparison.OrdinalIgnoreCase); }
+
+        // One BootExecute entry written by Windows itself: "autocheck autochk" + only the documented switches
+        // (/k:<letters> from chkntfs /x; /r, /m, /p followed by \??\X: or \??\Volume{guid} from a scheduled chkdsk;
+        // /q, /v) and an optional "*" (all volumes). Anything else (another native program, extra arguments) is not.
+        internal static bool AutochkLine(string entry)
+        {
+            string[] t = (entry ?? "").Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (t.Length < 2 || !t[0].Equals("autocheck", StringComparison.OrdinalIgnoreCase) || !t[1].Equals("autochk", StringComparison.OrdinalIgnoreCase)) return false;
+            for (int i = 2; i < t.Length; i++)
+            {
+                string a = t[i].ToLowerInvariant();
+                if (a == "*" || a == "/q" || a == "/v" || NtVolume(a)) continue;
+                if (a.StartsWith("/k:") && a.Length > 3)
+                {
+                    for (int j = 3; j < a.Length; j++) if (a[j] < 'a' || a[j] > 'z') return false;
+                    continue;
+                }
+                if ((a == "/r" || a == "/m" || a == "/p") && i + 1 < t.Length && NtVolume(t[i + 1].ToLowerInvariant())) { i++; continue; }
+                return false;
+            }
+            return true;
+        }
+
+        // \??\C:  or  \??\Volume{8-4-4-4-12 hex}
+        static bool NtVolume(string a)
+        {
+            if (!a.StartsWith("\\??\\")) return false;
+            string v = a.Substring(4);
+            if (v.Length == 2 && v[0] >= 'a' && v[0] <= 'z' && v[1] == ':') return true;
+            if (!v.StartsWith("volume{") || !v.EndsWith("}") || v.Length != 44) return false;
+            for (int i = 7; i < 43; i++)
+            {
+                char c = v[i];
+                bool dash = i == 15 || i == 20 || i == 25 || i == 30;
+                if (dash ? c != '-' : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+            }
+            return true;
+        }
+
+        // What BootExecute is reset to: the legitimate autochk lines that are there, plus the default
+        // "autocheck autochk *" when no kept line covers all volumes.
+        internal static string[] BootExecuteRepair(string[] entries)
+        {
+            List<string> keep = new List<string>();
+            bool star = false;
+            foreach (string e in entries ?? new string[0])
+                if (AutochkLine(e))
+                {
+                    keep.Add(e.Trim());
+                    if (Array.IndexOf(e.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries), "*") >= 0) star = true;
+                }
+            if (!star) keep.Add(BootExecute);
+            return keep.ToArray();
+        }
+
+        // A SetupExecute entry of pending Windows servicing: poqexec.exe (bare, \SystemRoot\System32\ or
+        // <X>:\Windows\System32\) whose other arguments are switches or ...\WinSxS\pending.xml.
+        internal static bool ServicingEntry(string entry)
+        {
+            string[] t = (entry ?? "").Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (t.Length == 0) return false;
+            string exe = t[0].ToLowerInvariant();
+            int slash = exe.LastIndexOf('\\');
+            string dir = slash < 0 ? "" : exe.Substring(0, slash), name = exe.Substring(slash + 1);
+            if (name != "poqexec.exe" && name != "poqexec") return false;
+            if (dir.Length > 0 && dir != "\\systemroot\\system32" && !(dir.Length == 19 && dir[1] == ':' && dir.Substring(2) == "\\windows\\system32")) return false;
+            for (int i = 1; i < t.Length; i++)
+            {
+                string a = t[i].ToLowerInvariant();
+                if (a.StartsWith("/") && a.IndexOf('\\') < 0 && a.IndexOf(':') < 0) continue;
+                if (a.EndsWith("\\winsxs\\pending.xml") && (a.StartsWith("\\systemroot\\") || (a.Length > 3 && a[1] == ':' && a[2] == '\\'))) continue;
+                return false;
+            }
+            return true;
+        }
+
+        // IFEO Debugger values set by legitimate tools (research windows-semantics Q7): Process Explorer / System
+        // Informer / Process Hacker replacing Task Manager, Notepad++ replacing Notepad, and the Microsoft debuggers.
+        // Those are REVIEW (shown, never cleared by the blanket unlock); everything else is SUSPECT.
+        internal static bool IfeoKnownDebugger(string exe, string debugger)
+        {
+            string img = ImageName(debugger);
+            string e = (exe ?? "").ToLowerInvariant();
+            if (img == "vsjitdebugger.exe" || img == "windbg.exe" || img == "windbgx.exe" || img == "cdb.exe" || img == "ntsd.exe") return true;
+            if (e == "taskmgr.exe" && (img == "procexp.exe" || img == "procexp64.exe" || img == "procexp64a.exe" || img == "systeminformer.exe" || img == "processhacker.exe")) return true;
+            if (e == "notepad.exe" && img == "notepad++.exe") return true;
+            return false;
+        }
+
+        // file name (lower case) of the program a command line starts: "C:\x y\a.exe" -b  ->  a.exe
+        internal static string ImageName(string cmd)
+        {
+            string c = (cmd ?? "").Trim();
+            string first;
+            if (c.StartsWith("\"")) { int q = c.IndexOf('"', 1); first = q > 0 ? c.Substring(1, q - 1) : c.Substring(1); }
+            else
+            {
+                int ex = c.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);   // unquoted path with spaces
+                int sp = c.IndexOf(' ');
+                first = ex > 0 && (sp < 0 || ex < c.Length) ? c.Substring(0, Math.Min(c.Length, ex + 4)) : (sp > 0 ? c.Substring(0, sp) : c);
+            }
+            first = first.Trim();
+            return first.Substring(first.LastIndexOfAny(new char[] { '\\', '/' }) + 1).ToLowerInvariant();
+        }
+    }
+
+    // One line of a quarantine manifest (format 2). FILE: a moved file. REG: a registry value (V) or key (K) backed
+    // up to <N>.reg; the location is LOGICAL (installation + hive kind + profile + key path below the hive), so a
+    // restore in another session maps it onto whatever mount / HKU key that hive has now. Legacy = a line of the
+    // old format (shown, never restored automatically).
+    class ManEntry
+    {
+        public string Type = "";            // FILE | REG | LEGACY
+        public int N;                       // order of the backups (restore runs newest first)
+        public string Orig = "";            // FILE: original full path   LEGACY: original key / path
+        public string Vol = "";             // FILE: serial of the original volume ("" = unknown)
+        public string Backup = "";          // file name inside the quarantine folder (LEGACY: as written)
+        public int Attrs;                   // FILE: original attributes
+        public string Sha = "";             // SHA-256 of the backup file
+        public bool IsKey;                  // REG: K = whole key, V = one value
+        public string Install = "";         // REG: installation identity (InstallId)
+        public string RootKind = "";        // REG: SOFTWARE | SYSTEM | USER
+        public string UserId = "";          // REG USER: SID, or "dir:" + profile folder without the drive letter
+        public string RegRoot = "";         // REG: the hive root as written in the .reg file
+        public string Rel = "";             // REG: key path below the hive root
+        public string ValueName = "";       // REG V: the value name
+        public string Note = "";            // REG: what it was (category / action)
+    }
+
+    static class QuarMan
+    {
+        internal const string Magic = "RESCUESCAN-QUARANTINE";
+        internal const string ManifestName = "manifest.txt";
+
+        // TAB / CR / LF / backslash escaped: a field can never split a line or add one.
+        internal static string Esc(string s)
+        {
+            return (s ?? "").Replace("\\", "\\\\").Replace("\t", "\\t").Replace("\r", "\\r").Replace("\n", "\\n").Replace("\0", "\\0");
+        }
+
+        internal static string Unesc(string s)
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (s[i] != '\\' || i + 1 >= s.Length) { sb.Append(s[i]); continue; }
+                char c = s[++i];
+                sb.Append(c == 't' ? '\t' : c == 'r' ? '\r' : c == 'n' ? '\n' : c == '0' ? '\0' : c);
+            }
+            return sb.ToString();
+        }
+
+        static string Join(params string[] f)
+        {
+            string[] e = new string[f.Length];
+            for (int i = 0; i < f.Length; i++) e[i] = Esc(f[i]);
+            return string.Join("\t", e);
+        }
+
+        internal static string HeaderLine(string stamp, string target, string install) { return Join(Magic, "2", stamp, target, install); }
+
+        internal static string FileLine(ManEntry e)
+        {
+            return Join("FILE", e.N.ToString(), e.Orig, e.Vol, e.Backup, e.Attrs.ToString(), e.Sha);
+        }
+
+        internal static string RegLine(ManEntry e)
+        {
+            return Join("REG", e.N.ToString(), e.IsKey ? "K" : "V", e.Install, e.RootKind, e.UserId, e.RegRoot, e.Rel, e.ValueName, e.Backup, e.Sha, e.Note);
+        }
+
+        internal static bool IsHeader(string line) { return line != null && line.StartsWith(Magic + "\t2\t"); }
+
+        // One manifest line -> entry. null with err "" = not an entry (header, blank, *-FAIL lines); null with err = rejected.
+        internal static ManEntry Parse(string line, out string err)
+        {
+            err = "";
+            if (string.IsNullOrEmpty(line) || IsHeader(line)) return null;
+            string[] raw = line.Split('\t');
+            string[] p = new string[raw.Length];
+            for (int i = 0; i < raw.Length; i++) p[i] = Unesc(raw[i]);
+            if (p[0] != "FILE" && p[0] != "REG") return null;
+            ManEntry e = new ManEntry();
+            if (p.Length >= 4 && p[2] == "=>")   // format 1: FILE orig => dst   /   REG key => dst [tag]
+            {
+                e.Type = "LEGACY"; e.Orig = p[1]; e.Backup = p[3]; e.Note = p[0];
+                return e;
+            }
+            int n;
+            if (p.Length < 2 || !int.TryParse(p[1], out n) || n <= 0) { err = "нет номера"; return null; }
+            e.N = n;
+            if (p[0] == "FILE")
+            {
+                if (p.Length != 7) { err = "FILE: число полей"; return null; }
+                e.Type = "FILE"; e.Orig = p[2]; e.Vol = p[3]; e.Backup = p[4]; e.Sha = p[6];
+                if (!int.TryParse(p[5], out e.Attrs)) { err = "FILE: атрибуты"; return null; }
+                if (!AbsLocalPath(e.Orig)) { err = "FILE: путь не абсолютный локальный: " + e.Orig; return null; }
+            }
+            else
+            {
+                if (p.Length != 12) { err = "REG: число полей"; return null; }
+                e.Type = "REG"; e.IsKey = p[2] == "K"; e.Install = p[3]; e.RootKind = p[4]; e.UserId = p[5]; e.RegRoot = p[6];
+                e.Rel = p[7]; e.ValueName = p[8]; e.Backup = p[9]; e.Sha = p[10]; e.Note = p[11];
+                if (p[2] != "K" && p[2] != "V") { err = "REG: вид"; return null; }
+                if (e.RootKind != "SOFTWARE" && e.RootKind != "SYSTEM" && e.RootKind != "USER") { err = "REG: куст " + e.RootKind; return null; }
+                if (e.RootKind == "USER" && e.UserId.Length == 0) { err = "REG: профиль не указан"; return null; }
+                if (!e.RegRoot.StartsWith("HKEY_", StringComparison.OrdinalIgnoreCase)) { err = "REG: корень " + e.RegRoot; return null; }
+                if (!RelKeyOk(e.Rel, e.IsKey)) { err = "REG: путь ключа " + e.Rel; return null; }
+                if (e.ValueName.IndexOf('\0') >= 0) { err = "REG: имя с NUL"; return null; }
+            }
+            if (!PlainName(e.Backup)) { err = "имя бэкапа: " + e.Backup; return null; }
+            if (e.Sha.Length != 64) { err = "нет SHA-256"; return null; }
+            return e;
+        }
+
+        // key path below a hive root: components non-empty, no NUL; a whole key needs at least one component
+        internal static bool RelKeyOk(string rel, bool isKey)
+        {
+            if (rel == null || rel.IndexOf('\0') >= 0) return false;
+            if (rel.Length == 0) return !isKey;
+            foreach (string c in rel.Split('\\')) if (c.Length == 0) return false;
+            return true;
+        }
+
+        // a bare file name inside the quarantine folder (no path, no "..", not the manifest itself)
+        internal static bool PlainName(string n)
+        {
+            if (string.IsNullOrEmpty(n) || n == "." || n == ".." || n.Length > 200) return false;
+            if (n.IndexOfAny(new char[] { '\\', '/', ':', '\0' }) >= 0 || n.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return false;
+            if (n.EndsWith(".") || n.EndsWith(" ")) return false;
+            return !n.Equals(ManifestName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // X:\... with no "." / ".." components, no device / UNC forms
+        internal static bool AbsLocalPath(string p)
+        {
+            if (string.IsNullOrEmpty(p) || p.Length < 4 || !char.IsLetter(p[0]) || p[1] != ':' || p[2] != '\\') return false;
+            if (p.IndexOf('\0') >= 0 || p.IndexOf('/') >= 0) return false;
+            foreach (string c in p.Substring(3).Split('\\')) if (c.Length == 0 || c == "." || c == "..") return false;
+            return true;
+        }
+
+        // <n>_<name>.quarantine: never executable by double click, never an attacker-chosen extension or path.
+        internal static string QuarFileName(int n, string original)
+        {
+            string name = original ?? "";
+            name = name.Substring(name.LastIndexOfAny(new char[] { '\\', '/' }) + 1);
+            StringBuilder sb = new StringBuilder();
+            char[] bad = Path.GetInvalidFileNameChars();
+            foreach (char c in name) sb.Append(c < 32 || Array.IndexOf(bad, c) >= 0 || c == ':' ? '_' : c);
+            string s = sb.ToString().TrimEnd('.', ' ');
+            if (s.Length > 80) s = s.Substring(0, 80);
+            return n + "_" + s + ".quarantine";
+        }
+
+        // Where a new quarantine folder may go, best first: <target drive>\RescueScan_Quarantine\<stamp>, then
+        // <exe folder>\RescueScan_Quarantine\<stamp>. Never on the WinPE RAM disk (ramDrive, e.g. X:) and never under
+        // %TEMP%: both are gone after a reboot, and with them the only copy of what was removed.
+        internal static List<string> Candidates(string tgtDrive, string exeDir, string ramDrive, string tempDir, string stamp)
+        {
+            List<string> res = new List<string>();
+            if (!string.IsNullOrEmpty(tgtDrive) && tgtDrive.Length == 2 && tgtDrive[1] == ':' && !OnDrive(tgtDrive, ramDrive))
+                res.Add(tgtDrive + "\\RescueScan_Quarantine\\" + stamp);
+            if (!string.IsNullOrEmpty(exeDir) && exeDir.Length >= 3 && exeDir[1] == ':' && !OnDrive(exeDir, ramDrive) && !Below(exeDir, tempDir))
+            {
+                string c = exeDir.TrimEnd('\\') + "\\RescueScan_Quarantine\\" + stamp;
+                if (!res.Exists(delegate(string r) { return r.Equals(c, StringComparison.OrdinalIgnoreCase); })) res.Add(c);
+            }
+            return res;
+        }
+
+        static bool OnDrive(string p, string drive)
+        {
+            return !string.IsNullOrEmpty(drive) && p.StartsWith(drive.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool Below(string p, string dir)
+        {
+            if (string.IsNullOrEmpty(p) || string.IsNullOrEmpty(dir)) return false;
+            string a = p.TrimEnd('\\') + "\\", b = dir.TrimEnd('\\') + "\\";
+            return a.StartsWith(b, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // the backup file 'name' resolves to a file directly inside 'dir'
+        internal static bool Inside(string dir, string name)
+        {
+            if (!PlainName(name)) return false;
+            try
+            {
+                string d = Path.GetFullPath(dir).TrimEnd('\\', '/');
+                string f = Path.GetFullPath(Path.Combine(dir, name));
+                return string.Equals(Path.GetDirectoryName(f).TrimEnd('\\', '/'), d, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        internal static string Sha256(string file)
+        {
+            using (System.Security.Cryptography.SHA256 h = System.Security.Cryptography.SHA256.Create())
+            using (FileStream s = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read))
+                return Reg.Hex(h.ComputeHash(s)).ToLowerInvariant();
+        }
+    }
+
+    // File-system operations that work for every name Win32 can store: on Windows through \\?\ paths (names ending in
+    // "." or " ", which the normal path rules silently strip and then hit a DIFFERENT file), without following
+    // junctions / symlinks, read-only / hidden / system cleared first. Elsewhere (Mono, tests) the managed API.
+    static class FsOps
+    {
+        static bool Win { get { return Environment.OSVersion.Platform == PlatformID.Win32NT; } }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct FindData
+        {
+            public uint Attr, C1, C2, A1, A2, W1, W2; public uint SizeHigh, SizeLow, R0, R1;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Name;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)] public string Alt;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr FindFirstFileW(string p, out FindData d);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool FindNextFileW(IntPtr h, out FindData d);
+        [DllImport("kernel32.dll")] static extern bool FindClose(IntPtr h);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool DeleteFileW(string p);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool RemoveDirectoryW(string p);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool SetFileAttributesW(string p, uint a);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint GetFileAttributesW(string p);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool MoveFileExW(string a, string b, int flags);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool GetVolumeInformationW(string root, StringBuilder name, int nameSize, out uint serial, out uint maxComp, out uint flags, StringBuilder fs, int fsSize);
+
+        const uint INVALID = 0xFFFFFFFF, A_RO = 1, A_HIDDEN = 2, A_SYSTEM = 4, A_DIR = 0x10, A_REPARSE = 0x400, A_NORMAL = 0x80;
+
+        internal static string Long(string p)
+        {
+            if (p.StartsWith("\\\\?\\")) return p;
+            if (p.StartsWith("\\\\")) return "\\\\?\\UNC\\" + p.Substring(2);
+            return "\\\\?\\" + p;
+        }
+
+        static string Why() { return new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message; }
+
+        // attributes, or -1 when nothing is there
+        internal static int Attrs(string p)
+        {
+            if (Win) { uint a = GetFileAttributesW(Long(p)); return a == INVALID ? -1 : (int)a; }
+            try { return File.Exists(p) || Directory.Exists(p) ? (int)File.GetAttributes(p) : -1; } catch { return -1; }
+        }
+
+        internal static bool Exists(string p) { return Attrs(p) != -1; }
+
+        internal static bool SetAttrs(string p, int a)
+        {
+            if (Win) return SetFileAttributesW(Long(p), a == 0 ? A_NORMAL : (uint)a);
+            try { File.SetAttributes(p, a == 0 ? FileAttributes.Normal : (FileAttributes)a); return true; } catch { return false; }
+        }
+
+        // drops ReadOnly / Hidden / System (attrib +r makes DeleteFile fail with "access denied")
+        internal static void ClearRhs(string p)
+        {
+            int a = Attrs(p);
+            if (a != -1 && (a & (int)(A_RO | A_HIDDEN | A_SYSTEM)) != 0) SetAttrs(p, a & ~(int)(A_RO | A_HIDDEN | A_SYSTEM));
+        }
+
+        internal static bool DeleteFile(string p, out string err)
+        {
+            err = "";
+            ClearRhs(p);
+            if (Win) { if (DeleteFileW(Long(p))) return true; err = Why(); return false; }
+            try { File.Delete(p); return !File.Exists(p); } catch (Exception ex) { err = ex.Message; return false; }
+        }
+
+        // Moves a file (also to another volume). The destination must not exist. The source must be gone afterwards:
+        // a cross-volume move that copied but could not delete the original is a failure (err says so).
+        internal static bool MoveFile(string src, string dst, out string err)
+        {
+            err = "";
+            try
+            {
+                if (Win) { if (!MoveFileExW(Long(src), Long(dst), 0x2 | 0x8)) { err = Why(); return false; } }   // COPY_ALLOWED | WRITE_THROUGH
+                else File.Move(src, dst);
+            }
+            catch (Exception ex) { err = ex.Message; return false; }
+            if (Exists(src)) { err = "копия сделана, но оригинал не удалился (файл занят?)"; return false; }
+            return true;
+        }
+
+        // Names in a folder exactly as stored (also "x." and "x "). null = cannot be listed.
+        internal static List<string> List(string dir)
+        {
+            List<string> res = new List<string>();
+            if (!Win)
+            {
+                try { foreach (string e in Directory.GetFileSystemEntries(dir)) res.Add(Path.GetFileName(e)); return res; }
+                catch { return null; }
+            }
+            FindData d;
+            IntPtr h = FindFirstFileW(Long(dir.TrimEnd('\\') + "\\*"), out d);
+            if (h == new IntPtr(-1)) return Marshal.GetLastWin32Error() == 2 ? res : null;
+            try
+            {
+                do { if (d.Name != "." && d.Name != "..") res.Add(d.Name); } while (FindNextFileW(h, out d));
+            }
+            finally { FindClose(h); }
+            return res;
+        }
+
+        // Deletes a folder tree. Junctions / symlinks inside are removed as links; their targets are never entered.
+        // Continues after errors; returns false (and counts them in 'failed') if anything stayed.
+        internal static bool DeleteTree(string dir, ref int failed, ref string err)
+        {
+            int a = Attrs(dir);
+            if (a == -1) return true;
+            if ((a & (int)A_REPARSE) == 0)
+            {
+                List<string> names = List(dir);
+                if (names == null) { failed++; if (err.Length == 0) err = "папка не читается: " + dir; return false; }
+                foreach (string n in names)
+                {
+                    string p = Win ? dir.TrimEnd('\\') + "\\" + n : Path.Combine(dir, n);
+                    int pa = Attrs(p);
+                    string e;
+                    if (pa != -1 && (pa & (int)A_DIR) != 0) DeleteTree(p, ref failed, ref err);
+                    else if (!DeleteFile(p, out e)) { failed++; if (err.Length == 0) err = n + ": " + e; }
+                }
+            }
+            ClearRhs(dir);
+            bool ok;
+            if (Win) ok = RemoveDirectoryW(Long(dir));
+            else { try { Directory.Delete(dir, false); ok = true; } catch { ok = false; } }
+            if (!ok) { failed++; if (err.Length == 0) err = dir + ": " + (Win ? Why() : "не удалена"); }
+            return ok && failed == 0;
+        }
+
+        // Volume serial number of the drive of 'path' as 8 hex digits ("" = unknown, e.g. not Windows).
+        internal static string VolumeSerial(string path)
+        {
+            if (!Win || string.IsNullOrEmpty(path) || path.Length < 2 || path[1] != ':') return "";
+            try
+            {
+                uint serial, mc, fl;
+                if (GetVolumeInformationW(path.Substring(0, 2) + "\\", null, 0, out serial, out mc, out fl, null, 0)) return serial.ToString("X8");
+            }
+            catch { }
+            return "";
+        }
+    }
+
     class MainForm : Form
     {
         ComboBox cboWin;
@@ -923,7 +1817,9 @@ namespace RescueScan
         string tgtWinDir = "";       // e.g. D:\Windows
         string tgtSoft = "";         // SOFTWARE root: HKLM\RS_SOFT (offline) / HKLM\SOFTWARE (live); "" = not available
         string tgtSys = "";          // SYSTEM root:   HKLM\RS_SYS  (offline) / HKLM\SYSTEM   (live); "" = not available
-        List<string[]> tgtUsers = new List<string[]>();   // {name, hive root (HKLM\RS_U<n> / HKU\<SID>) or "", profile dir}
+        List<string[]> tgtUsers = new List<string[]>();   // {name, hive root (HKLM\RS_U<n> / HKU\<SID>) or "", profile dir, SID or ""}
+        string tgtSysRoot = "";      // the target's own %SystemRoot% as it boots (e.g. C:\Windows also when WinPE calls it D:)
+        string tgtInstall = "";      // identity of the installation for quarantine backups (InstallId)
         // The MOUNT ROLE: only the RescueScan GUI that holds this mutex mounts or unloads hives (HiveMounts). A second
         // instance never does, so the holder may treat every RS_* mount it did not make as stale, and neither instance
         // can unload or replace a hive the other one is using. A second instance takes the role over once the holder
@@ -1106,8 +2002,10 @@ namespace RescueScan
             rdef.Click += delegate { RepairSet(false); };
             rcus.Click += delegate { RepairSet(true); };
             chkGuard.CheckedChanged += delegate { GuardToggle(); };
-            bunlock.Click += delegate { if (!RequireSoft("Снять блокировки")) return; int a = RestoreRestrictions(); int b = ClearIFEODirect(); MessageBox.Show("Снято ограничений политик: " + a + "\r\nСнято IFEO-блокировок: " + b + "\r\nЦель: " + TargetName(), "Разблокировка"); };
-            bassoc.Click += delegate { if (!RequireSoft("Вернуть ассоциации")) return; int a = RestoreAssoc(); MessageBox.Show("Восстановлено ассоциаций/иконок: " + a + "\r\nЦель: " + TargetName(), "Ассоциации"); };
+            bunlock.Click += delegate { if (!RequireSoft("Снять блокировки")) return; quarErr = ""; int a = RestoreRestrictions(); int kept; int b = ClearIFEODirect(out kept);
+                MessageBox.Show("Снято ограничений политик: " + a + "\r\nСнято IFEO-блокировок: " + b + (kept > 0 ? "\r\nОставлено известных отладчиков (Process Explorer, Notepad++…): " + kept + " — сними вручную в списке скана, если не нужны" : "")
+                    + "\r\nЦель: " + TargetName() + (quarDir.Length > 0 ? "\r\nБэкап изменений: " + quarDir : "") + (quarErr.Length > 0 ? "\r\nОшибка: " + quarErr : ""), "Разблокировка"); };
+            bassoc.Click += delegate { if (!RequireSoft("Вернуть ассоциации")) return; quarErr = ""; int a = RestoreAssoc(); MessageBox.Show("Восстановлено ассоциаций/иконок: " + a + "\r\nЦель: " + TargetName() + (quarDir.Length > 0 ? "\r\nБэкап изменений: " + quarDir : "") + (quarErr.Length > 0 ? "\r\nОшибка: " + quarErr : ""), "Ассоциации"); };
 
             // ---- TAB (accounts): live net user ops ----
             Panel abar = new Panel(); abar.Dock = DockStyle.Top; abar.Height = 36;
@@ -1116,6 +2014,7 @@ namespace RescueScan
             Button aen = new Button(); aen.Text = "Включить/разблок."; aen.Left = 236; aen.Top = 6; aen.Width = 140;
             Button adel = new Button(); adel.Text = "Удалить юзера"; adel.Left = 380; adel.Top = 6; adel.Width = 120;
             Button aprof = new Button(); aprof.Text = "Удалить профиль"; aprof.Left = 504; aprof.Top = 6; aprof.Width = 130;
+            accBtns = new Button[] { apass, aen, adel, aprof };
             abar.Controls.Add(aref); abar.Controls.Add(apass); abar.Controls.Add(aen); abar.Controls.Add(adel); abar.Controls.Add(aprof);
             lvAcc = new ListView(); lvAcc.Dock = DockStyle.Fill; lvAcc.View = View.Details; lvAcc.FullRowSelect = true; lvAcc.GridLines = true;
             lvAcc.Columns.Add("Пользователь", 180); lvAcc.Columns.Add("Отключён", 80); lvAcc.Columns.Add("Заблокирован", 100); lvAcc.Columns.Add("Пароль нужен", 100); lvAcc.Columns.Add("SID", 300);
@@ -1165,6 +2064,7 @@ namespace RescueScan
 
             // wiring tab1
             btnDetect.Click += delegate { Detect(); };
+            cboWin.SelectedIndexChanged += delegate { UpdateAccState(); };
             btnScan.Click += delegate { Scan(); };
             btnMark.Click += delegate { MarkSuspect(lv); };
             btnPreboot.Click += delegate { PrebootScan(); };
@@ -1220,9 +2120,12 @@ namespace RescueScan
 "       Жёлтый = REVIEW (легит, но частое у малвари место: AppData/ProgramData/Downloads/автозагрузка) — просто глянь.\r\n" +
 "\r\n" +
 "1) АВТОЗАГРУЗКА (полная): «Найти ОС» -> «Сканировать» -> ВСЕ точки автозапуска. Кнопки: Обезвредить / Карантин / Удалить / Экспорт / Pre-boot.\r\n" +
-"   Pre-boot (ESP/BCD): проверяет загрузчик и ESP \\EFI\\ — ловит дисковый буткит («вирус до BIOS»).\r\n" +
-"   ОБЕЗВРЕДИТЬ (defuse): службе -> Start=4/ErrorControl=1, IFEO -> убрать Debugger, Winlogon -> дефолт. Делай ПЕРЕД удалением файла,\r\n" +
-"   иначе удаление boot-критичного бинаря даёт BSOD 0x7B (винда не грузится).\r\n" +
+"   Pre-boot (ESP/BCD): хранилища BCD (системное + \\EFI\\Microsoft\\Boot\\BCD каждого ESP с буквой) и файлы ESP — только ИНФОРМАЦИЯ,\r\n" +
+"   кнопками не удаляется (загрузчики Linux/производителя легитимны): чинить вручную (bcdedit / bcdboot).\r\n" +
+"   ОБЕЗВРЕДИТЬ (defuse): службе -> Start=4/ErrorControl=1, IFEO -> убрать только значение Debugger, Winlogon/BootExecute -> дефолт.\r\n" +
+"   Делай ПЕРЕД удалением файла, иначе удаление boot-критичного бинаря даёт BSOD 0x7B (винда не грузится). Всё — с бэкапом в карантин.\r\n" +
+"   НЕ УДАЛЯЮТСЯ, а возвращаются к дефолту Windows (любой кнопкой): Winlogon Shell/Userinit/VMApplet, BootExecute (законные строки autochk\r\n" +
+"   остаются), SetupExecute (ожидающее обновление Windows не трогается), SafeBoot AlternateShell. Userinit берётся из SystemRoot цели.\r\n" +
 "\r\n" +
 "2) АВТОЗАПУСК (кратко): только Run/RunOnce/Планировщик/Startup — как «Автозагрузка» в Диспетчере задач Windows.\r\n" +
 "\r\n" +
@@ -1230,18 +2133,33 @@ namespace RescueScan
 "   закроет RescueScan, напарник его перезапустит и запишет в лог (%TEMP%\\rescuescan.log). По умолчанию выключен.\r\n" +
 "\r\n" +
 "4) ПРОВОДНИК: видит СКРЫТЫЕ и СИСТЕМНЫЕ файлы (серым/оранжевым). Красный = найден сканом. Кнопки: Запустить (ручной запуск exe,\r\n" +
-"   если сломан шелл), Переименовать, Карантин, Удалить, Снять скрытие (убрать H/S), Кто ссылается (из какой автозагрузки стартует файл).\r\n" +
+"   если сломан шелл), Переименовать, Карантин, Удалить, Снять скрытие (убрать H/S/R), Кто ссылается (из какой автозагрузки стартует файл).\r\n" +
+"   Удалить: корни дисков и системные папки (Windows, Program Files, ProgramData, Users…) не удаляются; папка — только после второго\r\n" +
+"   подтверждения; «только чтение» снимается; имена с точкой/пробелом в конце удаляются правильно; ссылки (junction) не обходятся.\r\n" +
 "\r\n" +
-"5) КАРАНТИН: список из manifest.txt. «Восстановить» — файлы возвращаются на место, ветки реестра импортируются из .reg. «Найти последний»/«Открыть папку…».\r\n" +
+"5) КАРАНТИН: папка <диск цели>\\RescueScan_Quarantine\\<дата_время> (НЕ на RAM-диске X: и не в %TEMP% — там всё пропадёт при перезагрузке).\r\n" +
+"   Каждый элемент — свой бэкап: файл -> <N>_<имя>.quarantine (не запускается двойным кликом), реестр -> <N>.reg (точная копия всех типов;\r\n" +
+"   значение — только оно, ключ — со всеми подключами; .reg можно импортировать и вручную после загрузки системы).\r\n" +
+"   manifest.txt хранит, ЧТО и ОТКУДА (установка + куст + профиль + путь), поэтому «Восстановить» работает и в другом сеансе, и с живой ОС:\r\n" +
+"   выбери ту же установку, нажми «Сканировать», затем «Восстановить» (если куст/профиль не смонтирован — будет понятный отказ).\r\n" +
+"   Восстановление идёт от новых записей к старым; файл, лежащий сейчас на месте оригинала, не удаляется, а переименовывается.\r\n" +
+"   Бэкап с изменённой контрольной суммой (SHA-256) или вне папки карантина не восстанавливается. «Найти последний» ищет на всех дисках.\r\n" +
 "\r\n" +
-"6) РЕМОНТ: Winlogon Shell/Userinit/AppInit/cmd AutoRun. Красная строка = подмена. ВЫДЕЛИ строку -> «→ Дефолт» или «→ Своё…».\r\n" +
-"   Кнопки: «Снять блокировки (политики+IFEO)» (убрать DisableTaskMgr/DisableRegistryTools/NoRun + дебагеры), «Вернуть ассоциации» (.exe/.bat/.lnk+иконки).\r\n" +
+"6) РЕМОНТ: Winlogon Shell/Userinit/AppInit/cmd AutoRun (+ их WOW64-копии). Красная строка = подмена. ВЫДЕЛИ строку -> «→ Дефолт» или «→ Своё…».\r\n" +
+"   Кнопки: «Снять блокировки (политики+IFEO)» (DisableTaskMgr/DisableRegistryTools/DisableCMD, NoRun, DisallowRun + список, NoWinKeys, NoLogoff,\r\n" +
+"   DisableLockWorkstation, NoDrives/NoViewOnDrive и др. — у машины и у КАЖДОГО профиля; на живой ОС и у всех вошедших HKU\\S-1-5-21-*;\r\n" +
+"   IFEO: удаляется только значение Debugger, известные отладчики — Process Explorer, System Informer, Notepad++, windbg — остаются),\r\n" +
+"   «Вернуть ассоциации» (.exe/.bat/.lnk+иконки). КАЖДОЕ изменение сначала сохраняется в карантин (можно вернуть).\r\n" +
 "   «Стеречь Winlogon» — фоновый страж возвращает дефолт при подмене (живая ОС).\r\n" +
 "\r\n" +
 "7) АККАУНТЫ (только живая ОС + WMI): локальные юзеры. Колонки Отключён/Заблокирован/Пароль нужен (НЕ «есть ли пароль»!).\r\n" +
-"   Сменить пароль / Включить-разблок / Удалить юзера / Удалить профиль. В WinPE не работает — офлайн-сброс пароля делай chntpw / MS DaRT.\r\n" +
+"   Сменить пароль (скрытый ввод дважды, через API, не через командную строку) / Включить-разблок / Удалить юзера / Удалить профиль.\r\n" +
+"   Сброс пароля и удаление юзера = потеря его EFS-файлов и сохранённых паролей (DPAPI). Профиль удаляется, только если папка лежит прямо\r\n" +
+"   в ProfilesDirectory (C:\\Users) и это не твой/чужой/системный профиль; нужно ввести имя юзера.\r\n" +
+"   В WinPE и при выбранной офлайн-установке вкладка ОТКЛЮЧЕНА (там видны аккаунты самой WinPE) — офлайн-сброс пароля: chntpw / MS DaRT.\r\n" +
 "\r\n" +
 "8) ИЗИ-КНОПКА: одна кнопка по тумблерам: скан -> вернуть Winlogon/IFEO/ограничения/ассоциации+иконки -> обезвредить -> подозрительное в карантин -> watchdog.\r\n" +
+"   Каждое изменение реестра сохраняется в карантин ДО изменения; уже исправленное предыдущим шагом повторно не трогается.\r\n" +
 "   Тумблеры «Запуск вместо Explorer» и «Запуск до Windows/пре-бут» ВЫКЛЮЧЕНЫ (shell-hijack + boot-персистентность) — включим после одобрения CVP.\r\n" +
 "\r\n" +
 "ГРАНИЦЫ: чистит уровень ОС + загрузчик/ESP. Имплант в прошивку (BIOS/SPI) НЕ трогает — только перепрошивка. Офлайн-сброс пароля (правка SAM) — chntpw/DaRT.\r\n";
@@ -1461,7 +2379,7 @@ namespace RescueScan
         // of what could NOT be unloaded (those stay mounted and are retried on the next rescan / on exit).
         string UnloadAll()
         {
-            tgtReady = false; tgtSoft = ""; tgtSys = ""; tgtUsers.Clear();
+            tgtReady = false; tgtSoft = ""; tgtSys = ""; tgtUsers.Clear(); tgtSysRoot = ""; tgtInstall = "";
             return mounts.UnloadAll();
         }
 
@@ -1497,10 +2415,17 @@ namespace RescueScan
                 string root = "", nt = p[1] + "\\NTUSER.DAT";
                 if (tgtLive && p[2].Length > 0 && Reg.KeyExists("HKU\\" + p[2])) root = "HKU\\" + p[2];   // logged on: already loaded
                 else if (File.Exists(nt)) root = mounts.MountUser(nt, warn, ref next, ref failed);
-                tgtUsers.Add(new string[] { p[0], root, p[1] });
+                tgtUsers.Add(new string[] { p[0], root, p[1], p[2] });
             }
             if (failed > 0) warn.Append("не смонтировано профилей: " + failed + ". ");
+            string srv = "";
+            if (tgtSoft.Length > 0)
+                foreach (string[] v in Reg.Values(tgtSoft + "\\Microsoft\\Windows NT\\CurrentVersion"))
+                    if (v[0].Equals("SystemRoot", StringComparison.OrdinalIgnoreCase)) srv = v[1];
+            tgtSysRoot = Defaults.SystemRootFor(srv, tgtLive, RunningWinDir(), tgtWinDir);
+            tgtInstall = InstallId(tgtWinDir, FsOps.VolumeSerial(tgtWinDir));
             tgtReady = true;
+            UpdateAccState();
             return warn.ToString().Trim();
         }
 
@@ -1639,18 +2564,62 @@ namespace RescueScan
             if (tag.StartsWith("D|")) Nav(tag.Substring(2)); // папки открываем; файлы НЕ запускаем
         }
 
+        // Why a path must not be deleted from the Explorer tab ("" = may be deleted): drive roots and the folders
+        // Windows cannot live without (Windows, System32/SysWOW64/WinSxS, Program Files*, ProgramData, Users, System
+        // Volume Information, Boot, Recovery) on ANY drive, and the target's own Windows folder wherever it is.
+        internal static string ProtectedPath(string p, string targetWinDir)
+        {
+            string x = (p ?? "").Trim();
+            if (x.StartsWith("\\\\?\\")) x = x.Substring(4);
+            x = x.TrimEnd('\\', '/');
+            if (x.Length <= 2) return "корень диска";
+            if (x.Length < 3 || x[1] != ':' || x[2] != '\\') return x.StartsWith("\\\\") && x.Substring(2).Split('\\').Length <= 2 ? "корень сетевой папки" : "";
+            if (!string.IsNullOrEmpty(targetWinDir) && x.Equals(targetWinDir.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) return "папка Windows выбранной системы";
+            string rest = x.Substring(2);
+            string[] crit = { "\\Windows", "\\Windows\\System32", "\\Windows\\SysWOW64", "\\Windows\\WinSxS", "\\Windows\\System32\\config",
+                "\\Program Files", "\\Program Files (x86)", "\\ProgramData", "\\Users", "\\System Volume Information", "\\Boot", "\\Recovery", "\\EFI" };
+            foreach (string c in crit) if (rest.Equals(c, StringComparison.OrdinalIgnoreCase)) return "системная папка " + x;
+            if (!string.IsNullOrEmpty(targetWinDir))
+                foreach (string c in new string[] { "\\System32", "\\SysWOW64", "\\WinSxS", "\\System32\\config", "\\System32\\drivers" })
+                    if (x.Equals(targetWinDir.TrimEnd('\\') + c, StringComparison.OrdinalIgnoreCase)) return "системная папка " + x;
+            return "";
+        }
+
         void DeleteFile()
         {
             if (lvFiles.SelectedItems.Count == 0) { MessageBox.Show("Выбери файл/папку."); return; }
-            if (MessageBox.Show("Удалить выбранное (" + lvFiles.SelectedItems.Count + ")? Необратимо.", "Подтверждение",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-            int ok = 0, fail = 0;
+            List<string> files = new List<string>(), dirs = new List<string>(), refused = new List<string>();
             foreach (ListViewItem it in lvFiles.SelectedItems)
             {
-                string tag = (string)it.Tag; string p = tag.Substring(2);
-                try { if (tag.StartsWith("F|")) File.Delete(p); else Directory.Delete(p, true); ok++; } catch { fail++; }
+                string tag = (string)it.Tag, p = tag.Substring(2);
+                string why = ProtectedPath(p, tgtWinDir);
+                if (why.Length > 0) { refused.Add(p + " — " + why); continue; }
+                if (tag.StartsWith("F|")) files.Add(p); else dirs.Add(p);
             }
-            lblFiles.Text = "Удалено: " + ok + "   ошибок: " + fail; Nav(curPath);
+            if (refused.Count > 0)
+                MessageBox.Show("Это не удаляется (иначе Windows не загрузится или пропадут все данные):\r\n" + string.Join("\r\n", refused.ToArray()), "Удаление",
+                    MessageBoxButtons.OK, MessageBoxIcon.Stop);
+            if (files.Count + dirs.Count == 0) return;
+            if (MessageBox.Show("Удалить выбранное (файлов: " + files.Count + ", папок: " + dirs.Count + ")? Необратимо, без бэкапа (для бэкапа файла — «Карантин»).", "Подтверждение",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            if (dirs.Count > 0)
+            {
+                List<string> show = dirs.GetRange(0, Math.Min(dirs.Count, 10));
+                if (MessageBox.Show("ВНИМАНИЕ: папки удаляются ЦЕЛИКОМ, со всем содержимым:\r\n\r\n" + string.Join("\r\n", show.ToArray()) + (dirs.Count > 10 ? "\r\n…" : "") +
+                    "\r\n\r\nТочно удалить эти папки?", "Удаление папок", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            }
+            int ok = 0, fail = 0; string first = "";
+            foreach (string p in files)
+            {
+                string err;
+                if (FsOps.DeleteFile(p, out err)) ok++; else { fail++; if (first.Length == 0) first = Path.GetFileName(p) + ": " + err; }
+            }
+            foreach (string d in dirs)
+            {
+                int failed = 0; string err = "";
+                if (FsOps.DeleteTree(d, ref failed, ref err)) ok++; else { fail++; if (first.Length == 0) first = err; }
+            }
+            lblFiles.Text = "Удалено: " + ok + "   ошибок: " + fail + (first.Length > 0 ? "   (" + Reg.OneLine(first, 160) + ")" : ""); Nav(curPath);
         }
 
         void Unhide()
@@ -1659,7 +2628,8 @@ namespace RescueScan
             foreach (ListViewItem it in lvFiles.SelectedItems)
             {
                 string p = ((string)it.Tag).Substring(2);
-                try { FileAttributes a = File.GetAttributes(p); a &= ~FileAttributes.Hidden; a &= ~FileAttributes.System; File.SetAttributes(p, a); } catch { }
+                int a = FsOps.Attrs(p);
+                if (a != -1) FsOps.SetAttrs(p, a & ~(int)(FileAttributes.Hidden | FileAttributes.System | FileAttributes.ReadOnly));
             }
             Nav(curPath);
         }
@@ -1720,7 +2690,7 @@ namespace RescueScan
             AddValues(f, "RunOnce (HKLM WOW64)", SOFT + "\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
 
             // ---- Winlogon ----
-            ScanWinlogon(f, SOFT);
+            ScanWinlogon(f, SOFT, tgtSysRoot);
 
             // ---- AppInit_DLLs ----
             string winkey = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
@@ -1737,16 +2707,9 @@ namespace RescueScan
                         Add(f, "cmd AutoRun", v[0], v[1], cp, "SUSPECT", 0, cp, v[0], null);
 
             // ---- IFEO debugger hijacks ----
-            string ifeo = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
             bool cutWalk;
             List<string> cut = new List<string>();   // registry walks that hit a bound: told to the user
-            foreach (string[] pr in Reg.Pairs(ifeo, "Debugger", out cutWalk))
-            {
-                string sub = pr[0]; string dbg = pr[1];
-                string target = sub.Substring(sub.LastIndexOf('\\') + 1);
-                Add(f, "IFEO Debugger", target, dbg, sub, "SUSPECT", 1, sub, null, null);
-            }
-            if (cutWalk) cut.Add("IFEO");
+            ScanIfeo(f, SOFT, cut);
 
             // ---- extra SOFTWARE persistence (Active Setup, Notify, Policies, SilentProcessExit, class hijack) ----
             ScanExtraSoftware(f, SOFT);
@@ -1771,12 +2734,13 @@ namespace RescueScan
                 else Add(f, "MiniNT (журнал событий выкл.)", "MiniNT", "(ключ WinPE на установленной Windows: журнал событий не пишется — трюк вирусов)", mnt, "SUSPECT", 1, mnt, null, null);
             }
             string sm = SYS + "\\" + ccs + "\\Control\\Session Manager";
-            foreach (string[] v in Reg.Values(sm))
-                if (v[0].Equals("BootExecute", StringComparison.OrdinalIgnoreCase))
-                {
-                    string dt = v[1].Replace("\\0", " ").Trim();
-                    Add(f, "BootExecute", v[0], dt, sm, dt.ToLower().StartsWith("autocheck autochk") && dt.Length < 40 ? "" : "SUSPECT", 0, sm, v[0], null);
-                }
+            if (SYS.Length > 0) ScanBootExecute(f, sm);
+            // Safe Mode with Command Prompt runs AlternateShell instead of Explorer (default cmd.exe): reset, never delete
+            string sb = SYS + "\\" + ccs + "\\Control\\SafeBoot";
+            if (SYS.Length > 0)
+                foreach (string[] v in Reg.Values(sb))
+                    if (v[0].Equals("AlternateShell", StringComparison.OrdinalIgnoreCase))
+                        AddReset(f, "SafeBoot AlternateShell", sb, v[0], v[1], Defaults.AlternateShellClean(v[1]) ? "" : "SUSPECT", Defaults.AlternateShell, RegistryValueKind.String);
             // suspicious services/drivers only
             foreach (string[] pr in Reg.Pairs(SYS + "\\" + ccs + "\\Services", "ImagePath", out cutWalk))
             {
@@ -1920,19 +2884,84 @@ namespace RescueScan
             }
         }
 
-        // Winlogon Shell / Userinit / Taskman of the SOFTWARE root. (Shell and Userinit are ResetOnly: never deleted.)
-        internal static void ScanWinlogon(List<Finding> f, string SOFT)
+        // Winlogon Shell / Userinit / Taskman of the SOFTWARE root. Shell and Userinit are Kind 4 (reset to the default,
+        // never deleted: a deleted Userinit = logon/logoff loop). systemRoot = the target's %SystemRoot% ("" = unknown).
+        internal static void ScanWinlogon(List<Finding> f, string SOFT) { ScanWinlogon(f, SOFT, ""); }
+
+        internal static void ScanWinlogon(List<Finding> f, string SOFT, string systemRoot)
         {
             string wl = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
             foreach (string[] v in Reg.Values(wl))
             {
                 string nm = v[0]; string dt = v[1];
                 if (nm.Equals("Shell", StringComparison.OrdinalIgnoreCase))
-                    Add(f, "Winlogon Shell", nm, dt, wl, dt.Trim().ToLower() == "explorer.exe" ? "" : "SUSPECT", 0, wl, nm, null);
+                    AddReset(f, "Winlogon Shell", wl, nm, dt, Defaults.ShellClean(dt, systemRoot) ? "" : "SUSPECT", Defaults.Shell, RegistryValueKind.String);
                 else if (nm.Equals("Userinit", StringComparison.OrdinalIgnoreCase))
-                    Add(f, "Winlogon Userinit", nm, dt, wl, dt.ToLower().Contains("userinit.exe,") && dt.Split(',').Length <= 2 ? "" : "SUSPECT", 0, wl, nm, null);
+                    AddReset(f, "Winlogon Userinit", wl, nm, dt, Defaults.UserinitClean(dt, systemRoot) ? "" : "SUSPECT", Defaults.Userinit(systemRoot), RegistryValueKind.String);
                 else if (nm.Equals("Taskman", StringComparison.OrdinalIgnoreCase))
                     Add(f, "Winlogon Taskman", nm, dt, wl, "SUSPECT", 0, wl, nm, null);
+            }
+        }
+
+        // A Kind 4 finding: remediation writes 'data' back (never deletes the value).
+        internal static Finding AddReset(List<Finding> f, string cat, string key, string name, string shown, string risk, object data, RegistryValueKind type)
+        {
+            Add(f, cat, name, shown, key, risk, 4, key, name, null);
+            Finding x = f[f.Count - 1];
+            x.ResetData = data; x.ResetType = type;
+            return x;
+        }
+
+        // BootExecute (REG_MULTI_SZ): every entry must be a Windows autochk line; reset keeps those (+ the default).
+        internal static void ScanBootExecute(List<Finding> f, string sm)
+        {
+            string[] be = Reg.ReadMulti(sm, "BootExecute");
+            if (be == null) return;
+            bool bad = false;
+            foreach (string e in be) if (e.Trim().Length > 0 && !Defaults.AutochkLine(e)) bad = true;
+            AddReset(f, "BootExecute", sm, "BootExecute", string.Join(" | ", be), bad ? "SUSPECT" : "", Defaults.BootExecuteRepair(be), RegistryValueKind.MultiString);
+        }
+
+        // SetupExecute: pending Windows servicing (poqexec ... pending.xml) is REVIEW and never touched; anything else is
+        // SUSPECT and the reset keeps only the servicing entries.
+        internal static void ScanSetupExecute(List<Finding> f, string sm)
+        {
+            string[] se = Reg.ReadMulti(sm, "SetupExecute");
+            if (se == null) return;
+            List<string> keep = new List<string>();
+            bool other = false;
+            foreach (string e in se)
+            {
+                if (e.Trim().Length == 0) continue;
+                if (Defaults.ServicingEntry(e)) keep.Add(e); else other = true;
+            }
+            if (!other && keep.Count == 0) return;
+            string shown = string.Join(" | ", se);
+            if (!other) Add(f, "SessionMgr SetupExecute", "SetupExecute", shown + "   (ожидает установка обновления Windows — не трогать)", sm, "REVIEW", 3, null, null, null);
+            else AddReset(f, "SessionMgr SetupExecute", sm, "SetupExecute", shown, "SUSPECT", keep.ToArray(), RegistryValueKind.MultiString);
+        }
+
+        // IFEO Debugger values (also in filter subkeys <exe>\<n>) as "delete only the Debugger value" findings: the
+        // IFEO\<exe> key also holds Exploit Protection MitigationOptions, GlobalFlag, Windows 11's notepad redirect.
+        // Known legitimate debuggers are REVIEW. The Wow6432Node copy is not consulted on Win7+ (ntdll reads only the
+        // native key) but is listed as such; on a live system where it is the same key it is not listed twice.
+        internal static void ScanIfeo(List<Finding> f, string SOFT, List<string> cut)
+        {
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string root in new string[] { SOFT, SOFT + "\\Wow6432Node" })
+            {
+                bool wow = root != SOFT, cutWalk;
+                string ifeo = root + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+                foreach (string[] pr in Reg.Pairs(ifeo, "Debugger", out cutWalk))
+                {
+                    string rel = pr[0].Substring(ifeo.Length + 1);
+                    if (!seen.Add(rel + "\0" + pr[1]) && wow) continue;   // live: the shared key seen again through Wow6432Node
+                    if (pr[1].Trim().Length == 0) continue;
+                    string exe = rel.Split('\\')[0];
+                    string risk = Defaults.IfeoKnownDebugger(exe, pr[1]) && Risk(pr[1]) != "SUSPECT" ? "REVIEW" : "SUSPECT";
+                    Add(f, wow ? "IFEO Debugger (WOW64-копия, на Win7+ не действует)" : "IFEO Debugger", rel, pr[1], pr[0], risk, 0, pr[0], "Debugger", null);
+                }
+                if (cutWalk && cut != null) cut.Add(wow ? "IFEO WOW64" : "IFEO");
             }
         }
 
@@ -2024,7 +3053,9 @@ namespace RescueScan
             // Winlogon одиночные хуки
             string wl2 = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
             foreach (string[] v in Reg.Values(wl2))
-                if ((v[0].Equals("GinaDLL", StringComparison.OrdinalIgnoreCase) || v[0].Equals("VmApplet", StringComparison.OrdinalIgnoreCase)
+                if (v[0].Equals("VmApplet", StringComparison.OrdinalIgnoreCase))   // Microsoft default on Win7-11: reset, never delete
+                    AddReset(f, "Winlogon VmApplet", wl2, v[0], v[1], Defaults.VmAppletClean(v[1]) ? "" : "SUSPECT", Defaults.VmApplet, RegistryValueKind.String);
+                else if ((v[0].Equals("GinaDLL", StringComparison.OrdinalIgnoreCase)
                     || v[0].Equals("AppSetup", StringComparison.OrdinalIgnoreCase) || v[0].Equals("System", StringComparison.OrdinalIgnoreCase)
                     || v[0].Equals("UIHost", StringComparison.OrdinalIgnoreCase)) && v[1].Trim().Length > 0)
                     Add(f, "Winlogon " + v[0], v[0], v[1], wl2, "SUSPECT", 0, wl2, v[0], null);
@@ -2084,7 +3115,8 @@ namespace RescueScan
             }
             // Session Manager execute hooks
             string sm = CCS + "\\Control\\Session Manager";
-            foreach (string vn in new string[] { "SetupExecute", "S0InitialCommand", "PlatformExecute", "AppCertDlls" })
+            ScanSetupExecute(f, sm);
+            foreach (string vn in new string[] { "S0InitialCommand", "PlatformExecute", "AppCertDlls" })
                 foreach (string[] v in Reg.Values(sm))
                     if (v[0].Equals(vn, StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
                         Add(f, "SessionMgr " + vn, v[0], v[1].Replace("\\0", " "), sm, "SUSPECT", 0, sm, v[0], null);
@@ -2122,7 +3154,8 @@ namespace RescueScan
             return "";
         }
 
-        // ---- MODULE: pre-boot (BCD store + ESP contents) ----
+        // ---- MODULE: pre-boot (BCD stores + ESP contents) ----  Everything here is information (Kind 3): boot files are
+        // fixed by hand (bcdedit / bcdboot), never by «Отметить подозрит.» + «Удалить» (vendor and Linux loaders are legit).
         void PrebootScan()
         {
             if (curDrive == "") { MessageBox.Show("Сначала нажми «Сканировать» (нужен выбранный диск)."); return; }
@@ -2130,18 +3163,29 @@ namespace RescueScan
             List<Finding> f = new List<Finding>();
             string bo; int brc = RunProc("bcdedit", "/enum all", out bo);
             if (brc != 0) { string w = Reg.OneLine(bo, 220); bo = ""; Add(f, "BCD", "(bcdedit не сработал)", w.Length > 0 ? w : "код " + brc, "BCD store", "REVIEW", 3, null, null, null); }
-            ParseBcd(f, bo);
+            ParseBcd(f, bo, "BCD (системное хранилище запущенной ОС)");
             int esps = 0;
             for (char c = 'A'; c <= 'Z'; c++)
             {
                 string efi = c + ":\\EFI";
-                if (!Directory.Exists(efi)) continue;
-                if (!Directory.Exists(efi + "\\Microsoft") && !Directory.Exists(efi + "\\Boot")) continue;
-                ScanEsp(f, efi); esps++;
+                try
+                {
+                    if (!Directory.Exists(efi)) continue;
+                    if (!Directory.Exists(efi + "\\Microsoft") && !Directory.Exists(efi + "\\Boot")) continue;
+                    ScanEsp(f, efi); esps++;
+                    string store = efi + "\\Microsoft\\Boot\\BCD";   // the store this ESP boots with (e.g. the target's, not WinPE's)
+                    if (File.Exists(store))
+                    {
+                        string so; int rc = RunProc("bcdedit", "/store " + Reg.QuoteArg(store) + " /enum all", out so);
+                        if (rc == 0) ParseBcd(f, so, "BCD " + store);
+                        else Add(f, "BCD " + store, "(bcdedit /store не сработал)", Reg.OneLine(so, 220), store, "REVIEW", 3, null, null, null);
+                    }
+                }
+                catch (Exception ex) { Add(f, "ESP " + efi, "(ошибка)", Reg.OneLine(ex.Message, 200), efi, "REVIEW", 3, null, null, null); }
             }
             foreach (Finding x in f) AddRow(x);
             Cursor.Current = Cursors.Default;
-            lblStatus.Text = "Pre-boot: +" + f.Count + " записей (BCD + ESP найдено: " + esps + "). ESP без буквы — присвой через diskpart.";
+            lblStatus.Text = "Pre-boot: +" + f.Count + " записей (BCD + ESP найдено: " + esps + "). Только информация — чинить вручную. ESP без буквы — присвой через diskpart / mountvol.";
         }
 
         // bcdedit / net: full System32 path, concurrent stdout+stderr, timeout. Variable args -> Reg.QuoteArg.
@@ -2150,45 +3194,64 @@ namespace RescueScan
             return Reg.RunProcess(Reg.SysExe(exe), args, Reg.ToolTimeoutMs, out outp);
         }
 
-        void ParseBcd(List<Finding> f, string txt)
+        // "bcdedit /enum all" output -> {description, path} per entry. Entries are blocks separated by blank lines; in a
+        // block "description" may come before or after "path" (it comes after it in bcdedit's output).
+        internal static List<string[]> BcdEntries(string txt)
         {
-            if (txt == null) return;
-            string[] lines = txt.Replace("\r", "").Split('\n');
-            string desc = "";
-            foreach (string line in lines)
+            List<string[]> res = new List<string[]>();
+            if (txt == null) return res;
+            string desc = "", path = null;
+            foreach (string line in (txt.Replace("\r", "") + "\n\n").Split('\n'))
             {
                 string l = line.Trim();
-                if (l.StartsWith("description")) { desc = l.Substring(11).Trim(); }
-                else if (l.StartsWith("path"))
+                if (l.Length == 0)
                 {
-                    string p = l.Substring(4).Trim(); string lp = p.ToLower();
-                    bool ok = lp.EndsWith("winload.efi") || lp.EndsWith("winload.exe") || lp.EndsWith("bootmgfw.efi")
-                        || lp.EndsWith("bootmgr.efi") || lp.EndsWith("\\bootmgr") || lp.EndsWith("winresume.efi")
-                        || lp.EndsWith("winresume.exe") || lp.EndsWith("memtest.efi") || lp.EndsWith("hvloader.efi");
-                    Add(f, "BCD path", desc.Length > 0 ? desc : "(entry)", p, "BCD store", ok ? "" : "SUSPECT", 3, null, null, null);
+                    if (path != null) res.Add(new string[] { desc, path });
+                    desc = ""; path = null;
+                    continue;
                 }
+                int sp = l.IndexOfAny(new char[] { ' ', '\t' });
+                string key = sp < 0 ? l : l.Substring(0, sp), val = sp < 0 ? "" : l.Substring(sp).Trim();
+                if (key.Equals("description", StringComparison.OrdinalIgnoreCase)) desc = val;
+                else if (key.Equals("path", StringComparison.OrdinalIgnoreCase)) path = val;
             }
+            return res;
         }
 
+        internal static bool BcdPathOk(string p)
+        {
+            string lp = (p ?? "").Trim().ToLowerInvariant();
+            return lp.EndsWith("winload.efi") || lp.EndsWith("winload.exe") || lp.EndsWith("bootmgfw.efi")
+                || lp.EndsWith("bootmgr.efi") || lp.EndsWith("\\bootmgr") || lp.EndsWith("winresume.efi")
+                || lp.EndsWith("winresume.exe") || lp.EndsWith("memtest.efi") || lp.EndsWith("memtest.exe") || lp.EndsWith("hvloader.efi");
+        }
+
+        static void ParseBcd(List<Finding> f, string txt, string where)
+        {
+            foreach (string[] e in BcdEntries(txt))
+                Add(f, "BCD path", e[0].Length > 0 ? e[0] : "(entry)", e[1], where, BcdPathOk(e[1]) ? "" : "SUSPECT", 3, null, null, null);
+        }
+
+        // Every file of the ESP without throwing (one bad entry no longer hides the whole ESP); folders that cannot be
+        // read are listed. .efi: Microsoft\ / Boot\ are normal, other loaders (vendor, Linux, tools) are REVIEW.
         void ScanEsp(List<Finding> f, string efi)
         {
-            try
+            List<string> files = new List<string>(), denied = new List<string>();
+            FilesBelow(efi, 0, files, denied);
+            foreach (string dd in denied) Add(f, "ESP (нет доступа)", dd, "(папка не читается — проверь вручную)", dd, "REVIEW", 3, null, null, null);
+            foreach (string fp in files)
             {
-                foreach (string fp in Directory.GetFiles(efi, "*", SearchOption.AllDirectories))
+                string ext = Path.GetExtension(fp).ToLowerInvariant();
+                string rel = fp.Length > efi.Length ? fp.Substring(efi.Length).TrimStart('\\') : fp;
+                string low = rel.ToLowerInvariant();
+                if (ext == ".efi")
                 {
-                    string ext = Path.GetExtension(fp).ToLower();
-                    string rel = fp.Substring(efi.Length).TrimStart('\\');
-                    string low = rel.ToLower();
-                    if (ext == ".efi")
-                    {
-                        bool std = low.StartsWith("microsoft\\") || low.StartsWith("boot\\") || low.Contains("\\boot\\") || low.StartsWith("linux\\") || low.StartsWith("ubuntu\\");
-                        Add(f, "ESP .efi", rel, fp, fp, std ? "REVIEW" : "SUSPECT", 2, null, null, fp);
-                    }
-                    else if (ext == ".exe" || ext == ".dll" || ext == ".bat" || ext == ".cmd" || ext == ".ps1" || ext == ".vbs" || ext == ".scr")
-                        Add(f, "ESP чужой файл!", rel, fp, fp, "SUSPECT", 2, null, null, fp);
+                    bool std = low.StartsWith("microsoft\\") || low.StartsWith("boot\\");
+                    Add(f, "ESP .efi", rel, fp, fp, std ? "" : "REVIEW", 3, null, null, null);
                 }
+                else if (ext == ".exe" || ext == ".dll" || ext == ".bat" || ext == ".cmd" || ext == ".ps1" || ext == ".vbs" || ext == ".scr")
+                    Add(f, "ESP чужой файл!", rel, fp, fp, "SUSPECT", 3, null, null, null);
             }
-            catch { }
         }
 
         void AddStartup(List<Finding> f, string dir, string cat)
@@ -2255,39 +3318,50 @@ namespace RescueScan
         }
 
         // ================= QUARANTINE (safe removal with backup) =================
+        // Folder: <target drive>\RescueScan_Quarantine\<stamp> (else <exe folder>\RescueScan_Quarantine\<stamp>), never
+        // the WinPE RAM disk X: or %TEMP% (gone after a reboot). manifest.txt (format 2) is written BEFORE the first item;
+        // every item gets its own numbered backup (never a name chosen by the malware); registry backups are written by
+        // our own exact .reg writer and recorded with a LOGICAL location (installation + hive + profile + key path), so
+        // «Восстановить» works in a later session, with other drive letters / mount names, or from the live system.
+        string quarFor = "";   // target drive the current quarantine folder belongs to
+        int quarSeq = 0;       // number of the last backup in quarDir
+
+        static string RamDrive()
+        {
+            string run = RunningWinDir();
+            return IsRescueSystem(Reg.KeyExists("HKLM\\SYSTEM\\CurrentControlSet\\Control\\MiniNT"), run) ? run.Substring(0, 2) : "";
+        }
+
         bool EnsureQuar()
         {
-            if (quarDir.Length > 0 && Directory.Exists(quarDir)) return true;
-            string bas = Path.GetDirectoryName(Application.ExecutablePath);
-            string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            string[] cands = { Path.Combine(bas, "Quarantine_" + stamp),
-                               Path.Combine(curDrive.Length == 2 ? curDrive + "\\" : "C:\\", "RescueScan_Quarantine\\" + stamp),
-                               Path.Combine(Path.GetTempPath(), "RescueScan_Quarantine_" + stamp) };
-            foreach (string c in cands)
-                try { Directory.CreateDirectory(c); quarDir = c; return true; } catch { }
-            MessageBox.Show("Не удалось создать папку карантина."); return false;
+            if (quarDir.Length > 0 && Directory.Exists(quarDir) && (curDrive.Length == 0 || curDrive.Equals(quarFor, StringComparison.OrdinalIgnoreCase))) return true;
+            quarDir = ""; quarSeq = 0;
+            string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss"), exeDir = "", tmp = "", why = "";
+            try { exeDir = Path.GetDirectoryName(Application.ExecutablePath); } catch { }
+            try { tmp = Path.GetTempPath(); } catch { }
+            foreach (string c0 in QuarMan.Candidates(curDrive, exeDir, RamDrive(), tmp, stamp))
+                for (int i = 0; i < 20; i++)
+                {
+                    string c = i == 0 ? c0 : c0 + "_" + i;
+                    try
+                    {
+                        if (Directory.Exists(c)) continue;
+                        Directory.CreateDirectory(c);
+                        File.WriteAllText(Path.Combine(c, QuarMan.ManifestName), QuarMan.HeaderLine(stamp, TargetName(), tgtInstall) + "\r\n", Encoding.UTF8);
+                        quarDir = c; quarFor = curDrive;
+                        return true;
+                    }
+                    catch (Exception ex) { if (why.Length == 0) why = ex.Message; break; }
+                }
+            NoteQuarErr("папку карантина не создать (" + (curDrive.Length > 0 ? curDrive + "\\RescueScan_Quarantine" : "диск цели не выбран") +
+                "; RAM-диск X: и %TEMP% не используются — там бэкап пропадёт при перезагрузке)" + (why.Length > 0 ? ": " + why : ""));
+            return false;
         }
 
-        void QLog(string line)
+        bool QAppend(string line)
         {
-            try { File.AppendAllText(Path.Combine(quarDir, "manifest.txt"), line + "\r\n", Encoding.UTF8); } catch { }
-        }
-
-        // move a file into quarantine; returns true on success
-        bool QuarFile(string path)
-        {
-            if (!EnsureQuar()) return false;
-            try
-            {
-                string name = Path.GetFileName(path);
-                string dst = Path.Combine(quarDir, name);
-                int n = 1; while (File.Exists(dst)) { dst = Path.Combine(quarDir, "(" + (n++) + ")" + name); }
-                try { File.SetAttributes(path, FileAttributes.Normal); } catch { }
-                File.Move(path, dst);
-                QLog("FILE\t" + path + "\t=>\t" + dst);
-                return true;
-            }
-            catch (Exception ex) { QLog("FILE-FAIL\t" + path + "\t" + ex.Message); NoteQuarErr(ex.Message); return false; }
+            try { File.AppendAllText(Path.Combine(quarDir, QuarMan.ManifestName), line + "\r\n", Encoding.UTF8); return true; }
+            catch (Exception ex) { NoteQuarErr("manifest.txt не записан: " + ex.Message); return false; }
         }
 
         void NoteQuarErr(string why)
@@ -2295,79 +3369,266 @@ namespace RescueScan
             if (quarErr.Length == 0 && !string.IsNullOrEmpty(why)) quarErr = Reg.OneLine(why, 220);
         }
 
-        // export a reg key to .reg (backup) then return true; caller deletes afterwards
-        bool QuarReg(string key)
+        // Moves a file into quarantine as <n>_<name>.quarantine (attributes R/H/S cleared first, restored on restore).
+        bool QuarFile(string path)
         {
             if (!EnsureQuar()) return false;
+            if (!QuarMan.AbsLocalPath(path)) { NoteQuarErr("путь не поддерживается: " + path); return false; }
+            int attrs = FsOps.Attrs(path);
+            if (attrs == -1) { NoteQuarErr("нет файла " + path); return false; }
+            if ((attrs & 0x10) != 0) { NoteQuarErr("это папка, не файл: " + path); return false; }
+            int n = ++quarSeq;
+            string dst = Path.Combine(quarDir, QuarMan.QuarFileName(n, path)), err;
+            FsOps.ClearRhs(path);
+            if (!FsOps.MoveFile(path, dst, out err))
+            {
+                if (FsOps.Exists(path))
+                {
+                    if (File.Exists(dst)) { string e2; FsOps.DeleteFile(dst, out e2); }   // the original is still there: no half copy
+                    FsOps.SetAttrs(path, attrs);
+                }
+                QAppend("FILE-FAIL\t" + QuarMan.Esc(path) + "\t" + QuarMan.Esc(err));
+                NoteQuarErr(Path.GetFileName(path) + ": " + err);
+                return false;
+            }
+            ManEntry e = new ManEntry();
+            e.N = n; e.Orig = path; e.Vol = FsOps.VolumeSerial(path); e.Backup = Path.GetFileName(dst); e.Attrs = attrs;
+            try { e.Sha = QuarMan.Sha256(dst); } catch { }
+            if (e.Sha.Length == 64 && QAppend(QuarMan.FileLine(e))) return true;
+            FsOps.MoveFile(dst, path, out err);   // not recorded = not restorable: put it back
+            NoteQuarErr("manifest.txt не записан — файл оставлен на месте: " + path);
+            return false;
+        }
+
+        // Backs up a registry value (valueName != null; a missing value is recorded as "delete on restore") or a whole
+        // key into <n>.reg + a manifest line. false (and nothing may be changed) if any part of it failed.
+        bool QuarReg(string key, string valueName, string note)
+        {
+            if (!EnsureQuar()) return false;
+            string kind, uid, rel, regRoot, phys, err;
+            if (!Locate(key, tgtSoft, tgtSys, tgtUsers, out kind, out uid, out rel, out regRoot, out phys))
+            { NoteQuarErr(key + " — не в кустах цели " + TargetName() + ": бэкап не сделан"); return false; }
+            List<RegSection> snap = Reg.Snapshot(key, valueName, out err);
+            string text = null;
+            if (snap != null)
+            {
+                foreach (RegSection sec in snap) sec.Path = regRoot + sec.Path.Substring(phys.Length);
+                text = RegFile.Format(snap, out err);
+            }
+            if (text == null)
+            {
+                QAppend("REG-FAIL\t" + QuarMan.Esc(key) + "\t" + QuarMan.Esc(err));
+                NoteQuarErr("бэкап " + key + " не сделан: " + err);
+                return false;
+            }
+            int n = ++quarSeq;
+            string dst = Path.Combine(quarDir, n + ".reg");
+            ManEntry e = new ManEntry();
+            e.N = n; e.IsKey = valueName == null; e.Install = tgtInstall; e.RootKind = kind; e.UserId = uid; e.RegRoot = regRoot;
+            e.Rel = rel; e.ValueName = valueName ?? ""; e.Backup = n + ".reg"; e.Note = note ?? "";
             try
             {
-                string safe = key.Replace("\\", "_").Replace("\"", "");
-                if (safe.Length > 80) safe = safe.Substring(safe.Length - 80);
-                string dst = Path.Combine(quarDir, "reg_" + safe + ".reg");
-                string err;
-                if (!Reg.Export(key, dst, out err)) { QLog("REG-FAIL\t" + key + "\treg export failed: " + err); NoteQuarErr(err); return false; }   // no backup -> no delete
-                QLog("REG\t" + key + "\t=>\t" + dst + "\t" + HiveTag(key));   // which installation / profile: checked on restore
-                return true;
+                File.WriteAllText(dst, text, Encoding.Unicode);   // UTF-16LE with BOM, like regedit
+                e.Sha = QuarMan.Sha256(dst);
             }
-            catch (Exception ex) { QLog("REG-FAIL\t" + key + "\t" + ex.Message); NoteQuarErr(ex.Message); return false; }
+            catch (Exception ex) { NoteQuarErr("бэкап не записан: " + ex.Message); return false; }
+            if (QAppend(QuarMan.RegLine(e))) return true;
+            try { File.Delete(dst); } catch { }
+            return false;
+        }
+
+        // Which hive of the target a key is in: kind SOFTWARE / SYSTEM / USER, uid (USER: SID or "dir:\Users\x"), rel =
+        // path below the hive root, regRoot = the root as written into the .reg file (importable by regedit on the
+        // repaired system: HKEY_LOCAL_MACHINE\SOFTWARE, ...\SYSTEM, HKEY_USERS\<SID>), phys = the root in this session.
+        internal static bool Locate(string key, string soft, string sys, List<string[]> users, out string kind, out string uid, out string rel, out string regRoot, out string phys)
+        {
+            kind = ""; uid = ""; rel = ""; regRoot = ""; phys = "";
+            if (string.IsNullOrEmpty(key) || key.EndsWith("\\")) return false;
+            if (Under(key, soft)) { kind = "SOFTWARE"; phys = soft; regRoot = "HKEY_LOCAL_MACHINE\\SOFTWARE"; }
+            else if (Under(key, sys)) { kind = "SYSTEM"; phys = sys; regRoot = "HKEY_LOCAL_MACHINE\\SYSTEM"; }
+            else
+                foreach (string[] u in users)
+                    if (u.Length > 2 && Under(key, u[1]))
+                    {
+                        string sid = u.Length > 3 ? u[3] : "";
+                        kind = "USER"; phys = u[1];
+                        uid = sid.Length > 0 ? sid : "dir:" + (u[2].Length > 2 && u[2][1] == ':' ? u[2].Substring(2) : u[2]);
+                        regRoot = sid.Length > 0 ? "HKEY_USERS\\" + sid : FullRoot(u[1]);
+                        break;
+                    }
+            if (kind.Length == 0) return false;
+            rel = key.Length > phys.Length ? key.Substring(phys.Length + 1) : "";
+            return true;
+        }
+
+        static string FullRoot(string k)
+        {
+            if (k.StartsWith("HKLM\\", StringComparison.OrdinalIgnoreCase)) return "HKEY_LOCAL_MACHINE" + k.Substring(4);
+            if (k.StartsWith("HKU\\", StringComparison.OrdinalIgnoreCase)) return "HKEY_USERS" + k.Substring(3);
+            return k;
+        }
+
+        // The hive root a manifest entry maps to NOW ("" = that hive is not mounted / not part of the target).
+        internal static string Resolve(ManEntry e, string soft, string sys, List<string[]> users)
+        {
+            if (e.RootKind == "SOFTWARE") return soft ?? "";
+            if (e.RootKind == "SYSTEM") return sys ?? "";
+            foreach (string[] u in users)
+            {
+                if (u.Length < 3 || u[1].Length == 0) continue;
+                string sid = u.Length > 3 ? u[3] : "";
+                string dir = "dir:" + (u[2].Length > 2 && u[2][1] == ':' ? u[2].Substring(2) : u[2]);
+                if ((sid.Length > 0 && sid.Equals(e.UserId, StringComparison.OrdinalIgnoreCase)) || dir.Equals(e.UserId, StringComparison.OrdinalIgnoreCase)) return u[1];
+            }
+            return "";
+        }
+
+        static bool Under(string key, string root)
+        {
+            return !string.IsNullOrEmpty(root) && (key.Equals(root, StringComparison.OrdinalIgnoreCase) || key.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase));
+        }
+
+        // Identity of an installation that survives a reboot into WinPE and back: volume serial + Windows folder.
+        internal static string InstallId(string winDir, string serial)
+        {
+            if (string.IsNullOrEmpty(winDir)) return "";
+            return string.IsNullOrEmpty(serial) || winDir.Length < 3 ? winDir.ToUpperInvariant() : serial + winDir.Substring(2).ToUpperInvariant();
+        }
+
+        // ---- remediation: one place for «Удалить», «Карантин», «Обезвредить», the Easy button and the repairs ----
+        // 1 = done, 2 = nothing to do (already default / already gone), 0 = failed (quarErr says why).
+        // backup = the original goes to the quarantine first; no backup -> no change.
+        int Remediate(Finding x, bool backup)
+        {
+            if (x == null || x.Kind == 3) return 0;
+            if (x.Kind == 4) return BackedSet(x.DelKey, x.DelName, x.ResetData, x.ResetType, backup, x.Category + " -> дефолт");
+            if (x.Kind == 0) return BackedDeleteValue(x.DelKey, x.DelName, backup, x.Category);
+            if (x.Kind == 1) return BackedDeleteKey(x.DelKey, backup, x.Category);
+            if (x.Kind == 2)
+            {
+                if (string.IsNullOrEmpty(x.DelPath) || !FsOps.Exists(x.DelPath)) return 2;
+                if (backup) return QuarFile(x.DelPath) ? 1 : 0;
+                string err;
+                if (FsOps.DeleteFile(x.DelPath, out err)) return 1;
+                NoteQuarErr(Path.GetFileName(x.DelPath) + ": " + err);
+            }
+            return 0;
+        }
+
+        // value already equal (same type, same data) to what would be written
+        static bool SameValue(string key, string name, object data, RegistryValueKind kind)
+        {
+            foreach (string[] v in Reg.Values(key))
+                if (v[0].Equals(name, StringComparison.OrdinalIgnoreCase)) return v[2] == Reg.KindName(kind) && v[1] == Reg.FormatData(data);
+            return false;
+        }
+
+        int BackedSet(string key, string name, object data, RegistryValueKind kind, bool backup, string note)
+        {
+            if (string.IsNullOrEmpty(key) || name == null || data == null) return 0;
+            if (SameValue(key, name, data, kind)) return 2;
+            if (backup && !QuarReg(key, name, note)) return 0;
+            if (Reg.SetValue(key, name, data, kind)) return 1;
+            NoteQuarErr("не записано: " + key + "\\" + name);
+            return 0;
+        }
+
+        int BackedDeleteValue(string key, string name, bool backup, string note)
+        {
+            if (string.IsNullOrEmpty(key) || name == null || !Reg.HasValue(key, name)) return 2;
+            if (backup && !QuarReg(key, name, note)) return 0;
+            if (Reg.DeleteValue(key, name)) return 1;
+            NoteQuarErr("не удалено: " + key + "\\" + name);
+            return 0;
+        }
+
+        int BackedDeleteKey(string key, bool backup, string note)
+        {
+            if (string.IsNullOrEmpty(key) || !Reg.KeyExists(key)) return 2;
+            if (backup && !QuarReg(key, null, note)) return 0;
+            if (Reg.DeleteKey(key)) return 1;
+            NoteQuarErr("не удалён ключ: " + key);
+            return 0;
         }
 
         void QuarantineChecked(ListView target)
         {
             int n = 0; foreach (ListViewItem it in target.Items) if (it.Checked) n++;
             if (n == 0) { MessageBox.Show("Ничего не отмечено."); return; }
-            if (MessageBox.Show("Карантин отмеченных (" + n + ")? Файлы будут перенесены, ветки реестра — забэкаплены в .reg и удалены.\nПапка карантина создастся рядом с программой.", "Карантин",
+            if (MessageBox.Show("Карантин отмеченных (" + n + ")?\r\nФайлы переносятся в папку карантина, значения и ветки реестра сохраняются в .reg и удаляются " +
+                "(Winlogon Shell/Userinit, BootExecute и т.п. не удаляются, а возвращаются к дефолту — тоже с бэкапом).\r\n" +
+                "Папка: <диск цели>\\RescueScan_Quarantine\\<дата_время> (не на RAM-диске X:).", "Карантин",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            if (!EnsureTarget()) { MessageBox.Show("Сначала выбери установку Windows и нажми «Сканировать»."); return; }
             List<ListViewItem> done = new List<ListViewItem>();
-            int ok = 0, fail = 0, skip = 0, keep = 0;
+            int ok = 0, fail = 0, skip = 0, already = 0;
             quarErr = "";
             foreach (ListViewItem it in target.Items)
             {
                 if (!it.Checked) continue;
                 Finding x = (Finding)it.Tag;
-                if (ResetOnly(x)) { keep++; continue; }
-                bool r = false;
-                if (x.Kind == 2) r = QuarFile(x.DelPath);
-                else if (x.Kind == 0) { if (QuarReg(x.DelKey)) r = Reg.DeleteValue(x.DelKey, x.DelName); }
-                else if (x.Kind == 1) { if (QuarReg(x.DelKey)) r = Reg.DeleteKey(x.DelKey); }
-                else { skip++; continue; }
-                if (r) { ok++; done.Add(it); } else fail++;
+                if (x.Kind == 3) { skip++; continue; }
+                int r = Remediate(x, true);
+                if (r == 1) { ok++; done.Add(it); } else if (r == 2) { already++; done.Add(it); } else fail++;
             }
             foreach (ListViewItem it in done) target.Items.Remove(it);
-            lblStatus.Text = "Карантин: " + ok + "   ошибок: " + fail + "   пропущено: " + skip + "   -> " + quarDir
-                + (fail > 0 && quarErr.Length > 0 ? "   причина: " + quarErr : "") + KeepNote(keep);
+            lblStatus.Text = "Карантин: " + ok + "   уже чисто: " + already + "   ошибок: " + fail + "   пропущено (info): " + skip + "   -> " + (quarDir.Length > 0 ? quarDir : "(нет папки)")
+                + (fail > 0 && quarErr.Length > 0 ? "   причина: " + quarErr : "");
         }
 
         void QuarantineSelectedFiles()
         {
             if (lvFiles.SelectedItems.Count == 0) { MessageBox.Show("Выбери файл."); return; }
             int ok = 0, fail = 0;
-            List<ListViewItem> done = new List<ListViewItem>();
+            quarErr = "";
             foreach (ListViewItem it in lvFiles.SelectedItems)
             {
                 string tag = (string)it.Tag;
                 if (!tag.StartsWith("F|")) continue;   // только файлы
-                if (QuarFile(tag.Substring(2))) { ok++; done.Add(it); } else fail++;
+                if (QuarFile(tag.Substring(2))) ok++; else fail++;
             }
-            lblFiles.Text = "В карантин: " + ok + "   ошибок: " + fail + "   -> " + quarDir;
+            lblFiles.Text = "В карантин: " + ok + "   ошибок: " + fail + "   -> " + (quarDir.Length > 0 ? quarDir : "(нет папки)") + (fail > 0 && quarErr.Length > 0 ? "   причина: " + quarErr : "");
             Nav(curPath);
         }
 
         // ---- Quarantine viewer / restore ----
+        // Newest quarantine folder (by its date_time name) in <every drive>\RescueScan_Quarantine, next to the exe, or
+        // an old-format <exe folder>\Quarantine_* .
         void QuarAutoFind()
         {
-            string bas = Path.GetDirectoryName(Application.ExecutablePath);
-            string best = ""; DateTime bestT = DateTime.MinValue;
+            List<string> roots = new List<string>();
+            string exeDir = "";
+            try { exeDir = Path.GetDirectoryName(Application.ExecutablePath); } catch { }
             try
             {
-                foreach (string d in Directory.GetDirectories(bas, "Quarantine_*"))
-                {
-                    DateTime t = Directory.GetLastWriteTime(d);
-                    if (t > bestT && File.Exists(Path.Combine(d, "manifest.txt"))) { bestT = t; best = d; }
-                }
+                foreach (DriveInfo d in DriveInfo.GetDrives())
+                    if (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable) roots.Add(d.Name.TrimEnd('\\') + "\\RescueScan_Quarantine");
             }
             catch { }
-            if (best.Length == 0) { lblQuar.Text = "Рядом с программой нет папок Quarantine_* с manifest.txt. Нажми «Открыть папку…»."; lvQuar.Items.Clear(); return; }
+            if (exeDir.Length > 0) roots.Add(exeDir.TrimEnd('\\') + "\\RescueScan_Quarantine");
+            string best = "", bestKey = "";
+            foreach (string r in roots)
+                try
+                {
+                    if (!Directory.Exists(r)) continue;
+                    foreach (string d in Directory.GetDirectories(r))
+                    {
+                        string k = Path.GetFileName(d);
+                        if (string.CompareOrdinal(k, bestKey) > 0 && File.Exists(Path.Combine(d, QuarMan.ManifestName))) { bestKey = k; best = d; }
+                    }
+                }
+                catch { }
+            try
+            {
+                if (exeDir.Length > 0)
+                    foreach (string d in Directory.GetDirectories(exeDir, "Quarantine_*"))
+                    {
+                        string k = Path.GetFileName(d).Substring(11);
+                        if (string.CompareOrdinal(k, bestKey) > 0 && File.Exists(Path.Combine(d, QuarMan.ManifestName))) { bestKey = k; best = d; }
+                    }
+            }
+            catch { }
+            if (best.Length == 0) { lblQuar.Text = "Папок карантина (X:\\RescueScan_Quarantine\\…) не найдено. Нажми «Открыть папку…»."; lvQuar.Items.Clear(); return; }
             QuarLoad(best);
         }
 
@@ -2381,89 +3642,149 @@ namespace RescueScan
         void QuarLoad(string dir)
         {
             lvQuar.Items.Clear(); quarViewDir = dir;
-            string mf = Path.Combine(dir, "manifest.txt");
+            string mf = Path.Combine(dir, QuarMan.ManifestName);
             if (!File.Exists(mf)) { lblQuar.Text = "Нет manifest.txt в " + dir; return; }
-            int cnt = 0;
-            foreach (string line in File.ReadAllLines(mf))
+            string[] lines;
+            try { lines = File.ReadAllLines(mf); } catch (Exception ex) { lblQuar.Text = "manifest.txt не читается: " + ex.Message; return; }
+            bool v2 = lines.Length > 0 && QuarMan.IsHeader(lines[0]);
+            int cnt = 0, bad = 0;
+            foreach (string line in lines)
             {
-                string[] p = line.Split('\t');
-                if (p.Length < 4) continue;
-                if (p[0] != "FILE" && p[0] != "REG") continue;   // пропускаем *-FAIL
-                string type = p[0]; string orig = p[1]; string backup = p[3];
-                string tag = type == "REG" && p.Length >= 5 && p[4].Length > 0 ? p[4] : null;   // null: older manifest
-                ListViewItem it = new ListViewItem(new string[] { type, orig, backup, type == "REG" ? (tag ?? "(не указана)") : "" });
-                it.Tag = new string[] { type, orig, backup, tag };
-                if (!File.Exists(backup)) it.ForeColor = Color.Gray;   // бэкап уже убран
+                string err;
+                ManEntry e = QuarMan.Parse(line, out err);
+                if (e == null) { if (err.Length > 0) bad++; continue; }
+                if (v2 != (e.Type != "LEGACY")) { bad++; continue; }   // both formats in one manifest: not ours
+                string what, where;
+                if (e.Type == "FILE") { what = "файл"; where = e.Orig; }
+                else if (e.Type == "REG")
+                {
+                    what = e.IsKey ? "ключ" : "значение";
+                    where = e.RootKind + (e.RootKind == "USER" ? " " + e.UserId : "") + (e.Rel.Length > 0 ? "\\" + e.Rel : "") + (e.IsKey ? "" : "  : " + (e.ValueName.Length > 0 ? e.ValueName : "(по умолчанию)"))
+                        + (e.Note.Length > 0 ? "   [" + e.Note + "]" : "");
+                }
+                else { what = "старый " + e.Note; where = e.Orig; }
+                ListViewItem it = new ListViewItem(new string[] { what, where, e.Backup, e.Type == "REG" ? e.Install : e.Type == "FILE" ? (e.Vol.Length > 0 ? "том " + e.Vol : "") : "только вручную" });
+                it.Tag = e;
+                if (e.Type == "LEGACY" || !QuarMan.Inside(dir, e.Backup) || !File.Exists(Path.Combine(dir, e.Backup))) it.ForeColor = Color.Gray;
                 lvQuar.Items.Add(it); cnt++;
             }
-            lblQuar.Text = "Карантин: " + dir + "   (записей: " + cnt + ")";
+            lblQuar.Text = "Карантин: " + dir + "   (записей: " + cnt + (bad > 0 ? ", отброшено строк: " + bad : "") + ")"
+                + (v2 ? "" : "   СТАРЫЙ формат: только просмотр — .reg импортируй вручную, файлы верни вручную");
         }
 
         void QuarRestore()
         {
-            int n = 0; foreach (ListViewItem it in lvQuar.Items) if (it.Checked) n++;
-            if (n == 0) { MessageBox.Show("Отметь, что восстановить."); return; }
-            if (MessageBox.Show("Восстановить отмеченные (" + n + ") на исходные места?", "Восстановление",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-            int ok = 0, fail = 0;
-            string why = "";
-            List<ListViewItem> done = new List<ListViewItem>();
-            // A .reg backup names HKEY_LOCAL_MACHINE\RS_SOFT / RS_SYS / RS_U<n> (offline) or HKLM\SOFTWARE / HKU\<SID> (live):
-            // whatever is mounted there NOW gets the import. Import only into the same installation / profile as at backup
-            // time; a branch whose root is not a hive of the prepared target is refused (in WinPE, HKLM\SOFTWARE is WinPE's
-            // own); a different or unknown (older manifest) installation needs an explicit yes.
-            bool anyReg = false;
-            foreach (ListViewItem it in lvQuar.Items) if (it.Checked && ((string[])it.Tag)[0] == "REG") anyReg = true;
+            List<ManEntry> sel = new List<ManEntry>();
+            List<ListViewItem> items = new List<ListViewItem>();
+            foreach (ListViewItem it in lvQuar.Items) if (it.Checked) { sel.Add((ManEntry)it.Tag); items.Add(it); }
+            if (sel.Count == 0) { MessageBox.Show("Отметь, что восстановить."); return; }
+            if (MessageBox.Show("Восстановить отмеченные (" + sel.Count + ") на исходные места?\r\nФайл, который сейчас лежит на месте оригинала, не удаляется, а переименовывается (*.before-restore-…).",
+                "Восстановление", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            bool anyReg = sel.Exists(delegate(ManEntry e) { return e.Type == "REG"; });
             if (anyReg) EnsureTarget();
-            StringBuilder ask = new StringBuilder(); int asks = 0;
-            foreach (ListViewItem it in lvQuar.Items)
+            // newest first: a key backed up after its Start value was changed is restored first, then the original value
+            List<int> order = new List<int>();
+            for (int i = 0; i < sel.Count; i++) order.Add(i);
+            order.Sort(delegate(int a, int b) { return sel[b].N.CompareTo(sel[a].N); });
+            int ok = 0, fail = 0;
+            string why = "", stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            List<ListViewItem> done = new List<ListViewItem>();
+            foreach (int i in order)
             {
-                string[] e = (string[])it.Tag;
-                if (!it.Checked || e[0] != "REG") continue;
-                string now = HiveTag(e[1]);
-                if (now.Length == 0 || (e[3] != null && string.Equals(e[3], now, StringComparison.OrdinalIgnoreCase))) continue;
-                if (asks++ < 5) ask.Append("\r\n  • " + (e[3] ?? "(старый карантин: цель не записана)") + "  ->  сейчас: " + now);
-            }
-            bool other = asks == 0 || MessageBox.Show("Ветки реестра (" + asks + ") были сохранены для ДРУГОЙ установки / профиля или без отметки цели:" + ask +
-                "\r\n\r\nИмпортировать их в текущую цель «" + TargetName() + "»? Если это не та же система, изменения попадут не туда.",
-                "Восстановление", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
-            foreach (ListViewItem it in lvQuar.Items)
-            {
-                if (!it.Checked) continue;
-                string[] e = (string[])it.Tag; bool r = false;
+                ManEntry e = sel[i];
+                string w = "";
+                bool r = false;
                 try
                 {
-                    if (e[0] == "FILE")
-                    {
-                        string orig = e[1], backup = e[2];
-                        if (File.Exists(backup))
-                        {
-                            string od = Path.GetDirectoryName(orig);
-                            if (od.Length > 0 && !Directory.Exists(od)) Directory.CreateDirectory(od);
-                            if (File.Exists(orig)) File.Delete(orig);
-                            File.Move(backup, orig); r = true;
-                        }
-                    }
-                    else if (e[0] == "REG")
-                    {
-                        string now = HiveTag(e[1]);
-                        if (now.Length == 0)
-                        {
-                            if (why.Length == 0) why = e[1] + " не относится к кустам текущей цели (" + TargetName() + "): выбери ту установку и нажми «Сканировать»";
-                        }
-                        else if (other || (e[3] != null && string.Equals(e[3], now, StringComparison.OrdinalIgnoreCase)))
-                        {
-                            string o; r = Reg.RunCode("import " + Reg.QuoteArg(e[2]), out o) == 0;
-                            if (!r && why.Length == 0) why = Reg.OneLine(o, 220);
-                        }
-                        else if (why.Length == 0) why = "ветка от другой цели (" + (e[3] ?? "не указана") + ") — пропущена";
-                    }
+                    string bk = Path.Combine(quarViewDir, e.Backup);
+                    if (e.Type == "LEGACY") w = "старый формат карантина — восстанови вручную (" + e.Backup + ")";
+                    else if (!QuarMan.Inside(quarViewDir, e.Backup)) w = "бэкап вне папки карантина: " + e.Backup;
+                    else if (!File.Exists(bk)) w = "бэкапа нет (уже восстановлен?): " + e.Backup;
+                    else if (!string.Equals(QuarMan.Sha256(bk), e.Sha, StringComparison.OrdinalIgnoreCase)) w = "бэкап " + e.Backup + " изменён после карантина (SHA-256 не совпадает) — не восстанавливаю";
+                    else if (e.Type == "FILE") r = RestoreFile(e, bk, stamp, out w);
+                    else r = RestoreReg(e, bk, out w);
                 }
-                catch (Exception ex) { r = false; if (why.Length == 0) why = Reg.OneLine(ex.Message, 220); }
-                if (r) { ok++; done.Add(it); } else fail++;
+                catch (Exception ex) { r = false; w = ex.Message; }
+                if (r) { ok++; done.Add(items[i]); }
+                else { fail++; if (why.Length == 0) why = Reg.OneLine(w, 260); }
             }
             foreach (ListViewItem it in done) lvQuar.Items.Remove(it);
             lblQuar.Text = "Восстановлено: " + ok + "   ошибок: " + fail + (fail > 0 && why.Length > 0 ? "   причина: " + why : "");
+            if (fail > 0 && why.Length > 0) MessageBox.Show("Не восстановлено: " + fail + "\r\n" + why, "Восстановление", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        // Drive letter that the volume with this serial has now ("" = not attached).
+        static string DriveOfSerial(string serial)
+        {
+            try
+            {
+                foreach (DriveInfo d in DriveInfo.GetDrives())
+                    if (d.Name.Length >= 2 && string.Equals(FsOps.VolumeSerial(d.Name), serial, StringComparison.OrdinalIgnoreCase)) return d.Name.Substring(0, 2);
+            }
+            catch { }
+            return "";
+        }
+
+        bool RestoreFile(ManEntry e, string bk, string stamp, out string why)
+        {
+            why = "";
+            string orig = e.Orig;
+            if (e.Vol.Length > 0)
+            {
+                string d = DriveOfSerial(e.Vol);
+                if (d.Length == 0) { why = "том " + e.Vol + " (был " + orig.Substring(0, 2) + ") сейчас не подключён"; return false; }
+                orig = d + orig.Substring(2);
+            }
+            string err;
+            if (FsOps.Exists(orig))
+            {
+                string aside = orig + ".before-restore-" + stamp;
+                if (!FsOps.MoveFile(orig, aside, out err)) { why = "на месте оригинала есть файл, отодвинуть его не вышло: " + err; return false; }
+            }
+            string od = orig.Substring(0, orig.LastIndexOf('\\'));
+            if (od.Length > 2 && !FsOps.Exists(od)) Directory.CreateDirectory(od);
+            if (!FsOps.MoveFile(bk, orig, out err)) { why = orig + ": " + err; return false; }
+            if ((e.Attrs & 0x7) != 0) FsOps.SetAttrs(orig, e.Attrs & 0x27);   // ReadOnly / Hidden / System / Archive
+            return true;
+        }
+
+        // Writes a registry backup back through the Registry API into the hive that is mounted NOW for the same
+        // installation / profile; refuses (with the reason) when that hive is not available.
+        bool RestoreReg(ManEntry e, string bk, out string why)
+        {
+            why = "";
+            if (!tgtReady) { why = "цель не выбрана: выбери установку Windows и нажми «Сканировать»"; return false; }
+            if (!string.Equals(e.Install, tgtInstall, StringComparison.OrdinalIgnoreCase))
+            { why = "бэкап другой установки (" + e.Install + "), а цель сейчас " + TargetName() + " (" + tgtInstall + "): выбери ту установку и нажми «Сканировать»"; return false; }
+            string root = Resolve(e, tgtSoft, tgtSys, tgtUsers);
+            if (root.Length == 0)
+            {
+                why = (e.RootKind == "USER" ? "профиль " + e.UserId : "куст " + e.RootKind) + " цели " + TargetName() + " сейчас не смонтирован: нажми «Сканировать» и повтори";
+                return false;
+            }
+            string err;
+            List<RegSection> secs = RegFile.Parse(File.ReadAllText(bk), out err);
+            if (secs == null) { why = e.Backup + ": " + err; return false; }
+            List<string> rels = new List<string>();
+            foreach (RegSection s in secs)
+            {
+                if (!Under(s.Path, e.RegRoot)) { why = e.Backup + ": ключ вне " + e.RegRoot; return false; }
+                string rel = s.Path.Substring(e.RegRoot.Length).TrimStart('\\');
+                bool fits = e.IsKey ? Under(rel, e.Rel) : rel.Equals(e.Rel, StringComparison.OrdinalIgnoreCase) && s.Values.Count == 1 && s.Values[0].Name == e.ValueName;
+                if (!fits || (rel.Length == 0 && e.IsKey)) { why = e.Backup + ": не совпадает с записью в manifest.txt"; return false; }
+                rels.Add(rel);
+            }
+            for (int i = 0; i < secs.Count; i++)
+            {
+                string k = root + (rels[i].Length > 0 ? "\\" + rels[i] : "");
+                if (e.IsKey && !Reg.CreateKey(k)) { why = "ключ не создан: " + k; return false; }
+                foreach (RegVal v in secs[i].Values)
+                {
+                    bool r = v.Delete ? (!Reg.HasValue(k, v.Name) || Reg.DeleteValue(k, v.Name)) : Reg.SetRaw(k, v.Name, v.Type, v.Data);
+                    if (!r) { why = "не записано: " + k + "\\" + v.Name; return false; }
+                }
+            }
+            return true;
         }
 
         // ================= WHO REFERENCES A FILE =================
@@ -2494,15 +3815,44 @@ namespace RescueScan
 
         // ================= REPAIR (Shell/Userinit/cmd/AppInit -> default or custom) =================
         // {name, subkey(under hive), valueName, default, "1"=delete-for-default}
-        static string[][] Anchors()
+        static string[][] Anchors(string systemRoot)
         {
             return new string[][] {
-                new string[]{ "Winlogon Shell",    "Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "Shell",    "explorer.exe", "0" },
-                new string[]{ "Winlogon Userinit", "Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "Userinit", "C:\\Windows\\system32\\userinit.exe,", "0" },
+                new string[]{ "Winlogon Shell",    "Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "Shell",    Defaults.Shell, "0" },
+                new string[]{ "Winlogon Userinit", "Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "Userinit", Defaults.Userinit(systemRoot), "0" },
                 new string[]{ "Winlogon Taskman",  "Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "Taskman",  "", "1" },
                 new string[]{ "AppInit_DLLs",      "Microsoft\\Windows NT\\CurrentVersion\\Windows",  "AppInit_DLLs", "", "0" },
+                new string[]{ "AppInit_DLLs (WOW64)", "Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Windows", "AppInit_DLLs", "", "0" },
                 new string[]{ "cmd AutoRun",       "Microsoft\\Command Processor",                    "AutoRun",  "", "1" },
+                new string[]{ "cmd AutoRun (WOW64)", "Wow6432Node\\Microsoft\\Command Processor",     "AutoRun",  "", "1" },
             };
+        }
+
+        // An anchor's current value is fine: Shell / Userinit by the same predicates as the scan, a "delete" anchor when
+        // absent, an empty default (AppInit_DLLs) when absent or empty, anything else when equal to the default.
+        internal static bool AnchorGood(string[] a, string cur, bool present, string systemRoot)
+        {
+            if (a[2] == "Shell") return present && Defaults.ShellClean(cur, systemRoot);
+            if (a[2] == "Userinit") return present && Defaults.UserinitClean(cur, systemRoot);
+            if (a[4] == "1") return !present;
+            if (a[3].Length == 0) return !present || cur.Trim().Length == 0;
+            return present && string.Equals(cur.Trim(), a[3], StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Puts one anchor to its default (or 'custom') with a quarantine backup first. 1 changed / 2 already fine / 0 failed.
+        int ApplyAnchor(string[] a, string custom)
+        {
+            string root = SoftRoot();
+            if (root.Length == 0) return 0;
+            string key = root + "\\" + a[1];
+            if (a[1].StartsWith("Wow6432Node\\") && !Reg.KeyExists(key)) return 2;   // 32-bit Windows: no WOW64 copy
+            string cur = ""; bool present = false;
+            foreach (string[] v in Reg.Values(key)) if (v[0].Equals(a[2], StringComparison.OrdinalIgnoreCase)) { cur = v[1]; present = true; }
+            string note = "Ремонт: " + a[0];
+            if (custom != null) return BackedSet(key, a[2], custom, RegistryValueKind.String, true, note);
+            if (AnchorGood(a, cur, present, tgtSysRoot)) return 2;
+            if (a[4] == "1") return BackedDeleteValue(key, a[2], true, note);
+            return BackedSet(key, a[2], a[3], RegistryValueKind.String, true, note);
         }
 
         // simplified autoruns: Run/RunOnce/Startup/Scheduled Tasks only (like Task Manager Startup / Simple Unlocker)
@@ -2524,23 +3874,6 @@ namespace RescueScan
             if (lastFindings.Count == 0) lblStatus.Text = "Нажми «Сканировать».";
         }
 
-        // Which hive of the prepared target a key is in, as a readable tag for the quarantine manifest: "SOFTWARE D:\Windows",
-        // "SYSTEM D:\Windows", "профиль D:\Users\Ivan"; "" = none of them (e.g. HKLM\SOFTWARE while the target is offline).
-        internal static string HiveTag(string key, string soft, string sys, string winDir, List<string[]> users)
-        {
-            if (string.IsNullOrEmpty(key)) return "";
-            if (Under(key, soft)) return "SOFTWARE " + winDir;
-            if (Under(key, sys)) return "SYSTEM " + winDir;
-            foreach (string[] u in users) if (Under(key, u[1])) return "профиль " + u[2];
-            return "";
-        }
-
-        static bool Under(string key, string root)
-        {
-            return !string.IsNullOrEmpty(root) && (key.Equals(root, StringComparison.OrdinalIgnoreCase) || key.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase));
-        }
-
-        string HiveTag(string key) { return tgtReady ? HiveTag(key, tgtSoft, tgtSys, tgtWinDir, tgtUsers) : ""; }
 
         // SOFTWARE root of the target the scan used. "" = not available: actions refuse (RequireSoft) instead of
         // silently falling back to the live HKLM\SOFTWARE of the machine that runs the tool.
@@ -2582,18 +3915,17 @@ namespace RescueScan
             lvRepair.Items.Clear();
             if (prepare) EnsureTarget();
             string root = SoftRoot();
-            foreach (string[] a in Anchors())
+            foreach (string[] a in Anchors(tgtSysRoot))
             {
-                string cur = "(нет значения)";
+                string cur = "(нет значения)"; bool present = false;
                 if (root.Length == 0) cur = tgtReady ? "(куст SOFTWARE цели не смонтирован)" : "(цель не выбрана: «Сканировать» или «Обновить»)";
                 else
                     foreach (string[] v in Reg.Values(root + "\\" + a[1]))
-                        if (v[0].Equals(a[2], StringComparison.OrdinalIgnoreCase)) cur = v[1];
+                        if (v[0].Equals(a[2], StringComparison.OrdinalIgnoreCase)) { cur = v[1]; present = true; }
                 string def = a[4] == "1" ? "(удалить значение)" : (a[3].Length == 0 ? "(пусто)" : a[3]);
                 ListViewItem it = new ListViewItem(new string[] { a[0], cur, def });
                 it.Tag = a;
-                bool good = a[4] == "1" ? (cur == "(нет значения)") : string.Equals(cur.Trim(), a[3], StringComparison.OrdinalIgnoreCase);
-                if (!good && root.Length > 0) it.BackColor = Color.FromArgb(255, 220, 220);
+                if (root.Length > 0 && !AnchorGood(a, present ? cur : "", present, tgtSysRoot)) it.BackColor = Color.FromArgb(255, 220, 220);
                 lvRepair.Items.Add(it);
             }
         }
@@ -2602,25 +3934,23 @@ namespace RescueScan
         {
             if (lvRepair.SelectedItems.Count == 0) { MessageBox.Show("Выбери строку в списке, потом жми «→ Дефолт» или «→ Своё…»."); return; }
             if (!RequireSoft("Ремонт")) return;
-            string root = SoftRoot();
+            int ok = 0, fail = 0;
+            quarErr = "";
             foreach (ListViewItem it in lvRepair.SelectedItems)
             {
                 string[] a = (string[])it.Tag;
-                string key = root + "\\" + a[1];
+                string val = null;
                 if (custom)
                 {
-                    string val = Prompt("Своё значение для «" + a[0] + "»", a[3]);
+                    val = Prompt("Своё значение для «" + a[0] + "»", a[3]);
                     if (val == null) continue;
-                    Reg.SetString(key, a[2], val);
                 }
-                else
-                {
-                    if (a[4] == "1") Reg.DeleteValue(key, a[2]);
-                    else Reg.SetString(key, a[2], a[3]);
-                }
+                int r = ApplyAnchor(a, val);
+                if (r == 1) ok++; else if (r == 0) fail++;
             }
             RepairRefresh();
-            lblStatus.Text = IsOffline() ? "Ремонт применён к офлайн-кусту (" + tgtWinDir + ")." : "Ремонт применён к ЖИВОЙ системе (HKLM\\SOFTWARE).";
+            lblStatus.Text = (IsOffline() ? "Ремонт офлайн-куста (" + tgtWinDir + ")" : "Ремонт ЖИВОЙ системы (HKLM\\SOFTWARE)") + ": изменено " + ok + ", ошибок " + fail
+                + (ok > 0 ? "   бэкап: " + quarDir : "") + (fail > 0 && quarErr.Length > 0 ? "   причина: " + quarErr : "");
         }
 
         static string Prompt(string title, string def)
@@ -2658,20 +3988,19 @@ namespace RescueScan
         void GuardLoop()
         {
             string wl = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
-            string[][] want = { new string[] { "Shell", "explorer.exe" },
-                                new string[] { "Userinit", "C:\\Windows\\system32\\userinit.exe," } };
+            string sr = RunningWinDir();   // the guard only runs while the target is the running OS
             while (guarding)
             {
-                foreach (string[] w in want)
+                foreach (string name in new string[] { "Shell", "Userinit" })
                 {
                     string cur = null;
                     foreach (string[] v in Reg.Values(wl))
-                        if (v[0].Equals(w[0], StringComparison.OrdinalIgnoreCase)) cur = v[1];
-                    if (cur != null && !string.Equals(cur.Trim(), w[1], StringComparison.OrdinalIgnoreCase))
-                    {
-                        Reg.SetString(wl, w[0], w[1]);
-                        Watchdog.Log("guard: Winlogon " + w[0] + " подменён на '" + cur + "' -> вернул '" + w[1] + "'");
-                    }
+                        if (v[0].Equals(name, StringComparison.OrdinalIgnoreCase)) cur = v[1];
+                    bool shell = name == "Shell";
+                    if (cur == null || (shell ? Defaults.ShellClean(cur, sr) : Defaults.UserinitClean(cur, sr))) continue;
+                    string def = shell ? Defaults.Shell : Defaults.Userinit(sr);
+                    Reg.SetString(wl, name, def);
+                    Watchdog.Log("guard: Winlogon " + name + " подменён на '" + cur + "' -> вернул '" + def + "'");
                 }
                 for (int i = 0; i < 30 && guarding; i++) Thread.Sleep(100);
             }
@@ -2705,104 +4034,143 @@ namespace RescueScan
             return j > 0 ? k.Substring(0, j) : k;
         }
 
-        // Winlogon Shell / Userinit must be RESET to the default, never deleted: a deleted Userinit gives a logon/logoff
-        // loop (research windows-semantics Q1: "treat it as critical"). Delete, quarantine and the Easy quarantine skip
-        // them; «Обезвредить», the «Ремонт» tab and the Easy Winlogon step reset them instead. (Live mode made this
-        // reachable on the running OS: Easy used to reset Userinit and then delete it.)
+        // Values that must be RESET to the Windows default, never deleted (Kind 4: Winlogon Shell/Userinit/VMApplet,
+        // BootExecute, SetupExecute, SafeBoot AlternateShell): a deleted Userinit = logon/logoff loop (research
+        // windows-semantics Q1), a deleted BootExecute drops autochk. «Удалить», «Карантин», «Обезвредить» and the Easy
+        // button write the default back (with a quarantine backup) through Remediate.
         internal static bool ResetOnly(Finding x)
         {
-            return x != null && x.Kind == 0 && (x.Category == "Winlogon Shell" || x.Category == "Winlogon Userinit");
+            return x != null && x.Kind == 4;
         }
 
-        static string KeepNote(int keep)
+        // 1 = defused, 2 = already defused, 0 = failed, -1 = not applicable. Every change is backed up first.
+        int DefuseOne(Finding x)
         {
-            return keep > 0 ? "   Winlogon Shell/Userinit не удаляются (" + keep + "): сброс — «Обезвредить» или вкладка «Ремонт»" : "";
-        }
-
-        bool DefuseOne(Finding x)
-        {
-            if (x == null) return false;
+            if (x == null) return -1;
+            if (x.Kind == 4) return Remediate(x, true);
             string c = x.Category;
             if (c.StartsWith("Service") || c.StartsWith("svchost"))
             {
                 string root = ServiceKeyOf(x.DelKey != null ? x.DelKey : x.Location);
-                Reg.SetDword(root, "Start", 4);
-                Reg.SetDword(root, "ErrorControl", 1);
-                return true;
+                int a = BackedSet(root, "Start", 4, RegistryValueKind.DWord, true, "Обезвредить: Start=4");
+                if (a == 0) return 0;
+                int b = BackedSet(root, "ErrorControl", 1, RegistryValueKind.DWord, true, "Обезвредить: ErrorControl=1");
+                return b == 0 ? 0 : (a == 1 || b == 1 ? 1 : 2);
             }
             if (c.StartsWith("IFEO"))
-            {
-                Reg.DeleteValue(x.DelKey != null ? x.DelKey : x.Location, "Debugger");
-                return true;
-            }
-            if (c.StartsWith("Winlogon Shell"))
-            {
-                Reg.SetString(x.DelKey, "Shell", "explorer.exe"); return true;
-            }
-            if (c.StartsWith("Winlogon Userinit"))
-            {
-                Reg.SetString(x.DelKey, "Userinit", "C:\\Windows\\system32\\userinit.exe,"); return true;
-            }
-            return false;
+                return BackedDeleteValue(x.DelKey != null ? x.DelKey : x.Location, "Debugger", true, "Обезвредить: IFEO Debugger");
+            return -1;
         }
 
         void DefuseChecked(ListView target)
         {
-            int done = 0, skip = 0;
+            int done = 0, skip = 0, fail = 0, already = 0;
+            quarErr = "";
             foreach (ListViewItem it in target.Items)
             {
                 if (!it.Checked) continue;
-                if (DefuseOne((Finding)it.Tag)) done++; else skip++;
+                int r = DefuseOne((Finding)it.Tag);
+                if (r == 1) done++; else if (r == 2) already++; else if (r == 0) fail++; else skip++;
             }
-            if (done == 0 && skip == 0) { MessageBox.Show("Отметь службы / IFEO / Winlogon, которые обезвредить."); return; }
-            lblStatus.Text = "Обезврежено якорей: " + done + "   (не применимо: " + skip + "). Теперь можно удалять/карантинить файл.";
+            if (done + skip + fail + already == 0) { MessageBox.Show("Отметь службы / IFEO / Winlogon / BootExecute, которые обезвредить."); return; }
+            lblStatus.Text = "Обезврежено якорей: " + done + "   уже: " + already + "   ошибок: " + fail + "   (не применимо: " + skip + ")"
+                + (done > 0 ? "   бэкап: " + quarDir : "") + (fail > 0 && quarErr.Length > 0 ? "   причина: " + quarErr : "") + ". Теперь можно удалять/карантинить файл.";
         }
 
         // ================= RESTORE DEFAULTS =================
-        void RestoreWinlogonDefaults()
+        // Winlogon Shell/Userinit/Taskman, AppInit_DLLs and cmd AutoRun (also the WOW64 copies): every change backed up.
+        int RestoreWinlogonDefaults(out int fail)
         {
-            string root = SoftRoot();
-            if (root.Length == 0) return;   // never a fallback to the live HKLM (see RequireSoft)
-            foreach (string[] a in Anchors())
+            int n = 0; fail = 0;
+            if (SoftRoot().Length == 0) return 0;   // never a fallback to the live HKLM (see RequireSoft)
+            foreach (string[] a in Anchors(tgtSysRoot))
             {
-                string key = root + "\\" + a[1];
-                if (a[4] == "1") Reg.DeleteValue(key, a[2]);
-                else Reg.SetString(key, a[2], a[3]);
+                int r = ApplyAnchor(a, null);
+                if (r == 1) n++; else if (r == 0) fail++;
             }
-        }
-
-        // снять все IFEO-Debugger блокировки напрямую (не требует предыдущего скана)
-        int ClearIFEODirect()
-        {
-            int n = 0;
-            if (SoftRoot().Length == 0) return 0;
-            string ifeo = SoftRoot() + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
-            foreach (string sk in Reg.Subkeys(ifeo))
-                foreach (string[] v in Reg.Values(sk))
-                    if (v[0].Equals("Debugger", StringComparison.OrdinalIgnoreCase))
-                    { if (Reg.DeleteValue(sk, v[0])) n++; }
             return n;
         }
 
-        List<string> PolicyBases()
+        // Removes IFEO Debugger values (native + Wow6432Node, also in filter subkeys <exe>\<n>), never the IFEO keys
+        // (they also hold Exploit Protection settings). Known legitimate debuggers (Process Explorer / System Informer
+        // for taskmgr, Notepad++ for notepad, Microsoft debuggers) are kept: kept = how many.
+        int ClearIFEODirect(out int kept)
+        {
+            int n = 0; kept = 0;
+            if (SoftRoot().Length == 0) return 0;
+            foreach (string r in new string[] { SoftRoot(), SoftRoot() + "\\Wow6432Node" })
+            {
+                string ifeo = r + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+                foreach (string sk in Reg.Subkeys(ifeo))
+                {
+                    List<string> keys = new List<string>();
+                    keys.Add(sk);
+                    keys.AddRange(Reg.Subkeys(sk));   // UseFilter subkeys: IFEO\<exe>\<n>\Debugger
+                    foreach (string k in keys)
+                        foreach (string[] v in Reg.Values(k))
+                            if (v[0].Equals("Debugger", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
+                            {
+                                if (Defaults.IfeoKnownDebugger(Last(sk), v[1]) && Risk(v[1]) != "SUSPECT") { kept++; continue; }
+                                if (BackedDeleteValue(k, v[0], true, "IFEO Debugger " + Last(sk)) == 1) n++;
+                            }
+                }
+            }
+            return n;
+        }
+
+        // Per-user hive roots of the target: the profiles of the scan; live also every loaded HKU\<user SID> (users
+        // logged on in another session; over-the-shoulder elevation makes HKCU the ADMIN's hive) and HKCU itself.
+        List<string> UserRoots()
         {
             List<string> b = new List<string>();
-            b.Add(SoftRoot() + "\\Microsoft\\Windows\\CurrentVersion\\Policies");
-            foreach (string[] u in tgtUsers) if (u[1].Length > 0) b.Add(u[1] + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies");
-            if (!IsOffline()) b.Add("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies");
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string[] u in tgtUsers) if (u[1].Length > 0 && seen.Add(u[1])) b.Add(u[1]);
+            if (tgtReady && tgtLive)
+            {
+                foreach (string sid in Reg.SubkeyNames("HKU"))
+                    if ((sid.StartsWith("S-1-5-21-", StringComparison.OrdinalIgnoreCase) || sid.StartsWith("S-1-12-1-", StringComparison.OrdinalIgnoreCase))
+                        && !sid.EndsWith("_Classes", StringComparison.OrdinalIgnoreCase) && seen.Add("HKU\\" + sid)) b.Add("HKU\\" + sid);
+                b.Add("HKCU");
+            }
             return b;
+        }
+
+        // Lock values malware sets (research amateur-malware-remediation Q1; default = value absent). Only VALUES are
+        // deleted (Policies\System also holds the UAC settings), plus the DisallowRun / RestrictRun / *Cpl list subkeys.
+        internal static readonly string[] PolSystem = { "DisableTaskMgr", "DisableRegistryTools", "DisableCMD", "DisableChangePassword", "DisableLockWorkstation",
+            "NoDispCPL", "NoDispBackgroundPage", "NoDispAppearancePage", "NoDispScrSavPage", "NoDispSettingsPage", "NoColorChoice", "NoVisualStyleChoice",
+            "NoSizeChoice", "Wallpaper", "WallpaperStyle" };
+        internal static readonly string[] PolExplorer = { "NoRun", "NoFolderOptions", "NoControlPanel", "NoDesktop", "NoViewContextMenu", "NoFind", "NoClose",
+            "RestrictRun", "DisallowRun", "RestrictCpl", "DisallowCpl", "NoWinKeys", "NoLogoff", "StartMenuLogOff", "NoDrives", "NoViewOnDrive",
+            "NoTrayContextMenu", "NoSetTaskbar", "NoChangeStartMenu", "NoFileMenu", "NoSecurityTab", "NoManageMyComputerVerb", "HideClock",
+            "NoTrayItemsDisplay", "NoSMHelp", "NoThemesTab", "DisableCMD" };
+        internal static readonly string[] PolExplorerLists = { "DisallowRun", "RestrictRun", "DisallowCpl", "RestrictCpl" };
+        internal static readonly string[] PolNonEnum = { "{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "{645FF040-5081-101B-9F08-00AA002F954E}", "{450D8FBA-AD25-11D0-98A8-0800361B1103}" };
+
+        // {key, value name or null = whole key} below one hive root ("Software\..." relative paths).
+        internal static List<string[]> RestrictionItems(string root, bool machine)
+        {
+            List<string[]> r = new List<string[]>();
+            string p = root + (machine ? "\\" : "\\Software\\") + "Microsoft\\Windows\\CurrentVersion\\Policies";
+            foreach (string v in PolSystem) r.Add(new string[] { p + "\\System", v });
+            foreach (string v in PolExplorer) r.Add(new string[] { p + "\\Explorer", v });
+            foreach (string k in PolExplorerLists) r.Add(new string[] { p + "\\Explorer\\" + k, null });
+            foreach (string v in PolNonEnum) r.Add(new string[] { p + "\\NonEnum", v });
+            r.Add(new string[] { p + "\\ActiveDesktop", "NoChangingWallPaper" });
+            r.Add(new string[] { root + (machine ? "\\" : "\\Software\\") + "Policies\\Microsoft\\Windows\\System", "DisableCMD" });   // the real DisableCMD location
+            return r;
         }
 
         int RestoreRestrictions()
         {
             int n = 0;
             if (SoftRoot().Length == 0) return 0;
-            string[] sysVals = { "DisableTaskMgr", "DisableRegistryTools", "DisableCMD", "DisableChangePassword" };
-            string[] expVals = { "NoRun", "NoFolderOptions", "NoControlPanel", "NoDesktop", "NoViewContextMenu", "NoFind", "NoClose", "RestrictRun" };
-            foreach (string b in PolicyBases())
+            List<string[]> items = RestrictionItems(SoftRoot(), true);
+            foreach (string u in UserRoots()) items.AddRange(RestrictionItems(u, false));
+            foreach (string[] it in items)
             {
-                foreach (string v in sysVals) if (Reg.DeleteValue(b + "\\System", v)) n++;
-                foreach (string v in expVals) if (Reg.DeleteValue(b + "\\Explorer", v)) n++;
+                int r = it[1] == null ? BackedDeleteKey(it[0], true, "Снять блокировки") : BackedDeleteValue(it[0], it[1], true, "Снять блокировки: " + it[1]);
+                if (r == 1) n++;
             }
             return n;
         }
@@ -2815,10 +4183,10 @@ namespace RescueScan
             string[][] map = { new string[]{".exe","exefile"}, new string[]{".com","comfile"}, new string[]{".bat","batfile"}, new string[]{".cmd","cmdfile"} };
             foreach (string[] m in map)
             {
-                if (Reg.SetString(root + "\\" + m[0], "", m[1])) n++;
-                if (Reg.SetString(root + "\\" + m[1] + "\\shell\\open\\command", "", cmd)) n++;
+                if (BackedSet(root + "\\" + m[0], "", m[1], RegistryValueKind.String, true, "Ассоциации " + m[0]) == 1) n++;
+                if (BackedSet(root + "\\" + m[1] + "\\shell\\open\\command", "", cmd, RegistryValueKind.String, true, "Ассоциации " + m[1]) == 1) n++;
             }
-            Reg.SetString(root + "\\.lnk", "", "lnkfile");
+            if (BackedSet(root + "\\.lnk", "", "lnkfile", RegistryValueKind.String, true, "Ассоциации .lnk") == 1) n++;
             // иконки: чистим кэш (офлайн — файлы юзеров; живьём — тоже файлы)
             try
             {
@@ -2838,45 +4206,43 @@ namespace RescueScan
             return n;
         }
 
-        // kept = Winlogon Shell/Userinit findings left alone (reset by the Winlogon / defuse steps, never deleted)
-        void QuarantineSuspectAll(out int ok, out int fail, out int kept)
+        // Easy: every SUSPECT finding with a backup (Kind 4 values are reset, not deleted). already = nothing left to do
+        // (e.g. the IFEO / Winlogon step before already fixed it): never deleted afterwards.
+        void QuarantineSuspectAll(out int ok, out int fail, out int already)
         {
-            ok = 0; fail = 0; kept = 0; quarErr = "";
+            ok = 0; fail = 0; already = 0;
             foreach (Finding x in new List<Finding>(lastFindings))
             {
-                if (x.Risk != "SUSPECT") continue;
-                if (ResetOnly(x)) { kept++; continue; }
-                bool r = false;
-                if (x.Kind == 2) r = QuarFile(x.DelPath);
-                else if (x.Kind == 0) { if (QuarReg(x.DelKey)) r = Reg.DeleteValue(x.DelKey, x.DelName); }
-                else if (x.Kind == 1) { if (QuarReg(x.DelKey)) r = Reg.DeleteKey(x.DelKey); }
-                else continue;
-                if (r) ok++; else fail++;
+                if (x.Risk != "SUSPECT" || x.Kind == 3) continue;
+                int r = Remediate(x, true);
+                if (r == 1) ok++; else if (r == 2) already++; else fail++;
             }
         }
 
         // ================= EASY BUTTON =================
         void DoEasy()
         {
-            if (MessageBox.Show("Запустить авто-очистку по выбранным тумблерам?\r\nПодозрительное уйдёт в Карантин (можно вернуть). Дефолты будут восстановлены.",
+            if (MessageBox.Show("Запустить авто-очистку по выбранным тумблерам?\r\nПодозрительное уйдёт в Карантин, каждое изменение реестра сохраняется туда же (можно вернуть). Дефолты будут восстановлены.",
                 "Изи-очистка", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
             Cursor.Current = Cursors.WaitCursor;
             StringBuilder r = new StringBuilder();
+            quarErr = "";
             if (oScan.Checked) { Scan(); r.AppendLine("Скан: записей " + lastFindings.Count); }
             bool soft = EnsureTarget() && SoftRoot().Length > 0;   // repairs act only on the scanned target, never on a fallback
             if (!soft && (oWinlogon.Checked || oIFEO.Checked || oRestrict.Checked || oAssoc.Checked))
                 r.AppendLine("ВНИМАНИЕ: куст SOFTWARE цели (" + TargetName() + ") не смонтирован — Winlogon/IFEO/ограничения/ассоциации НЕ тронуты.");
-            if (soft && oWinlogon.Checked) { RestoreWinlogonDefaults(); r.AppendLine("Winlogon Shell/Userinit -> дефолт"); }
-            if (soft && oIFEO.Checked) { int i = ClearIFEODirect(); r.AppendLine("Снято IFEO-блокировок: " + i); }
+            if (soft && oWinlogon.Checked) { int wf; int w = RestoreWinlogonDefaults(out wf); r.AppendLine("Winlogon Shell/Userinit, AppInit, cmd AutoRun -> дефолт: изменено " + w + (wf > 0 ? ", ошибок " + wf : "")); }
+            if (soft && oIFEO.Checked) { int kept; int i = ClearIFEODirect(out kept); r.AppendLine("Снято IFEO-блокировок: " + i + (kept > 0 ? "   (оставлено известных отладчиков — Process Explorer / Notepad++ и т.п.: " + kept + ")" : "")); }
             if (soft && oRestrict.Checked) { int i = RestoreRestrictions(); r.AppendLine("Снято ограничений политик: " + i); }
             if (soft && oAssoc.Checked) { int i = RestoreAssoc(); r.AppendLine("Ассоциации/иконки восстановлены (" + i + ")"); }
-            if (oDefuse.Checked) { int d = 0; foreach (Finding x in lastFindings) if (x.Risk == "SUSPECT" && DefuseOne(x)) d++; r.AppendLine("Обезврежено якорей: " + d); }
+            if (oDefuse.Checked) { int d = 0; foreach (Finding x in lastFindings) if (x.Risk == "SUSPECT" && DefuseOne(x) == 1) d++; r.AppendLine("Обезврежено якорей: " + d); }
             if (oQuar.Checked)
             {
-                int ok, fail, kept; QuarantineSuspectAll(out ok, out fail, out kept);
-                r.AppendLine("В карантин: " + ok + "  (ошибок " + fail + ")  -> " + quarDir + (fail > 0 && quarErr.Length > 0 ? "\r\n   причина: " + quarErr : ""));
-                if (kept > 0) r.AppendLine("Winlogon Shell/Userinit не удалены (" + kept + "): их только возвращают в дефолт" + (oWinlogon.Checked || oDefuse.Checked ? "" : " — включи «Вернуть Winlogon» или «Обезвредить»"));
+                int ok, fail, already; QuarantineSuspectAll(out ok, out fail, out already);
+                r.AppendLine("В карантин / к дефолту: " + ok + "  (уже исправлено раньше: " + already + ", ошибок " + fail + ")");
             }
+            if (quarDir.Length > 0) r.AppendLine("Бэкапы всех изменений: " + quarDir);
+            if (quarErr.Length > 0) r.AppendLine("Первая ошибка: " + quarErr);
             if (oWatch.Checked) { chkWatch.Checked = true; r.AppendLine("Watchdog включён"); }
             if (oScan.Checked) { Scan(); } // пересканировать, чтобы список отражал результат
             QuarAutoFind();
@@ -2884,10 +4250,40 @@ namespace RescueScan
             MessageBox.Show("Готово:\r\n\r\n" + r.ToString(), "Изи-очистка");
         }
 
-        // ================= ACCOUNTS (live, net user + WMI) =================
+        // ================= ACCOUNTS (live only: WMI list, NetUserSetInfo / net user) =================
+        Button[] accBtns = new Button[0];
+
+        // The Accounts tab changes the SAM of the RUNNING system. In WinPE that is WinPE's own SAM (not the installation
+        // being repaired), and with an offline target selected it is not the target: refused there, with the reason.
+        bool AccAllowed(out string why)
+        {
+            why = "";
+            if (IsRescueSystem(Reg.KeyExists("HKLM\\SYSTEM\\CurrentControlSet\\Control\\MiniNT"), RunningWinDir()))
+                why = "Это WinPE/WinRE: здесь видны аккаунты самой WinPE, а не выбранной Windows — вкладка отключена. Офлайн-сброс пароля — chntpw / MS DaRT.";
+            else
+            {
+                WinTarget t = cboWin == null ? null : cboWin.SelectedItem as WinTarget;
+                bool offline = tgtReady ? !tgtLive : (t != null && !t.Live);
+                if (offline) why = "Выбрана офлайн-установка " + (tgtReady ? tgtWinDir : t.WinDir) + ": аккаунты меняются только у ЖИВОЙ ОС, где запущена программа — вкладка отключена. Офлайн-сброс — chntpw / MS DaRT.";
+            }
+            return why.Length == 0;
+        }
+
+        void UpdateAccState()
+        {
+            if (lvAcc == null) return;
+            string why;
+            bool ok = AccAllowed(out why);
+            foreach (Button b in accBtns) b.Enabled = ok;
+            if (!ok) { lvAcc.Items.Clear(); lblAcc.Text = why; }
+        }
+
         void AccRefresh()
         {
             lvAcc.Items.Clear();
+            string why;
+            if (!AccAllowed(out why)) { UpdateAccState(); return; }
+            foreach (Button b in accBtns) b.Enabled = true;
             try
             {
                 System.Management.ManagementObjectSearcher s = new System.Management.ManagementObjectSearcher(
@@ -2903,27 +4299,76 @@ namespace RescueScan
                     if (dis == "да" || lo == "да") it.BackColor = Color.FromArgb(255, 245, 205);
                     lvAcc.Items.Add(it);
                 }
-                lblAcc.Text = "Локальных аккаунтов: " + lvAcc.Items.Count + " (живая ОС).";
+                lblAcc.Text = "Локальных аккаунтов: " + lvAcc.Items.Count + " (живая ОС " + RunningWinDir() + ").";
             }
-            catch (Exception ex) { lblAcc.Text = "WMI недоступен (WinPE или служба выключена): " + ex.Message; }
+            catch (Exception ex) { lblAcc.Text = "WMI недоступен (служба выключена?): " + ex.Message; }
         }
 
         string AccName()
         {
+            string why;
+            if (!AccAllowed(out why)) { MessageBox.Show(why, "Аккаунты"); return null; }
             if (lvAcc.SelectedItems.Count == 0) { MessageBox.Show("Выбери пользователя."); return null; }
             return lvAcc.SelectedItems[0].SubItems[0].Text;
+        }
+
+        // Masked password, typed twice. null = cancelled.
+        static string PromptPassword(string title)
+        {
+            Form f = new Form(); f.Text = title; f.Width = 540; f.Height = 190;
+            f.StartPosition = FormStartPosition.CenterScreen; f.FormBorderStyle = FormBorderStyle.FixedDialog;
+            f.MinimizeBox = false; f.MaximizeBox = false; f.TopMost = true;
+            Label l1 = new Label(); l1.Text = "Пароль:"; l1.Left = 12; l1.Top = 18; l1.Width = 90;
+            TextBox t1 = new TextBox(); t1.Left = 110; t1.Top = 15; t1.Width = 400; t1.UseSystemPasswordChar = true;
+            Label l2 = new Label(); l2.Text = "Ещё раз:"; l2.Left = 12; l2.Top = 52; l2.Width = 90;
+            TextBox t2 = new TextBox(); t2.Left = 110; t2.Top = 49; t2.Width = 400; t2.UseSystemPasswordChar = true;
+            Button ok = new Button(); ok.Text = "OK"; ok.Left = 336; ok.Top = 100; ok.Width = 80; ok.DialogResult = DialogResult.OK;
+            Button cc = new Button(); cc.Text = "Отмена"; cc.Left = 432; cc.Top = 100; cc.Width = 80; cc.DialogResult = DialogResult.Cancel;
+            f.Controls.Add(l1); f.Controls.Add(t1); f.Controls.Add(l2); f.Controls.Add(t2); f.Controls.Add(ok); f.Controls.Add(cc);
+            f.AcceptButton = ok; f.CancelButton = cc;
+            while (f.ShowDialog() == DialogResult.OK)
+            {
+                if (t1.Text == t2.Text) return t1.Text;
+                MessageBox.Show("Пароли не совпадают.", title);
+                t1.Text = ""; t2.Text = "";
+            }
+            return null;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct USER_INFO_1003 { public string usri1003_password; }
+
+        [DllImport("netapi32.dll", CharSet = CharSet.Unicode)]
+        static extern int NetUserSetInfo(string server, string user, int level, ref USER_INFO_1003 buf, out int parmErr);
+
+        static string NetErr(int rc)
+        {
+            switch (rc)
+            {
+                case 5: return "нет прав (запусти от администратора)";
+                case 2221: return "пользователь не найден";
+                case 2245: return "пароль не подходит под политику (длина / сложность / история)";
+            }
+            return "код " + rc + ": " + new System.ComponentModel.Win32Exception(rc).Message;
         }
 
         void AccSetPass()
         {
             string n = AccName(); if (n == null) return;
-            string p = Prompt("Новый пароль для «" + n + "» (пусто = снять пароль)", "");
+            if (MessageBox.Show("Сменить пароль «" + n + "» без старого пароля?\r\n\r\nВНИМАНИЕ: при таком сбросе пропадает доступ к EFS-зашифрованным файлам этого пользователя " +
+                "и к сохранённым паролям (DPAPI: браузеры, Wi-Fi, учётные данные, сертификаты). Для учётной записи Microsoft пароль меняется на account.microsoft.com, не здесь.",
+                "Пароль", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            string p = PromptPassword("Новый пароль для «" + n + "» (пусто = без пароля)");
             if (p == null) return;
-            // net1.exe treats ANY argument starting with "/" as a switch, even quoted: "/delete" would delete the account
-            if (p.StartsWith("/")) { MessageBox.Show("Пароль не может начинаться с «/»: net.exe примет его за ключ (например, /delete удалит аккаунт).", "Пароль"); return; }
-            // /Y: answer the ">14 characters" question instead of failing on it
-            string o; int rc = RunProc("net", "user " + Reg.QuoteArg(n) + " " + Reg.QuoteArg(p) + " /Y", out o);
-            MessageBox.Show(rc == 0 ? "Пароль изменён для " + n : "Ошибка:\r\n" + o, "Пароль");
+            int rc;
+            try
+            {
+                USER_INFO_1003 ui; ui.usri1003_password = p;
+                int pe;
+                rc = NetUserSetInfo(null, n, 1003, ref ui, out pe);   // no command line: nothing for net.exe to misread, nothing in the process list
+            }
+            catch (Exception ex) { MessageBox.Show("Ошибка: " + ex.Message, "Пароль"); return; }
+            MessageBox.Show(rc == 0 ? "Пароль изменён для " + n : "Ошибка: " + NetErr(rc), "Пароль");
             AccRefresh();
         }
 
@@ -2938,28 +4383,87 @@ namespace RescueScan
         void AccDelUser()
         {
             string n = AccName(); if (n == null) return;
-            if (MessageBox.Show("Удалить пользователя «" + n + "»? (профиль на диске останется)", "Удаление",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            if (MessageBox.Show("Удалить пользователя «" + n + "»? (профиль на диске останется, но его EFS-файлы и сохранённые пароли (DPAPI) станут недоступны)", "Удаление",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
             string o; int rc = RunProc("net", "user " + Reg.QuoteArg(n) + " /delete", out o);
             MessageBox.Show(rc == 0 ? "Пользователь удалён: " + n : "Ошибка:\r\n" + o, "Удаление");
             AccRefresh();
         }
 
+        // ProfileImagePath / ProfilesDirectory with only %SystemDrive%, %SystemRoot%, %windir% expanded (to the running
+        // system, never the technician's %USERPROFILE% & co.); "" if anything else is in it or it is not X:\...
+        internal static string ExpandProfileVar(string raw, string winDir)
+        {
+            if (string.IsNullOrEmpty(raw) || string.IsNullOrEmpty(winDir) || winDir.Length < 3) return "";
+            string p = ReplaceCI(ReplaceCI(ReplaceCI(raw.Trim(), "%SystemDrive%", winDir.Substring(0, 2)), "%SystemRoot%", winDir), "%windir%", winDir).TrimEnd('\\');
+            return QuarMan.AbsLocalPath(p) && p.IndexOf('%') < 0 ? p : "";
+        }
+
+        // The folder «Удалить профиль» may delete, or "" + why: strictly ONE level below ProfilesDirectory (itself not a
+        // root / system folder), not Public/Default, not this process's profile, not the folder of another ProfileList
+        // entry, not a protected folder, no "..". pip / profilesDir raw (not expanded) from ProfileList.
+        internal static string ProfileDeletePath(string pip, string profilesDir, string winDir, string me, List<string> others, out string why)
+        {
+            why = "";
+            if ((pip ?? "").IndexOf("..") >= 0) { why = "в пути есть «..»"; return ""; }
+            string p = ExpandProfileVar(pip, winDir);
+            string pd = ExpandProfileVar(string.IsNullOrEmpty(profilesDir) ? "%SystemDrive%\\Users" : profilesDir, winDir);
+            if (p.Length == 0) { why = "путь не абсолютный или с неизвестными %переменными%: " + pip; return ""; }
+            if (pd.Length <= 3 || QuarMan.Below(pd, winDir) || (ProtectedPath(pd, winDir).Length > 0 && !pd.Substring(2).Equals("\\Users", StringComparison.OrdinalIgnoreCase)))
+            { why = "ProfilesDirectory подозрителен: " + profilesDir; return ""; }
+            int cut = p.LastIndexOf('\\');
+            string parent = p.Substring(0, cut), name = p.Substring(cut + 1);
+            if (!parent.Equals(pd, StringComparison.OrdinalIgnoreCase)) { why = "папка не лежит прямо в " + pd + ": " + p; return ""; }
+            foreach (string bad in new string[] { "Public", "Default", "Default User", "All Users", "defaultuser0" })
+                if (name.Equals(bad, StringComparison.OrdinalIgnoreCase)) { why = "системный профиль " + name; return ""; }
+            string prot = QuarMan.Below(p, winDir) ? "папка Windows" : ProtectedPath(p, winDir);
+            if (prot.Length > 0) { why = prot; return ""; }
+            if (!string.IsNullOrEmpty(me) && p.Equals(me.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) { why = "это профиль, от имени которого запущена программа"; return ""; }
+            foreach (string o in others ?? new List<string>())
+                if (o.Length > 0 && p.Equals(o.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) { why = "эта папка указана и у другого пользователя в ProfileList"; return ""; }
+            return p;
+        }
+
+        static bool SidLike(string s)
+        {
+            if (string.IsNullOrEmpty(s) || !s.StartsWith("S-1-") || s.Length > 200) return false;
+            foreach (char c in s) if (!(c == '-' || c == 'S' || (c >= '0' && c <= '9'))) return false;
+            return true;
+        }
+
         void AccDelProfile()
         {
-            if (lvAcc.SelectedItems.Count == 0) { MessageBox.Show("Выбери пользователя."); return; }
-            string n = lvAcc.SelectedItems[0].SubItems[0].Text;
+            string n = AccName(); if (n == null) return;
             string sid = lvAcc.SelectedItems[0].SubItems[4].Text;
-            string pk = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\" + sid;
-            string path = "";
-            foreach (string[] v in Reg.Values(pk))
-                if (v[0].Equals("ProfileImagePath", StringComparison.OrdinalIgnoreCase)) path = Environment.ExpandEnvironmentVariables(v[1]);
-            if (MessageBox.Show("Удалить ПРОФИЛЬ пользователя «" + n + "»?\r\nПапка: " + (path.Length > 0 ? path : "(не найдена)") + "\r\n+ запись ProfileList. Необратимо.",
-                "Удаление профиля", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            if (!SidLike(sid)) { MessageBox.Show("Странный SID: " + sid, "Профиль"); return; }
+            string win = RunningWinDir();
+            string pl = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", pk = pl + "\\" + sid;
+            string raw = "", pdir = "";
+            foreach (string[] v in Reg.Values(pk)) if (v[0].Equals("ProfileImagePath", StringComparison.OrdinalIgnoreCase)) raw = v[1];
+            foreach (string[] v in Reg.Values(pl)) if (v[0].Equals("ProfilesDirectory", StringComparison.OrdinalIgnoreCase)) pdir = v[1];
+            List<string> others = new List<string>();
+            foreach (string sk in Reg.Subkeys(pl))
+                if (!Last(sk).Equals(sid, StringComparison.OrdinalIgnoreCase))
+                    foreach (string[] v in Reg.Values(sk)) if (v[0].Equals("ProfileImagePath", StringComparison.OrdinalIgnoreCase)) others.Add(ExpandProfileVar(v[1], win));
+            string me = "";
+            try { me = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile); } catch { }
+            string why = "", path = raw.Length > 0 ? ProfileDeletePath(raw, pdir, win, me, others, out why) : "";
+            if (raw.Length > 0 && path.Length == 0) { MessageBox.Show("Папку профиля «" + n + "» удалять нельзя: " + why + "\r\nProfileImagePath = " + raw, "Профиль", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            if (path.Length > 0 && (FsOps.Attrs(path) & 0x400) != 0 && FsOps.Attrs(path) != -1) { MessageBox.Show("Папка профиля — ссылка (junction / symlink): " + path + "\r\nУдали её вручную.", "Профиль"); return; }
+            if (MessageBox.Show("Удалить ПРОФИЛЬ пользователя «" + n + "»?\r\nProfileImagePath: " + (raw.Length > 0 ? raw : "(нет)") + "\r\nПапка: " + (path.Length > 0 ? path : "(не найдена)") +
+                "\r\n+ запись ProfileList (её бэкап — в карантин). Папка удаляется НЕОБРАТИМО.", "Удаление профиля", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            string typed = Prompt("Для подтверждения введи имя пользователя: " + n, "");
+            if (typed == null || typed != n) { MessageBox.Show("Имя не совпало — ничего не удалено.", "Профиль"); return; }
             string msg = "";
-            try { if (path.Length > 0 && Directory.Exists(path)) { Directory.Delete(path, true); msg += "Папка удалена. "; } }
-            catch (Exception ex) { msg += "Папка: " + ex.Message + " "; }
-            if (Reg.DeleteKey(pk)) msg += "ProfileList очищен.";
+            if (path.Length > 0 && FsOps.Exists(path))
+            {
+                int failed = 0; string err = "";
+                FsOps.DeleteTree(path, ref failed, ref err);
+                msg += failed == 0 ? "Папка удалена. " : "Папка удалена не полностью (ошибок " + failed + ": " + err + "). ";
+            }
+            quarErr = "";
+            int r = BackedDeleteKey(pk, tgtReady && tgtLive, "профиль " + n);
+            msg += r == 1 ? "ProfileList очищен." : r == 2 ? "Записи ProfileList нет." : "ProfileList не очищен: " + quarErr;
             MessageBox.Show(msg, "Профиль");
             AccRefresh();
         }
@@ -2968,29 +4472,23 @@ namespace RescueScan
         {
             int n = 0; foreach (ListViewItem it in target.Items) if (it.Checked) n++;
             if (n == 0) { MessageBox.Show("Ничего не отмечено."); return; }
-            if (MessageBox.Show("Удалить отмеченных записей: " + n + " ?\nОперация необратима.", "Подтверждение",
+            if (MessageBox.Show("Удалить отмеченных записей: " + n + " ?\nОперация необратима (без бэкапа; для бэкапа — «Карантин»).\n" +
+                "Winlogon Shell/Userinit, BootExecute и т.п. не удаляются, а возвращаются к дефолту.", "Подтверждение",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-
             List<ListViewItem> done = new List<ListViewItem>();
-            int ok = 0, fail = 0, skip = 0, keep = 0;
+            int ok = 0, fail = 0, skip = 0, already = 0;
+            quarErr = "";
             foreach (ListViewItem it in target.Items)
             {
                 if (!it.Checked) continue;
                 Finding x = (Finding)it.Tag;
-                if (x.Kind == 3) { skip++; continue; }   // info-only (BCD/LSA/class hijack): чинить вручную, не удалять
-                if (ResetOnly(x)) { keep++; continue; }
-                bool r = false;
-                try
-                {
-                    if (x.Kind == 0) r = Reg.DeleteValue(x.DelKey, x.DelName);
-                    else if (x.Kind == 1) r = Reg.DeleteKey(x.DelKey);
-                    else if (x.Kind == 2) { File.Delete(x.DelPath); r = true; }
-                }
-                catch { r = false; }
-                if (r) { ok++; done.Add(it); } else fail++;
+                if (x.Kind == 3) { skip++; continue; }   // info-only (BCD/LSA/class hijack/ESP): чинить вручную, не удалять
+                int r = Remediate(x, x.Kind == 4);      // a reset keeps the original in the quarantine anyway
+                if (r == 1) { ok++; done.Add(it); } else if (r == 2) { already++; done.Add(it); } else fail++;
             }
             foreach (ListViewItem it in done) target.Items.Remove(it);
-            lblStatus.Text = "Удалено: " + ok + "   ошибок: " + fail + "   пропущено (info): " + skip + KeepNote(keep);
+            lblStatus.Text = "Удалено / к дефолту: " + ok + "   уже нет: " + already + "   ошибок: " + fail + "   пропущено (info): " + skip
+                + (fail > 0 && quarErr.Length > 0 ? "   причина: " + quarErr : "");
         }
 
         void Export()

@@ -53,7 +53,20 @@ namespace RescueScan.Tests
                 Run("Live mode: ProfileImagePath -> folders on the TARGET volume only", ProfileDirs);
                 Run("Detect: WinPE hidden only on X: with MiniNT; live OS labelled", TargetList);
                 Run("WOW64: System32 of the running OS via Sysnative", FsPaths);
-                Run("Quarantine: registry backups tagged with their installation / profile", HiveTags);
+                Run("Defaults: Userinit / Shell / VMApplet / AlternateShell / SystemRoot", DefaultsWinlogon);
+                Run("Defaults: BootExecute autochk lines, repair, SetupExecute servicing", DefaultsBootExecute);
+                Run("Defaults: known IFEO debuggers", DefaultsIfeo);
+                Run("Scan: reset-only rows (BootExecute/SetupExecute/VMApplet/Userinit), IFEO value rows", ScanResetKinds);
+                Run("Repair anchors: good / bad", AnchorsGood);
+                Run(".reg writer/parser: all types, escaping, round trip", RegFileRoundTrip);
+                Run("Snapshot -> .reg -> SetRaw: exact restore", SnapshotRestore);
+                Run("Quarantine manifest: escaping, validation, names, folder", ManifestCases);
+                Run("Quarantine: logical location -> hive of a later session", LocateResolve);
+                Run("Explorer: protected paths", ProtectedPaths);
+                Run("Accounts: profile folder validation", ProfilePaths);
+                Run("Pre-boot: bcdedit entries (description after path)", BcdParse);
+                Run("FsOps: read-only delete, move, tree", FsOpsCases);
+                Run("Unlock: restriction list", RestrictionList);
                 Run("Live mode: SamePath / WinTarget labels", LiveHelpers);
                 Run("Mounts: RS_* names", MountNames);
                 Run("Mounts: mount / missing file / file in use / unload all", MountBasic);
@@ -95,7 +108,7 @@ namespace RescueScan.Tests
         {
             try { t(); passed++; Console.WriteLine("PASS  " + name); }
             catch (SkipException e) { skipped++; Console.WriteLine("SKIP  " + name + "  (" + e.Message + ")"); }
-            catch (Exception e) { failed++; Console.WriteLine("FAIL  " + name + "\n      " + e.Message.Replace("\n", "\n      ")); }
+            catch (Exception e) { failed++; Console.WriteLine("FAIL  " + name + "\n      " + e.Message.Replace("\n", "\n      ")); if (e is NullReferenceException) Console.WriteLine(e.StackTrace); }
         }
 
         static void WindowsOnly() { if (!OnWindows) throw new SkipException("needs Windows"); }
@@ -520,8 +533,11 @@ namespace RescueScan.Tests
             True(MainForm.ResetOnly(FindName(f, "Userinit")), "Userinit: reset only");
             Eq("SUSPECT", FindName(f, "Userinit").Risk, "the evil Userinit is still flagged");
             True(!MainForm.ResetOnly(FindName(f, "Taskman")), "Taskman can be deleted");
-            Finding vm = new Finding(); vm.Category = "Winlogon VmApplet"; vm.Kind = 0;
-            True(!MainForm.ResetOnly(vm), "other Winlogon values: unchanged behaviour");
+            Eq(4, FindName(f, "Userinit").Kind, "Userinit: Kind 4 (reset)");
+            Eq("C:\\Windows\\system32\\userinit.exe,", FindName(f, "Userinit").ResetData, "reset data");
+            Eq("explorer.exe", FindName(f, "Shell").ResetData, "Shell reset data");
+            Finding vm = new Finding(); vm.Category = "Winlogon GinaDLL"; vm.Kind = 0;
+            True(!MainForm.ResetOnly(vm), "other Winlogon values: deletable");
             True(!MainForm.ResetOnly(null), "null");
         }
 
@@ -718,26 +734,428 @@ namespace RescueScan.Tests
                "running OS in a non-standard folder is listed too");
         }
 
-        // Quarantine: a registry backup is tagged with the installation / profile its hive belongs to; restore imports it
-        // only when the key's root is a hive of the prepared target with the same tag.
-        static void HiveTags()
+        // ------------------------------------------------------------------ wave 2 / package A
+        // Winlogon / Session Manager defaults (research windows-semantics Q1/Q2).
+        static void DefaultsWinlogon()
+        {
+            string sr = "C:\\Windows";
+            True(Defaults.UserinitClean("C:\\Windows\\system32\\userinit.exe,", sr), "default with comma");
+            True(Defaults.UserinitClean("C:\\Windows\\system32\\userinit.exe", sr), "without comma (KB 555648 form)");
+            True(Defaults.UserinitClean(" c:\\windows\\SYSTEM32\\Userinit.exe , ", sr), "case / spaces / trailing comma");
+            True(Defaults.UserinitClean("userinit.exe,", sr), "bare userinit.exe");
+            True(Defaults.UserinitClean("userinit", sr), "bare userinit");
+            True(!Defaults.UserinitClean("C:\\Windows\\system32\\userinit.exe,C:\\evil.exe", sr), "classic hijack without trailing comma (R091)");
+            True(!Defaults.UserinitClean("C:\\Windows\\system32\\userinit.exe,C:\\evil.exe,", sr), "hijack with trailing comma");
+            True(!Defaults.UserinitClean("C:\\ProgramData\\x\\userinit.exe,", sr), "replacement in another folder (R011)");
+            True(!Defaults.UserinitClean("D:\\Windows\\system32\\userinit.exe,", sr), "other drive than the target's SystemRoot");
+            True(Defaults.UserinitClean("E:\\Windows\\system32\\userinit.exe,", ""), "SystemRoot unknown: any X:\\Windows");
+            True(!Defaults.UserinitClean("", sr), "empty");
+            True(!Defaults.UserinitClean(",,", sr), "only commas");
+            True(!Defaults.UserinitClean("C:\\Windows\\system32\\userinit.exe /x,", sr), "arguments");
+            Eq("D:\\Win10\\system32\\userinit.exe,", Defaults.Userinit("D:\\Win10\\"), "default from SystemRoot");
+            True(Defaults.ShellClean("explorer.exe", sr) && Defaults.ShellClean(" Explorer.EXE ", sr), "shell default");
+            True(Defaults.ShellClean("C:\\Windows\\explorer.exe", sr), "full path");
+            True(!Defaults.ShellClean("explorer.exe, C:\\evil.exe", sr), "extra program");
+            True(!Defaults.ShellClean("C:\\Users\\x\\explorer.exe", sr), "explorer.exe elsewhere");
+            True(Defaults.VmAppletClean("SystemPropertiesPerformance.exe /pagefile"), "VMApplet default (R059)");
+            True(Defaults.VmAppletClean("systempropertiesperformance.exe  /pagefile"), "VMApplet case / spaces");
+            True(!Defaults.VmAppletClean("C:\\evil.exe"), "VMApplet changed");
+            True(Defaults.AlternateShellClean("cmd.exe") && !Defaults.AlternateShellClean("C:\\x\\evil.exe"), "AlternateShell");
+            Eq("C:\\Windows", Defaults.SystemRootFor("C:\\Windows", false, "X:\\Windows", "D:\\Windows"), "offline: the installation's own SystemRoot value");
+            Eq("C:\\Windows", Defaults.SystemRootFor("", false, "X:\\Windows", "D:\\Windows"), "offline, value missing: C: + folder");
+            Eq("C:\\WINNT", Defaults.SystemRootFor("%SystemDrive%\\x", false, "X:\\Windows", "F:\\WINNT"), "offline, odd value: C: + folder");
+            Eq("E:\\Win", Defaults.SystemRootFor("C:\\Windows", true, "E:\\Win", "E:\\Win"), "live: the running system");
+        }
+
+        static void DefaultsBootExecute()
+        {
+            True(Defaults.AutochkLine("autocheck autochk *"), "default");
+            True(Defaults.AutochkLine("autocheck autochk /k:C *"), "chkntfs /x");
+            True(Defaults.AutochkLine("autocheck autochk /k:CD *"), "chkntfs /x two drives");
+            True(Defaults.AutochkLine("autocheck autochk /r \\??\\C:"), "scheduled chkdsk /r");
+            True(Defaults.AutochkLine("autocheck autochk /p \\??\\C:"), "scheduled /p");
+            True(Defaults.AutochkLine("AUTOCHECK AUTOCHK /m \\??\\Volume{12345678-abcd-ef01-2345-6789abcdef01}"), "volume GUID");
+            True(Defaults.AutochkLine("autocheck autochk /q /v *"), "/q /v");
+            True(!Defaults.AutochkLine("autocheck autochk * evil"), "extra token");
+            True(!Defaults.AutochkLine("evil"), "other native program");
+            True(!Defaults.AutochkLine("autocheck evil.exe *"), "other program after autocheck");
+            True(!Defaults.AutochkLine("autocheck autochk /r C:\\x.exe"), "switch with a non-volume argument");
+            True(!Defaults.AutochkLine("autocheck autochk /k:C1 *"), "bad /k list");
+            True(!Defaults.AutochkLine("autocheck autochk /m \\??\\Volume{zz}"), "bad volume GUID");
+            Eq("autocheck autochk *", string.Join("|", Defaults.BootExecuteRepair(new string[] { "autocheck autochk *", "evil" })), "extra entry dropped");
+            Eq("autocheck autochk /r \\??\\C:|autocheck autochk *", string.Join("|", Defaults.BootExecuteRepair(new string[] { "autocheck autochk /r \\??\\C:", "autocheck autochk *" })),
+               "scheduled chkdsk kept (R049/R052)");
+            Eq("autocheck autochk /r \\??\\C:|autocheck autochk *", string.Join("|", Defaults.BootExecuteRepair(new string[] { "autocheck autochk /r \\??\\C:", "\\??\\D:\\x.exe" })),
+               "default added when no kept line has *");
+            Eq("autocheck autochk *", string.Join("|", Defaults.BootExecuteRepair(new string[0])), "empty -> default");
+            True(Defaults.ServicingEntry("C:\\Windows\\System32\\poqexec.exe /display_progress \\SystemRoot\\WinSxS\\pending.xml"), "poqexec (R060)");
+            True(Defaults.ServicingEntry("\\SystemRoot\\System32\\poqexec.exe /display_progress \\SystemRoot\\WinSxS\\pending.xml"), "poqexec NT path");
+            True(Defaults.ServicingEntry("poqexec.exe /skip_pending"), "bare poqexec");
+            True(!Defaults.ServicingEntry("C:\\Users\\x\\poqexec.exe /display_progress \\SystemRoot\\WinSxS\\pending.xml"), "poqexec elsewhere");
+            True(!Defaults.ServicingEntry("C:\\Windows\\System32\\poqexec.exe C:\\evil.exe"), "poqexec with another argument");
+            True(!Defaults.ServicingEntry("C:\\evil.exe"), "other program");
+        }
+
+        static void DefaultsIfeo()
+        {
+            True(Defaults.IfeoKnownDebugger("taskmgr.exe", "\"C:\\Tools\\procexp64.exe\""), "Process Explorer");
+            True(Defaults.IfeoKnownDebugger("Taskmgr.exe", "C:\\Program Files\\SystemInformer\\SystemInformer.exe"), "System Informer, unquoted with spaces");
+            True(Defaults.IfeoKnownDebugger("notepad.exe", "\"C:\\Program Files\\Notepad++\\notepad++.exe\" -notepadStyleCmdline -z"), "Notepad++");
+            True(Defaults.IfeoKnownDebugger("myservice.exe", "C:\\Debuggers\\windbg.exe -g"), "windbg");
+            True(!Defaults.IfeoKnownDebugger("sethc.exe", "C:\\Windows\\System32\\cmd.exe"), "sticky keys backdoor");
+            True(!Defaults.IfeoKnownDebugger("taskmgr.exe", "C:\\evil.exe"), "taskmgr blocked");
+            True(!Defaults.IfeoKnownDebugger("regedit.exe", "\"C:\\Tools\\procexp64.exe\""), "procexp on another exe");
+            Eq("notepad++.exe", Defaults.ImageName("\"C:\\Program Files\\Notepad++\\notepad++.exe\" -z"), "ImageName quoted");
+            Eq("a.exe", Defaults.ImageName("C:\\x y\\a.exe -b"), "ImageName unquoted with space");
+            Eq("ntsd.exe", Defaults.ImageName("ntsd.exe -d"), "ImageName bare");
+        }
+
+        // Scan side: Winlogon / BootExecute / SetupExecute / IFEO rows and their remediation kind.
+        static void ScanResetKinds()
+        {
+            using (RegistryKey k = Make("sm"))
+            {
+                k.SetValue("BootExecute", new string[] { "autocheck autochk /r \\??\\C:", "autocheck autochk *", "evil" }, RegistryValueKind.MultiString);
+                k.SetValue("SetupExecute", new string[] { "C:\\Windows\\System32\\poqexec.exe /display_progress \\SystemRoot\\WinSxS\\pending.xml" }, RegistryValueKind.MultiString);
+            }
+            List<Finding> f = new List<Finding>();
+            MainForm.ScanBootExecute(f, Root + "\\sm");
+            MainForm.ScanSetupExecute(f, Root + "\\sm");
+            Eq(2, f.Count, "two rows");
+            Finding be = FindName(f, "BootExecute");
+            Eq("SUSPECT", be.Risk, "BootExecute with an extra entry");
+            Eq(4, be.Kind, "BootExecute is reset, never deleted");
+            True(MainForm.ResetOnly(be), "ResetOnly");
+            Eq("autocheck autochk /r \\??\\C:|autocheck autochk *", string.Join("|", (string[])be.ResetData), "reset keeps the scheduled chkdsk");
+            Eq(RegistryValueKind.MultiString, be.ResetType, "REG_MULTI_SZ");
+            Finding se = f[1];
+            Eq("REVIEW", se.Risk, "pending servicing = REVIEW");
+            Eq(3, se.Kind, "pending servicing is never removed");
+            using (RegistryKey k = Make("sm"))
+                k.SetValue("SetupExecute", new string[] { "C:\\Windows\\System32\\poqexec.exe /display_progress \\SystemRoot\\WinSxS\\pending.xml", "C:\\evil.exe" }, RegistryValueKind.MultiString);
+            f.Clear();
+            MainForm.ScanSetupExecute(f, Root + "\\sm");
+            Eq("SUSPECT", f[0].Risk, "SetupExecute with another program");
+            Eq(4, f[0].Kind, "SetupExecute reset");
+            Eq(1, ((string[])f[0].ResetData).Length, "only the servicing entry is kept");
+            using (RegistryKey k = Make("sm")) k.SetValue("BootExecute", new string[] { "autocheck autochk *" }, RegistryValueKind.MultiString);
+            f.Clear();
+            MainForm.ScanBootExecute(f, Root + "\\sm");
+            Eq("", f[0].Risk, "default BootExecute is clean");
+            // IFEO: Debugger value only (key holds MitigationOptions too); filter subkey; known debugger = REVIEW; WOW64 copy
+            string ifeo = "ifeo\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+            using (RegistryKey k = Make(ifeo + "\\sethc.exe")) { k.SetValue("Debugger", "C:\\Windows\\System32\\cmd.exe"); k.SetValue("MitigationOptions", new byte[] { 1, 2 }); }
+            using (RegistryKey k = Make(ifeo + "\\taskmgr.exe")) k.SetValue("Debugger", "\"C:\\Tools\\procexp64.exe\"");
+            using (RegistryKey k = Make(ifeo + "\\notepad.exe\\0")) k.SetValue("Debugger", "C:\\Users\\x\\AppData\\evil.exe");
+            using (RegistryKey k = Make("ifeo\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\utilman.exe")) k.SetValue("Debugger", "cmd.exe");
+            f.Clear();
+            MainForm.ScanIfeo(f, Root + "\\ifeo", new List<string>());
+            Eq(4, f.Count, "four IFEO rows");
+            Finding s = FindName(f, "sethc.exe");
+            Eq(0, s.Kind, "IFEO: delete the VALUE");
+            Eq("Debugger", s.DelName, "only Debugger");
+            Eq("SUSPECT", s.Risk, "sethc");
+            Eq("REVIEW", FindName(f, "taskmgr.exe").Risk, "Process Explorer = REVIEW");
+            Finding fl = FindName(f, "notepad.exe\\0");
+            True(fl != null && fl.DelKey.EndsWith("\\notepad.exe\\0"), "filter subkey row");
+            Finding w = FindName(f, "utilman.exe");
+            True(w != null && w.Category.Contains("WOW64"), "WOW64 copy labelled");
+            // Winlogon: VMApplet default is clean and reset-only
+            using (RegistryKey k = Make("wl2\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon")) { k.SetValue("VMApplet", "SystemPropertiesPerformance.exe /pagefile"); k.SetValue("Userinit", "D:\\W\\system32\\userinit.exe,"); }
+            f.Clear();
+            MainForm.ScanExtraSoftware(f, Root + "\\wl2");
+            Finding vm = FindName(f, "VMApplet");
+            True(vm != null && vm.Risk == "" && vm.Kind == 4, "VMApplet default: clean, reset-only");
+            f.Clear();
+            MainForm.ScanWinlogon(f, Root + "\\wl2", "D:\\W");
+            Eq("", FindName(f, "Userinit").Risk, "Userinit judged against the target's SystemRoot");
+            Eq("D:\\W\\system32\\userinit.exe,", FindName(f, "Userinit").ResetData, "reset data from the target's SystemRoot");
+        }
+
+        static void AnchorsGood()
+        {
+            string[] shell = { "Winlogon Shell", "x", "Shell", "explorer.exe", "0" };
+            string[] taskman = { "Winlogon Taskman", "x", "Taskman", "", "1" };
+            string[] appinit = { "AppInit_DLLs", "x", "AppInit_DLLs", "", "0" };
+            string[] ui = { "Winlogon Userinit", "x", "Userinit", "C:\\Windows\\system32\\userinit.exe,", "0" };
+            True(MainForm.AnchorGood(shell, "explorer.exe", true, "C:\\Windows"), "shell ok");
+            True(!MainForm.AnchorGood(shell, "", false, "C:\\Windows"), "shell missing");
+            True(MainForm.AnchorGood(taskman, "", false, "") && !MainForm.AnchorGood(taskman, "x", true, ""), "taskman");
+            True(MainForm.AnchorGood(appinit, "", false, "") && MainForm.AnchorGood(appinit, " ", true, "") && !MainForm.AnchorGood(appinit, "a.dll", true, ""), "appinit");
+            True(MainForm.AnchorGood(ui, "userinit.exe,", true, "C:\\Windows"), "userinit variant is not rewritten");
+            True(!MainForm.AnchorGood(ui, "C:\\Windows\\system32\\userinit.exe,evil.exe", true, "C:\\Windows"), "userinit hijack");
+        }
+
+        // .reg writer / parser: every type, escaping, default value, "delete" marker, continuation lines.
+        static void RegFileRoundTrip()
+        {
+            RegSection s = new RegSection("HKEY_LOCAL_MACHINE\\SOFTWARE\\A b\\[x]");
+            Action<string, int, byte[]> add = delegate(string n, int t, byte[] d) { RegVal v = new RegVal(); v.Name = n; v.Type = t; v.Data = d; s.Values.Add(v); };
+            add("", 1, Encoding.Unicode.GetBytes("def\0"));
+            add("q\"uote \\ back", 1, Encoding.Unicode.GetBytes("C:\\dir\\\"x\" Кириллица\0"));
+            add("noterm", 1, Encoding.Unicode.GetBytes("abc"));                // REG_SZ without terminator -> hex(1)
+            add("nl", 1, Encoding.Unicode.GetBytes("a\r\nb\0"));                // newline -> hex(1)
+            add("exp", 2, Encoding.Unicode.GetBytes("%SystemRoot%\\x\0"));
+            add("multi", 7, Encoding.Unicode.GetBytes("a\0b\0\0"));
+            add("dw", 4, BitConverter.GetBytes(0xdeadbeefu));
+            add("qw", 11, BitConverter.GetBytes(0x0102030405060708L));
+            add("bin", 3, new byte[200]);
+            add("none", 0, new byte[0]);
+            add("odd", 0x12345, new byte[] { 9 });
+            add("dwshort", 4, new byte[] { 1, 2 });
+            RegVal del = new RegVal(); del.Name = "gone"; del.Delete = true; s.Values.Add(del);
+            List<RegSection> secs = new List<RegSection> { s, new RegSection("HKEY_USERS\\S-1-5-21-1\\Software\\Empty") };
+            string err;
+            string text = RegFile.Format(secs, out err);
+            True(text != null, "format: " + err);
+            True(text.StartsWith("Windows Registry Editor Version 5.00\r\n"), "header");
+            True(text.Contains("\r\n@=\"def\"\r\n"), "default value as @");
+            True(text.Contains("\"q\\\"uote \\\\ back\"=\"C:\\\\dir\\\\\\\"x\\\" Кириллица\""), "escaping of name and data");
+            True(text.Contains("\"dw\"=dword:deadbeef"), "dword");
+            True(text.Contains("\"exp\"=hex(2):"), "hex(2)");
+            True(text.Contains("\"multi\"=hex(7):61,00,00,00,62,00,00,00,00,00"), "hex(7)");
+            True(text.Contains("\"qw\"=hex(b):08,07,06,05,04,03,02,01"), "hex(b) little endian");
+            True(text.Contains("\"none\"=hex(0):"), "hex(0)");
+            True(text.Contains("\"gone\"=-"), "delete marker");
+            True(text.Contains(",\\\r\n  "), "long hex wrapped like regedit");
+            foreach (string line in text.Split('\n')) True(line.Length <= 82, "line length " + line.Length);
+            List<RegSection> back = RegFile.Parse(text, out err);
+            True(back != null, "parse: " + err);
+            Eq(2, back.Count, "sections");
+            Eq(s.Path, back[0].Path, "path with ] and space");
+            Eq(s.Values.Count, back[0].Values.Count, "values");
+            for (int i = 0; i < s.Values.Count; i++)
+            {
+                RegVal a = s.Values[i], b = back[0].Values[i];
+                Eq(a.Name, b.Name, "name " + i);
+                Eq(a.Delete, b.Delete, "delete " + a.Name);
+                if (a.Delete) continue;
+                Eq(a.Type, b.Type, "type " + a.Name);
+                Eq(Reg.Hex(a.Data), Reg.Hex(b.Data), "bytes " + a.Name);
+            }
+            Eq(0, back[1].Values.Count, "empty key");
+            // UTF-16 file with BOM round trip
+            string file = Path.Combine(Path.GetTempPath(), "rs_reg_" + Id + ".reg"); tempFiles.Add(file);
+            File.WriteAllText(file, text, Encoding.Unicode);
+            byte[] raw = File.ReadAllBytes(file);
+            True(raw[0] == 0xFF && raw[1] == 0xFE, "UTF-16LE BOM");
+            True(RegFile.Parse(File.ReadAllText(file), out err) != null, "parse from file");
+            // rejects
+            True(RegFile.Parse("REGEDIT4\r\n[HKEY_LOCAL_MACHINE\\x]\r\n", out err) == null, "wrong header");
+            True(RegFile.Parse(RegFile.Header + "\r\n\"a\"=\"x\"\r\n", out err) == null, "value outside a key");
+            True(RegFile.Parse(RegFile.Header + "\r\n[-HKEY_LOCAL_MACHINE\\x]\r\n", out err) == null, "key deletion lines are not ours");
+            True(RegFile.Parse(RegFile.Header + "\r\n[HKEY_LOCAL_MACHINE\\x]\r\n\"a\"=hex:zz\r\n", out err) == null, "bad hex");
+            RegVal crlf = new RegVal(); crlf.Name = "a\nb"; crlf.Type = 1; crlf.Data = new byte[2];
+            RegSection bad = new RegSection("HKEY_LOCAL_MACHINE\\x"); bad.Values.Add(crlf);
+            True(RegFile.Format(new List<RegSection> { bad }, out err) == null, "a name with a newline cannot be written: no backup, no delete");
+        }
+
+        // Snapshot (exact copy) of a value / a subtree, written back with SetRaw into another key: identical.
+        static void SnapshotRestore()
+        {
+            using (RegistryKey k = Make("snap\\src"))
+            {
+                k.SetValue("sz", "C:\\x \"q\"");
+                k.SetValue("exp", "%SystemRoot%\\a", RegistryValueKind.ExpandString);
+                k.SetValue("multi", new string[] { "a", "", "b" }, RegistryValueKind.MultiString);
+                k.SetValue("dw", 7, RegistryValueKind.DWord);
+                k.SetValue("qw", 1L << 40, RegistryValueKind.QWord);
+                k.SetValue("bin", new byte[] { 0, 1, 255 }, RegistryValueKind.Binary);
+                k.SetValue("", "default");
+            }
+            using (RegistryKey k = Make("snap\\src\\child\\deep")) k.SetValue("x", "y");
+            string err;
+            List<RegSection> snap = Reg.Snapshot(Root + "\\snap\\src", null, out err);
+            True(snap != null, "snapshot: " + err);
+            Eq(3, snap.Count, "three keys");
+            string text = RegFile.Format(snap, out err);
+            True(text != null, "format: " + err);
+            List<RegSection> back = RegFile.Parse(text, out err);
+            True(back != null, "parse: " + err);
+            foreach (RegSection s in back)
+            {
+                string k = Root + "\\snap\\dst" + s.Path.Substring((Root + "\\snap\\src").Length);
+                True(Reg.CreateKey(k), "CreateKey " + k);
+                foreach (RegVal v in s.Values) True(Reg.SetRaw(k, v.Name, v.Type, v.Data), "SetRaw " + v.Name);
+            }
+            List<string[]> a = Reg.Values(Root + "\\snap\\src"), b = Reg.Values(Root + "\\snap\\dst");
+            Eq(a.Count, b.Count, "value count");
+            foreach (string[] v in a)
+            {
+                string[] w = Find(b, v[0]);
+                True(w != null, "value " + v[0]);
+                Eq(v[1] + "|" + v[2], w[1] + "|" + w[2], "data/type " + v[0]);
+            }
+            Eq("y", Find(Reg.Values(Root + "\\snap\\dst\\child\\deep"), "x")[1], "subtree restored");
+            List<RegSection> one = Reg.Snapshot(Root + "\\snap\\src", "dw", out err);
+            Eq(1, one.Count, "value snapshot: one key");
+            Eq(1, one[0].Values.Count, "value snapshot: one value");
+            Eq("dw", one[0].Values[0].Name, "value snapshot: the value");
+            List<RegSection> miss = Reg.Snapshot(Root + "\\snap\\src", "nothere", out err);
+            True(miss != null && miss[0].Values[0].Delete, "missing value recorded as delete-on-restore");
+            True(Reg.Snapshot(Root + "\\snap\\nokey", null, out err) == null, "missing key: no snapshot");
+            True(Reg.ReadMulti(Root + "\\snap\\src", "multi").Length == 3, "ReadMulti keeps empty items");
+            True(Reg.ReadMulti(Root + "\\snap\\src", "dw") == null, "ReadMulti: not a string");
+        }
+
+        static void ManifestCases()
+        {
+            foreach (string t in new string[] { "", "a\tb", "c:\\x\\", "line\r\nnext", "\\t literal", "nul\0x" })
+                Eq(t, QuarMan.Unesc(QuarMan.Esc(t)), "escape round trip " + t);
+            True(QuarMan.Esc("a\tb\nc").IndexOf('\t') < 0 && QuarMan.Esc("a\nb").IndexOf('\n') < 0, "no raw TAB / LF");
+            ManEntry f = new ManEntry(); f.N = 3; f.Orig = "D:\\Users\\x\\evil\tname.exe"; f.Vol = "1A2B3C4D"; f.Backup = "3_evil_name.exe.quarantine"; f.Attrs = 7; f.Sha = new string('a', 64);
+            string err;
+            ManEntry g = QuarMan.Parse(QuarMan.FileLine(f), out err);
+            True(g != null, "FILE parse: " + err);
+            Eq(f.Orig, g.Orig, "orig with TAB"); Eq(3, g.N, "N"); Eq(7, g.Attrs, "attrs"); Eq("1A2B3C4D", g.Vol, "vol");
+            ManEntry r = new ManEntry(); r.N = 4; r.IsKey = false; r.Install = "1A2B3C4D\\WINDOWS"; r.RootKind = "USER"; r.UserId = "S-1-5-21-1-2-3-1001";
+            r.RegRoot = "HKEY_USERS\\S-1-5-21-1-2-3-1001"; r.Rel = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"; r.ValueName = "x\ty"; r.Backup = "4.reg"; r.Sha = new string('b', 64); r.Note = "Run";
+            ManEntry q = QuarMan.Parse(QuarMan.RegLine(r), out err);
+            True(q != null, "REG parse: " + err);
+            Eq(r.ValueName, q.ValueName, "value name with TAB"); Eq("USER", q.RootKind, "root kind"); True(!q.IsKey, "V");
+            // rejected lines
+            ManEntry b = new ManEntry(); b.N = 1; b.Sha = new string('a', 64); b.Backup = "1.reg";
+            b.Orig = "..\\x"; True(QuarMan.Parse(QuarMan.FileLine(b), out err) == null && err.Length > 0, "relative original path");
+            b.Orig = "C:\\a\\..\\Windows\\x.dll"; True(QuarMan.Parse(QuarMan.FileLine(b), out err) == null, "'..' in the original path");
+            b.Orig = "\\\\server\\share\\x"; True(QuarMan.Parse(QuarMan.FileLine(b), out err) == null, "UNC original path");
+            b.Orig = "C:\\x.exe";
+            foreach (string bn in new string[] { "..\\..\\Windows\\x.reg", "C:\\x.reg", "a/b", "manifest.txt", "MANIFEST.TXT", "", "..", "x." })
+            { b.Backup = bn; True(QuarMan.Parse(QuarMan.FileLine(b), out err) == null, "backup name rejected: " + bn); }
+            b.Backup = "1.reg"; b.Sha = "";
+            True(QuarMan.Parse(QuarMan.FileLine(b), out err) == null, "no SHA-256");
+            r.RootKind = "HKLM"; True(QuarMan.Parse(QuarMan.RegLine(r), out err) == null, "unknown root kind");
+            r.RootKind = "SOFTWARE"; r.IsKey = true; r.Rel = ""; True(QuarMan.Parse(QuarMan.RegLine(r), out err) == null, "a whole hive root is never a key item");
+            r.Rel = "a\\\\b"; True(QuarMan.Parse(QuarMan.RegLine(r), out err) == null, "empty key component");
+            Eq(null, QuarMan.Parse(QuarMan.HeaderLine("20260101_000000", "D:\\Windows (офлайн)", "X"), out err), "header is not an entry");
+            True(QuarMan.IsHeader(QuarMan.HeaderLine("s", "t", "i")), "header recognised");
+            ManEntry lg = QuarMan.Parse("REG\tHKLM\\RS_SOFT\\x\t=>\tC:\\q\\reg_x.reg\tSOFTWARE D:\\Windows", out err);
+            True(lg != null && lg.Type == "LEGACY", "old format = legacy (view only)");
+            Eq(null, QuarMan.Parse("REG-FAIL\tx\ty", out err), "failure lines ignored");
+            // names and places
+            Eq("5_evil.exe.quarantine", QuarMan.QuarFileName(5, "C:\\x\\evil.exe"), "quarantine name");
+            Eq("6_a_b.quarantine", QuarMan.QuarFileName(6, "a:b"), "':' replaced");
+            Eq("7_x.quarantine", QuarMan.QuarFileName(7, "D:\\x. . "), "trailing dots / spaces dropped");
+            True(QuarMan.QuarFileName(8, "manifest.txt") != "manifest.txt", "a quarantined manifest.txt cannot become the manifest");
+            Eq("D:\\RescueScan_Quarantine\\S|E:\\Tools\\RescueScan_Quarantine\\S", string.Join("|", QuarMan.Candidates("D:", "E:\\Tools", "X:", "X:\\Windows\\TEMP", "S").ToArray()), "target drive first");
+            Eq("", string.Join("|", QuarMan.Candidates("X:", "X:\\Tools", "X:", "", "S").ToArray()), "never on the WinPE RAM disk");
+            Eq("D:\\RescueScan_Quarantine\\S", string.Join("|", QuarMan.Candidates("D:", "C:\\Users\\a\\AppData\\Local\\Temp\\z", "", "C:\\Users\\a\\AppData\\Local\\Temp\\", "S").ToArray()), "never under %TEMP%");
+            Eq("C:\\RescueScan_Quarantine\\S", string.Join("|", QuarMan.Candidates("", "C:\\", "X:", "", "S").ToArray()), "no target yet: next to the exe");
+            string d = Path.Combine(Path.GetTempPath(), "rs_q_" + Id); 
+            True(QuarMan.Inside(d, "1.reg"), "inside");
+            True(!QuarMan.Inside(d, "..\\1.reg") && !QuarMan.Inside(d, "../1.reg"), "outside");
+        }
+
+        static void LocateResolve()
         {
             List<string[]> users = new List<string[]> {
-                new string[] { "Ivan", "HKLM\\RS_U0", "D:\\Users\\Ivan" },
-                new string[] { "Petr", "", "D:\\Users\\Petr" },
-                new string[] { "Live", "HKU\\S-1-5-21-1-2-3-1001", "C:\\Users\\Live" } };
-            Eq("SOFTWARE D:\\Windows", MainForm.HiveTag("HKLM\\RS_SOFT\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "SOFTWARE");
-            Eq("SOFTWARE D:\\Windows", MainForm.HiveTag("hklm\\rs_soft", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "the root itself, any case");
-            Eq("SYSTEM D:\\Windows", MainForm.HiveTag("HKLM\\RS_SYS\\ControlSet001\\Services\\evil", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "SYSTEM");
-            Eq("профиль D:\\Users\\Ivan", MainForm.HiveTag("HKLM\\RS_U0\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "user hive");
-            Eq("", MainForm.HiveTag("HKLM\\RS_U1\\Software", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "a mount name not in use now");
-            Eq("", MainForm.HiveTag("HKLM\\RS_SOFTX\\a", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "prefix of another name");
-            Eq("", MainForm.HiveTag("HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users),
-               "a LIVE backup while the target is offline (WinPE's own SOFTWARE): refused");
-            Eq("", MainForm.HiveTag("HKLM\\RS_SOFT\\x", "", "HKLM\\RS_SYS", "D:\\Windows", users), "SOFTWARE not mounted");
-            Eq("SOFTWARE C:\\Windows", MainForm.HiveTag("HKLM\\SOFTWARE\\Microsoft", "HKLM\\SOFTWARE", "HKLM\\SYSTEM", "C:\\Windows", users), "live SOFTWARE");
-            Eq("профиль C:\\Users\\Live", MainForm.HiveTag("HKU\\S-1-5-21-1-2-3-1001\\Software\\x", "HKLM\\SOFTWARE", "HKLM\\SYSTEM", "C:\\Windows", users), "live logged-on user");
-            Eq("", MainForm.HiveTag("", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "empty key");
+                new string[] { "Ivan", "HKLM\\RS_U0", "D:\\Users\\Ivan", "S-1-5-21-1-2-3-1001" },
+                new string[] { "Petr", "HKLM\\RS_U1", "D:\\Users\\Petr", "" },
+                new string[] { "Gone", "", "D:\\Users\\Gone", "S-1-5-21-1-2-3-1003" } };
+            string kind, uid, rel, rr, phys;
+            True(MainForm.Locate("HKLM\\RS_SOFT\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", users, out kind, out uid, out rel, out rr, out phys), "SOFTWARE");
+            Eq("SOFTWARE|Microsoft\\Windows\\CurrentVersion\\Run|HKEY_LOCAL_MACHINE\\SOFTWARE|HKLM\\RS_SOFT", kind + "|" + rel + "|" + rr + "|" + phys, "SOFTWARE parts");
+            True(MainForm.Locate("hklm\\rs_sys\\ControlSet001\\Services\\evil", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", users, out kind, out uid, out rel, out rr, out phys), "SYSTEM any case");
+            Eq("SYSTEM|ControlSet001\\Services\\evil|HKEY_LOCAL_MACHINE\\SYSTEM", kind + "|" + rel + "|" + rr, "SYSTEM parts");
+            True(MainForm.Locate("HKLM\\RS_U0\\Software\\x", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", users, out kind, out uid, out rel, out rr, out phys), "user with SID");
+            Eq("USER|S-1-5-21-1-2-3-1001|HKEY_USERS\\S-1-5-21-1-2-3-1001|Software\\x", kind + "|" + uid + "|" + rr + "|" + rel, "user parts");
+            True(MainForm.Locate("HKLM\\RS_U1\\Software\\x", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", users, out kind, out uid, out rel, out rr, out phys), "user without SID");
+            Eq("dir:\\Users\\Petr|HKEY_LOCAL_MACHINE\\RS_U1", uid + "|" + rr, "user without SID: profile folder");
+            True(!MainForm.Locate("HKLM\\SOFTWARE\\x", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", users, out kind, out uid, out rel, out rr, out phys), "WinPE's own SOFTWARE is not the target");
+            True(!MainForm.Locate("HKLM\\RS_SOFTX\\a", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", users, out kind, out uid, out rel, out rr, out phys), "prefix of another name");
+            True(!MainForm.Locate("HKLM\\RS_SOFT\\x", "", "HKLM\\RS_SYS", users, out kind, out uid, out rel, out rr, out phys), "SOFTWARE not mounted");
+            // restore in a LATER session: other mount names, or live
+            ManEntry e = new ManEntry(); e.RootKind = "USER"; e.UserId = "S-1-5-21-1-2-3-1001";
+            List<string[]> live = new List<string[]> { new string[] { "Ivan", "HKU\\S-1-5-21-1-2-3-1001", "C:\\Users\\Ivan", "S-1-5-21-1-2-3-1001" } };
+            Eq("HKU\\S-1-5-21-1-2-3-1001", MainForm.Resolve(e, "HKLM\\SOFTWARE", "HKLM\\SYSTEM", live), "user hive found by SID");
+            e.UserId = "dir:\\Users\\Petr";
+            List<string[]> later = new List<string[]> { new string[] { "Petr", "HKLM\\RS_U0", "E:\\Users\\Petr", "" } };
+            Eq("HKLM\\RS_U0", MainForm.Resolve(e, "HKLM\\RS_SOFT", "HKLM\\RS_SYS", later), "by profile folder, other letter and mount name");
+            e.UserId = "S-1-5-21-1-2-3-1003";
+            Eq("", MainForm.Resolve(e, "HKLM\\RS_SOFT", "HKLM\\RS_SYS", users), "profile not mounted: refused");
+            e.RootKind = "SYSTEM";
+            Eq("HKLM\\SYSTEM", MainForm.Resolve(e, "HKLM\\SOFTWARE", "HKLM\\SYSTEM", live), "SYSTEM live");
+            Eq("", MainForm.Resolve(e, "HKLM\\RS_SOFT", "", users), "SYSTEM not mounted");
+            Eq("1A2B3C4D\\WINDOWS", MainForm.InstallId("D:\\Windows", "1A2B3C4D"), "install id: serial + folder, not the letter");
+            Eq(MainForm.InstallId("D:\\Windows", "1A2B3C4D"), MainForm.InstallId("C:\\WINDOWS", "1A2B3C4D"), "same installation seen as D: in WinPE and C: live");
+            Eq("D:\\WINDOWS", MainForm.InstallId("D:\\Windows", ""), "no serial: path");
+        }
+
+        static void ProtectedPaths()
+        {
+            foreach (string p in new string[] { "C:\\", "D:", "D:\\Windows", "E:\\windows\\system32", "C:\\Program Files", "C:\\Program Files (x86)\\",
+                "C:\\ProgramData", "C:\\Users", "C:\\System Volume Information", "\\\\?\\C:\\Windows", "F:\\WINNT", "F:\\WINNT\\System32\\drivers", "\\\\srv\\share" })
+                True(MainForm.ProtectedPath(p, "F:\\WINNT").Length > 0, "protected: " + p);
+            foreach (string p in new string[] { "C:\\Users\\Ivan\\AppData\\evil", "C:\\ProgramData\\evil", "D:\\Windows\\System32\\drivers\\evil.sys", "C:\\x.", "C:\\Program Files\\Evil" })
+                Eq("", MainForm.ProtectedPath(p, "F:\\WINNT"), "deletable: " + p);
+        }
+
+        static void ProfilePaths()
+        {
+            List<string> others = new List<string> { "C:\\Users\\Petr" };
+            string why;
+            Eq("C:\\Users\\Ivan", MainForm.ProfileDeletePath("C:\\Users\\Ivan", "%SystemDrive%\\Users", "C:\\Windows", "C:\\Users\\Admin", others, out why), "normal profile");
+            Eq("C:\\Users\\Ivan", MainForm.ProfileDeletePath("%SystemDrive%\\Users\\Ivan", "", "C:\\Windows", "", others, out why), "env var + default ProfilesDirectory");
+            foreach (string bad in new string[] { "C:\\", "C:\\Users", "C:\\Windows", "C:\\Windows\\System32", "C:\\Program Files", "C:\\Users\\Ivan\\..\\..\\Windows",
+                "C:\\Users\\Public", "C:\\Users\\Default", "C:\\Users\\Admin", "C:\\Users\\Petr", "%USERPROFILE%", "%SystemDrive%\\Users\\%USERNAME%", "\\\\srv\\x\\Ivan", "Users\\Ivan", "D:\\Users\\Ivan", "C:\\Users\\Ivan\\Docs" })
+            {
+                Eq("", MainForm.ProfileDeletePath(bad, "%SystemDrive%\\Users", "C:\\Windows", "C:\\Users\\Admin", others, out why), "refused: " + bad);
+                True(why.Length > 0, "reason for " + bad);
+            }
+            Eq("", MainForm.ProfileDeletePath("C:\\Program Files", "C:\\", "C:\\Windows", "", others, out why), "ProfilesDirectory = drive root (malware)");
+            Eq("", MainForm.ProfileDeletePath("C:\\Windows\\System32", "C:\\Windows", "C:\\Windows", "", others, out why), "ProfilesDirectory = Windows (malware)");
+        }
+
+        static void BcdParse()
+        {
+            string txt = "Windows Boot Manager\r\n--------------------\r\nidentifier              {bootmgr}\r\ndevice                  partition=\\Device\\HarddiskVolume1\r\npath                    \\EFI\\Microsoft\\Boot\\bootmgfw.efi\r\ndescription             Windows Boot Manager\r\n\r\n" +
+                "Windows Boot Loader\r\n-------------------\r\nidentifier              {current}\r\npath                    \\Windows\\system32\\winload.efi\r\ndescription             Windows 10\r\n\r\n" +
+                "Firmware Application (101fffff)\r\n-------------------------------\r\nidentifier              {abc}\r\npath                    \\EFI\\evil\\x.efi\r\ndescription             Evil\r\n\r\n" +
+                "Resume from Hibernate\r\nidentifier {r}\r\ndescription Resume\r\n";
+            List<string[]> e = MainForm.BcdEntries(txt);
+            Eq(3, e.Count, "entries with a path");
+            Eq("Windows Boot Manager|\\EFI\\Microsoft\\Boot\\bootmgfw.efi", e[0][0] + "|" + e[0][1], "description after path belongs to the same entry (R061)");
+            Eq("Windows 10", e[1][0], "second entry");
+            Eq("Evil", e[2][0], "third entry");
+            True(MainForm.BcdPathOk(e[1][1]) && !MainForm.BcdPathOk(e[2][1]), "path check");
+            Eq(0, MainForm.BcdEntries(null).Count, "null");
+        }
+
+        static void FsOpsCases()
+        {
+            string d = Path.Combine(Path.GetTempPath(), "rs_fs_" + Id);
+            tempDirs.Add(d);
+            string sep = Path.DirectorySeparatorChar.ToString();
+            Directory.CreateDirectory(d + sep + "a" + sep + "b");
+            string ro = d + sep + "a" + sep + "ro.txt";
+            File.WriteAllText(ro, "x");
+            File.SetAttributes(ro, FileAttributes.ReadOnly);
+            string err;
+            True(FsOps.DeleteFile(ro, out err), "read-only file deleted (attrib +r): " + err);
+            True(!File.Exists(ro), "gone");
+            File.WriteAllText(d + sep + "a" + sep + "b" + sep + "f", "x");
+            string m1 = d + sep + "m1", m2 = d + sep + "m2";
+            File.WriteAllText(m1, "y");
+            True(FsOps.MoveFile(m1, m2, out err) && !File.Exists(m1) && File.Exists(m2), "move");
+            File.WriteAllText(m1, "z");
+            True(!FsOps.MoveFile(m1, m2, out err), "move never overwrites");
+            int failed = 0; err = "";
+            True(FsOps.DeleteTree(d + sep + "a", ref failed, ref err), "tree: " + err);
+            True(!Directory.Exists(d + sep + "a"), "tree gone");
+            True(FsOps.List(d).Contains("m2"), "List");
+            Eq(-1, FsOps.Attrs(d + sep + "nothing"), "missing");
+        }
+
+        static void RestrictionList()
+        {
+            List<string[]> u = MainForm.RestrictionItems("HKLM\\RS_U0", false);
+            True(u.Exists(delegate(string[] x) { return x[0] == "HKLM\\RS_U0\\Software\\Policies\\Microsoft\\Windows\\System" && x[1] == "DisableCMD"; }), "DisableCMD in its real key (R108/Q6)");
+            True(u.Exists(delegate(string[] x) { return x[0] == "HKLM\\RS_U0\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\DisallowRun" && x[1] == null; }), "DisallowRun list subkey");
+            foreach (string v in new string[] { "NoWinKeys", "NoLogoff", "DisableLockWorkstation", "NoDrives", "NoViewOnDrive", "NoTrayContextMenu", "DisallowRun" })
+                True(u.Exists(delegate(string[] x) { return x[1] == v; }), v);
+            True(!u.Exists(delegate(string[] x) { return x[1] == "EnableLUA" || x[1] == "ConsentPromptBehaviorAdmin"; }), "UAC values never touched");
+            List<string[]> m = MainForm.RestrictionItems("HKLM\\RS_SOFT", true);
+            True(m.Exists(delegate(string[] x) { return x[0] == "HKLM\\RS_SOFT\\Microsoft\\Windows\\CurrentVersion\\Policies\\System" && x[1] == "DisableTaskMgr"; }), "machine path");
+            True(m.Exists(delegate(string[] x) { return x[0] == "HKLM\\RS_SOFT\\Policies\\Microsoft\\Windows\\System"; }), "machine DisableCMD");
         }
 
         static string JoinT(List<WinTarget> l)
