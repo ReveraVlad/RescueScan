@@ -3506,7 +3506,9 @@ namespace RescueScan
         static HashSet<string> ExecKeys(List<string[]> acts)
         {
             HashSet<string> h = new HashSet<string>();
-            foreach (string[] a in acts) if (a[0] == "exec") h.Add(Heur.CmdKey(a[1], a[2])); else h.Add("com " + a[1].ToLowerInvariant());
+            // exec actions only: the COM-handler layout of the Actions blob is not verified, a misread CLSID must not
+            // turn every COM task into a "mismatch"
+            foreach (string[] a in acts) if (a[0] == "exec") h.Add(Heur.CmdKey(a[1], a[2]));
             return h;
         }
 
