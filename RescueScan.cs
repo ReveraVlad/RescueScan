@@ -524,6 +524,15 @@ namespace RescueScan
         }
     }
 
+    // One Windows installation offered as scan target. Live = it is the running OS (its registry is read in place).
+    class WinTarget
+    {
+        public readonly string WinDir;   // e.g. D:\Windows
+        public readonly bool Live;
+        public WinTarget(string winDir, bool live) { WinDir = winDir; Live = live; }
+        public override string ToString() { return WinDir + (Live ? " (живая — эта ОС)" : " (офлайн)"); }
+    }
+
     class MainForm : Form
     {
         ComboBox cboWin;
@@ -895,13 +904,103 @@ namespace RescueScan
         void Detect()
         {
             cboWin.Items.Clear();
+            string runWin = RunningWinDir();
+            // in WinPE/WinRE (...\Control\MiniNT exists) the running X:\Windows is the rescue system itself: never a target
+            bool inPE = Reg.KeyExists("HKLM\\SYSTEM\\CurrentControlSet\\Control\\MiniNT");
             for (char c = 'C'; c <= 'Z'; c++)
             {
-                string sys = c + ":\\Windows\\System32\\config\\SYSTEM";
-                if (File.Exists(sys)) cboWin.Items.Add(c + ":\\Windows");
+                string wd = c + ":\\Windows";
+                if (!File.Exists(wd + "\\System32\\config\\SYSTEM")) continue;
+                bool live = SamePath(wd, runWin);
+                if (live && inPE) continue;
+                cboWin.Items.Add(new WinTarget(wd, live));
             }
             if (cboWin.Items.Count > 0) { cboWin.SelectedIndex = 0; lblStatus.Text = "Найдено установок: " + cboWin.Items.Count; }
             else lblStatus.Text = "Windows не найдена на подключённых дисках.";
+        }
+
+        // Windows dir of the running OS (from GetSystemDirectory, not from environment variables a virus could set).
+        internal static string RunningWinDir()
+        {
+            try
+            {
+                string s = Environment.SystemDirectory;
+                return string.IsNullOrEmpty(s) ? "" : Path.GetDirectoryName(s.TrimEnd('\\'));
+            }
+            catch { return ""; }
+        }
+
+        internal static bool SamePath(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            return string.Equals(NormDir(a), NormDir(b), StringComparison.OrdinalIgnoreCase);
+        }
+
+        static string NormDir(string d)
+        {
+            try { return Path.GetFullPath(d).TrimEnd('\\'); } catch { return d.TrimEnd('\\'); }
+        }
+
+        static string ReplaceCI(string s, string old, string rep)
+        {
+            int i = s.IndexOf(old, StringComparison.OrdinalIgnoreCase);
+            while (i >= 0)
+            {
+                s = s.Substring(0, i) + rep + s.Substring(i + old.Length);
+                i = s.IndexOf(old, i + rep.Length, StringComparison.OrdinalIgnoreCase);
+            }
+            return s;
+        }
+
+        // ProfileImagePath from the TARGET's ProfileList -> candidate profile folders on the target's disk, best first.
+        // %SystemDrive%/%SystemRoot%/%windir% are expanded to the target, never to the running WinPE. Offline, drive
+        // letters differ from the ones the installation used, so another letter is tried on the target's drive first.
+        internal static List<string> ProfileDirCandidates(string pip, string winDir, bool live)
+        {
+            List<string> res = new List<string>();
+            if (string.IsNullOrEmpty(pip) || string.IsNullOrEmpty(winDir) || winDir.Length < 3) return res;
+            string drive = winDir.Substring(0, 2);
+            string p = ReplaceCI(ReplaceCI(ReplaceCI(pip.Trim(), "%SystemDrive%", drive), "%SystemRoot%", winDir), "%windir%", winDir).TrimEnd('\\');
+            if (p.Length < 3 || p[1] != ':' || p[2] != '\\' || p.IndexOf('%') >= 0) return res;   // UNC, relative, unknown %var%
+            if (!live && char.ToUpperInvariant(p[0]) != char.ToUpperInvariant(drive[0])) res.Add(drive + p.Substring(2));
+            res.Add(p);
+            return res;
+        }
+
+        // Profiles of the target: ProfileList (user SIDs -> ProfileImagePath) plus <drive>\Users\*, without duplicates.
+        // {name, profile dir, SID or ""}
+        List<string[]> DiscoverProfiles()
+        {
+            List<string[]> res = new List<string[]>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (tgtSoft.Length > 0)
+                foreach (string sk in Reg.Subkeys(tgtSoft + "\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList"))
+                {
+                    string sid = Last(sk);   // user accounts (local/domain, Azure AD) - not SYSTEM/LocalService/NetworkService
+                    if (!sid.StartsWith("S-1-5-21-", StringComparison.OrdinalIgnoreCase) && !sid.StartsWith("S-1-12-1-", StringComparison.OrdinalIgnoreCase)) continue;
+                    string pip = "";
+                    foreach (string[] v in Reg.Values(sk))
+                        if (v[0].Equals("ProfileImagePath", StringComparison.OrdinalIgnoreCase)) pip = v[1];
+                    foreach (string dir in ProfileDirCandidates(pip, tgtWinDir, tgtLive))
+                    {
+                        if (!Directory.Exists(dir)) continue;
+                        if (seen.Add(NormDir(dir))) res.Add(new string[] { Last(dir), dir, sid });
+                        break;
+                    }
+                }
+            string usersDir = curDrive + "\\Users";
+            try
+            {
+                if (Directory.Exists(usersDir))
+                    foreach (string ud in Directory.GetDirectories(usersDir))
+                    {
+                        string name = Path.GetFileName(ud);
+                        if (name.Equals("Default", StringComparison.OrdinalIgnoreCase) || name.Equals("Public", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (seen.Add(NormDir(ud))) res.Add(new string[] { name, ud, "" });
+                    }
+            }
+            catch { }
+            return res;
         }
 
         // Unloads every hive WE mounted; the target is no longer prepared afterwards. Returns "" or a Russian description
@@ -946,43 +1045,42 @@ namespace RescueScan
             return 0;
         }
 
-        // Prepares the target used by the scan AND by all repair actions: unloads old mounts, then mounts SOFTWARE,
-        // SYSTEM and the user hives of the selected Windows. Returns warnings for the status line ("" = all fine).
-        string PrepareTarget(string winDir, bool live)
+        // Prepares the target used by the scan AND by all repair actions: unloads old mounts; OFFLINE mounts SOFTWARE,
+        // SYSTEM and the user hives of the selected Windows; LIVE (the running OS, whose hive files are in use) reads
+        // HKLM\SOFTWARE, HKLM\SYSTEM and HKU\<SID> of logged-on users in place and mounts only the other users' hives.
+        // Returns warnings for the status line ("" = all fine).
+        string PrepareTarget(WinTarget t)
         {
             StringBuilder warn = new StringBuilder();
             string uf = UnloadAll();
             if (uf.Length > 0) warn.Append(uf + ". ");
-            tgtWinDir = winDir; tgtLive = live;
-            curDrive = winDir.Substring(0, 2);   // D:
-            string cfg = winDir + "\\System32\\config";
-            if (MountHive("RS_SOFT", cfg + "\\SOFTWARE", warn) == 0) tgtSoft = "HKLM\\RS_SOFT";
-            else warn.Append("SOFTWARE не смонтирован. ");
-            if (MountHive("RS_SYS", cfg + "\\SYSTEM", warn) == 0) tgtSys = "HKLM\\RS_SYS";
-            else warn.Append("SYSTEM не смонтирован. ");
-            int ui = 0, failed = 0;
-            string usersDir = curDrive + "\\Users";
-            try
+            tgtWinDir = t.WinDir; tgtLive = t.Live;
+            curDrive = t.WinDir.Substring(0, 2);   // D:
+            if (tgtLive) { tgtSoft = "HKLM\\SOFTWARE"; tgtSys = "HKLM\\SYSTEM"; }
+            else
             {
-                if (Directory.Exists(usersDir))
-                    foreach (string ud in Directory.GetDirectories(usersDir))
-                    {
-                        string name = Path.GetFileName(ud), nt = ud + "\\NTUSER.DAT";
-                        if (!File.Exists(nt)) continue;
-                        if (name.Equals("Default", StringComparison.OrdinalIgnoreCase) || name.Equals("Public", StringComparison.OrdinalIgnoreCase)) continue;
-                        string root = "";
-                        while (ui < 100)
-                        {
-                            string mp = "RS_U" + ui;
-                            int r = MountHive(mp, nt, warn);
-                            if (r == 2) { ui++; continue; }   // name held by a stale mount: use the next one
-                            if (r == 0) { root = "HKLM\\" + mp; ui++; } else failed++;
-                            break;
-                        }
-                        tgtUsers.Add(new string[] { name, root, ud });
-                    }
+                string cfg = t.WinDir + "\\System32\\config";
+                if (MountHive("RS_SOFT", cfg + "\\SOFTWARE", warn) == 0) tgtSoft = "HKLM\\RS_SOFT";
+                else warn.Append("SOFTWARE не смонтирован. ");
+                if (MountHive("RS_SYS", cfg + "\\SYSTEM", warn) == 0) tgtSys = "HKLM\\RS_SYS";
+                else warn.Append("SYSTEM не смонтирован. ");
             }
-            catch (Exception ex) { warn.Append("профили: " + ex.Message + " "); }
+            int ui = 0, failed = 0;
+            foreach (string[] p in DiscoverProfiles())
+            {
+                string root = "", nt = p[1] + "\\NTUSER.DAT";
+                if (tgtLive && p[2].Length > 0 && Reg.KeyExists("HKU\\" + p[2])) root = "HKU\\" + p[2];   // logged on: already loaded
+                else if (File.Exists(nt))
+                    while (ui < 100)
+                    {
+                        string mp = "RS_U" + ui;
+                        int r = MountHive(mp, nt, warn);
+                        if (r == 2) { ui++; continue; }   // name held by a stale mount: use the next one
+                        if (r == 0) { root = "HKLM\\" + mp; ui++; } else failed++;
+                        break;
+                    }
+                tgtUsers.Add(new string[] { p[0], root, p[1] });
+            }
             if (failed > 0) warn.Append("не смонтировано профилей: " + failed + ". ");
             tgtReady = true;
             return warn.ToString().Trim();
@@ -1180,12 +1278,13 @@ namespace RescueScan
         // ---- Scan ----
         void Scan()
         {
-            if (cboWin.SelectedItem == null) { MessageBox.Show("Сначала выбери установку Windows."); return; }
+            WinTarget t = cboWin.SelectedItem as WinTarget;
+            if (t == null) { MessageBox.Show("Сначала выбери установку Windows."); return; }
             Cursor.Current = Cursors.WaitCursor;
             lv.Items.Clear();
-            string winDir = cboWin.SelectedItem.ToString();       // e.g. D:\Windows
-            // (re)mount the hives of THIS installation; all repair actions then use this same target
-            string warn = PrepareTarget(winDir, false);
+            string winDir = t.WinDir;                             // e.g. D:\Windows
+            // (re)mount the hives of THIS installation (live: read in place); all repair actions then use this target
+            string warn = PrepareTarget(t);
 
             List<Finding> f = new List<Finding>();
             string SOFT = tgtSoft;                                // "" = hive not mounted: nothing is read from it
@@ -1294,6 +1393,9 @@ namespace RescueScan
             if (Directory.Exists(usersDir))
                 foreach (string ud in Directory.GetDirectories(usersDir))
                     AddStartup(f, ud + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup", "Startup [" + Path.GetFileName(ud) + "]");
+            foreach (string[] tu in tgtUsers)   // profiles from ProfileList that live outside <drive>\Users
+                if (!SamePath(Path.GetDirectoryName(tu[2]), usersDir))
+                    AddStartup(f, tu[2] + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup", "Startup [" + tu[0] + "]");
 
             // ---- Drivers folder (нестандартные файлы) ----
             ScanDrivers(f, winDir);
@@ -1901,8 +2003,9 @@ namespace RescueScan
         bool EnsureTarget()
         {
             if (tgtReady) return true;
-            if (cboWin.SelectedItem == null) return false;
-            string w = PrepareTarget(cboWin.SelectedItem.ToString(), false);
+            WinTarget t = cboWin.SelectedItem as WinTarget;
+            if (t == null) return false;
+            string w = PrepareTarget(t);
             lblStatus.Text = "Цель: " + TargetName() + (w.Length > 0 ? "   ВНИМАНИЕ: " + w : "");
             return tgtReady;
         }
@@ -1988,12 +2091,18 @@ namespace RescueScan
             if (chkGuard.Checked)
             {
                 if (guarding) return;
+                if (!EnsureTarget() || !tgtLive)   // the guard writes the RUNNING OS's HKLM: only when that is the target
+                {
+                    MessageBox.Show("«Стеречь Winlogon» работает только когда цель — ЖИВАЯ система (та, где запущена программа).\r\nСейчас цель: " + TargetName(), "Страж");
+                    chkGuard.Checked = false;
+                    return;
+                }
                 guarding = true;
                 guardThread = new Thread(GuardLoop); guardThread.IsBackground = true; guardThread.Start();
                 Watchdog.Log("guard: слежение за Winlogon (live) включено");
                 lblStatus.Text = "Guard включён — Winlogon Shell/Userinit возвращаются к дефолту при подмене. Лог: " + Watchdog.LogPath;
             }
-            else { guarding = false; Watchdog.Log("guard: слежение выключено"); }
+            else if (guarding) { guarding = false; Watchdog.Log("guard: слежение выключено"); }
         }
 
         void GuardLoop()
