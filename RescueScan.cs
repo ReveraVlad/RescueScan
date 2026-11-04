@@ -9,6 +9,7 @@ using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -31,6 +32,8 @@ namespace RescueScan
         // SafeBoot AlternateShell): «Удалить», «Карантин», «Обезвредить» and the Easy button write this back instead.
         public object ResetData;  // string or string[]
         public RegistryValueKind ResetType = RegistryValueKind.String;
+        // registry keys removed (each backed up first) together with this finding: the TaskCache keys of a task
+        public List<string> AlsoKeys;
     }
 
     static class Reg
@@ -1675,6 +1678,164 @@ namespace RescueScan
             if (http && (ps || wsh || cmd)) return "SUSPECT";
             return review ? "REVIEW" : "";
         }
+
+        // ---- scheduled tasks ----
+        // "SUSPECT" > "REVIEW" > ""
+        internal static string Max(string a, string b)
+        {
+            if (a == "SUSPECT" || b == "SUSPECT") return "SUSPECT";
+            if (a == "REVIEW" || b == "REVIEW") return "REVIEW";
+            return "";
+        }
+
+        const RegexOptions RxOpt = RegexOptions.Singleline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
+        static readonly Regex XmlComment = new Regex("<!--.*?-->", RegexOptions.Singleline);
+        static readonly Regex ExecRx = new Regex(@"<(?:[\w.-]+:)?Exec(?:\s[^>]*)?>(.*?)</(?:[\w.-]+:)?Exec\s*>", RxOpt);
+        static readonly Regex ComRx = new Regex(@"<(?:[\w.-]+:)?ComHandler(?:\s[^>]*)?>(.*?)</(?:[\w.-]+:)?ComHandler\s*>", RxOpt);
+
+        static string Inner(string body, string tag)
+        {
+            Match m = Regex.Match(body, @"<(?:[\w.-]+:)?" + tag + @"(?:\s[^>]*)?>(.*?)</(?:[\w.-]+:)?" + tag + @"\s*>", RxOpt);
+            return m.Success ? XmlText(m.Groups[1].Value).Trim() : "";
+        }
+
+        // XML character data -> text: CDATA sections kept verbatim, entities (&lt; &amp; &#101; &#x65; ...) decoded.
+        internal static string XmlText(string s)
+        {
+            StringBuilder sb = new StringBuilder();
+            int i = 0;
+            while (i < s.Length)
+            {
+                if (string.CompareOrdinal(s, i, "<![CDATA[", 0, 9) == 0)
+                {
+                    int e = s.IndexOf("]]>", i + 9, StringComparison.Ordinal);
+                    if (e < 0) e = s.Length;
+                    sb.Append(s, i + 9, e - i - 9);
+                    i = Math.Min(s.Length, e + 3);
+                    continue;
+                }
+                char c = s[i];
+                if (c == '&')
+                {
+                    int semi = s.IndexOf(';', i);
+                    if (semi > i && semi - i <= 10)
+                    {
+                        string ent = s.Substring(i + 1, semi - i - 1);
+                        string rep = null;
+                        if (ent == "lt") rep = "<"; else if (ent == "gt") rep = ">"; else if (ent == "amp") rep = "&";
+                        else if (ent == "quot") rep = "\""; else if (ent == "apos") rep = "'";
+                        else if (ent.StartsWith("#"))
+                        {
+                            int code;
+                            bool ok = ent.StartsWith("#x") || ent.StartsWith("#X")
+                                ? int.TryParse(ent.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out code)
+                                : int.TryParse(ent.Substring(1), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out code);
+                            if (ok && code > 0 && code <= 0x10FFFF) { try { rep = char.ConvertFromUtf32(code); } catch { rep = null; } }
+                        }
+                        if (rep != null) { sb.Append(rep); i = semi + 1; continue; }
+                    }
+                }
+                sb.Append(c); i++;
+            }
+            return sb.ToString();
+        }
+
+        // Every action of a task XML (comments removed, any namespace prefix, entities decoded):
+        // {"exec", command, arguments} or {"com", ClassId, Data}. Never the whole XML: its xmlns is an http URL.
+        internal static List<string[]> TaskXmlActions(string xml)
+        {
+            List<string[]> res = new List<string[]>();
+            if (string.IsNullOrEmpty(xml)) return res;
+            string x = XmlComment.Replace(xml, "");
+            foreach (Match m in ExecRx.Matches(x))
+                res.Add(new string[] { "exec", Inner(m.Groups[1].Value, "Command"), Inner(m.Groups[1].Value, "Arguments") });
+            foreach (Match m in ComRx.Matches(x))
+                res.Add(new string[] { "com", Inner(m.Groups[1].Value, "ClassId"), Inner(m.Groups[1].Value, "Data") });
+            return res;
+        }
+
+        // TaskCache\Tasks\{Id}\Actions (Win8+ REG_BINARY; layout from GhostTask, research coverage-gaps Q2):
+        // u16 version, u32 len + UTF-16 author, then per action u16 magic, u32 len + id, and for 0x6666 (exec)
+        // u32 len + command, u32 len + arguments, u32 len + working dir (+ u16 flags); 0x7777 (COM) 16-byte CLSID +
+        // u32 len + data. Lengths in bytes. null = not this layout (the caller falls back to PrintableStrings).
+        internal static List<string[]> TaskCacheActions(byte[] b)
+        {
+            if (b == null || b.Length < 6) return null;
+            List<string[]> res = new List<string[]>();
+            int pos = 2;
+            string tmp;
+            if (!LenStr(b, ref pos, out tmp)) return null;   // author
+            while (pos + 2 <= b.Length)
+            {
+                int magic = BitConverter.ToUInt16(b, pos); pos += 2;
+                string id;
+                if (!LenStr(b, ref pos, out id)) return null;
+                if (magic == 0x6666)
+                {
+                    string cmd, args, wd;
+                    if (!LenStr(b, ref pos, out cmd) || !LenStr(b, ref pos, out args) || !LenStr(b, ref pos, out wd)) return null;
+                    res.Add(new string[] { "exec", cmd, args });
+                    if (pos + 2 <= b.Length && !KnownMagic(BitConverter.ToUInt16(b, pos))) pos += 2;   // flags
+                }
+                else if (magic == 0x7777)
+                {
+                    if (pos + 16 > b.Length) return null;
+                    string clsid = new Guid(SubArray(b, pos, 16)).ToString("B"); pos += 16;
+                    string data;
+                    if (!LenStr(b, ref pos, out data)) return null;
+                    res.Add(new string[] { "com", clsid, data });
+                }
+                else return null;   // e-mail / message box / unknown: layout not verified
+            }
+            return res;
+        }
+
+        static bool KnownMagic(int m) { return m == 0x6666 || m == 0x7777 || m == 0x8888 || m == 0x9999; }
+
+        static byte[] SubArray(byte[] b, int at, int n) { byte[] r = new byte[n]; Array.Copy(b, at, r, 0, n); return r; }
+
+        static bool LenStr(byte[] b, ref int pos, out string s)
+        {
+            s = null;
+            if (pos + 4 > b.Length) return false;
+            uint n = BitConverter.ToUInt32(b, pos);
+            if (n % 2 != 0 || n > (uint)(b.Length - pos - 4)) return false;
+            s = Encoding.Unicode.GetString(b, pos + 4, (int)n);
+            pos += 4 + (int)n;
+            return true;
+        }
+
+        // Runs of at least 'min' printable UTF-16LE characters (fallback display of an unparsed blob).
+        internal static List<string> PrintableStrings(byte[] b, int min)
+        {
+            List<string> res = new List<string>();
+            if (b == null) return res;
+            for (int start = 0; start < 2; start++)   // both alignments
+            {
+                StringBuilder cur = new StringBuilder();
+                for (int i = start; i + 1 < b.Length; i += 2)
+                {
+                    char c = (char)(b[i] | (b[i + 1] << 8));
+                    bool ok = c >= 0x20 && c != 0x7F && c < 0xD800 && !(c >= 0x80 && c < 0xA0);
+                    if (ok) { cur.Append(c); continue; }
+                    if (cur.Length >= min) res.Add(cur.ToString());
+                    cur.Length = 0;
+                }
+                if (cur.Length >= min) res.Add(cur.ToString());
+                if (res.Count > 0) break;
+            }
+            return res;
+        }
+
+        static readonly Regex GuidRx = new Regex(@"^\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}$", RegexOptions.CultureInvariant);
+        internal static bool IsGuid(string s) { return s != null && GuidRx.IsMatch(s); }
+
+        // the same command, ignoring case, quotes, whitespace runs and env-variable spellings
+        internal static string CmdKey(string cmd, string args)
+        {
+            string s = NormPath(((cmd ?? "") + " " + (args ?? "")).Replace("\"", ""));
+            return Regex.Replace(s, @"\s+", " ").Trim();
+        }
     }
 
     // One line of a quarantine manifest (format 2). FILE: a moved file. REG: a registry value (V) or key (K) backed
@@ -2901,6 +3062,11 @@ namespace RescueScan
             string SOFT = tgtSoft;                                // "" = hive not mounted: nothing is read from it
             string SYS = tgtSys;
 
+            bool cutWalk;
+            List<string> cut = new List<string>();   // registry walks that hit a bound: told to the user
+            string ccs = "ControlSet001";
+            try   // a module that throws (a hostile folder / key) must not discard everything found so far
+            {
             // ---- HKLM Run family ----
             AddValues(f, "Run (HKLM)", SOFT + "\\Microsoft\\Windows\\CurrentVersion\\Run");
             AddValues(f, "RunOnce (HKLM)", SOFT + "\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
@@ -2925,21 +3091,16 @@ namespace RescueScan
                         Add(f, "cmd AutoRun", v[0], v[1], cp, "SUSPECT", 0, cp, v[0], null);
 
             // ---- IFEO debugger hijacks ----
-            bool cutWalk;
-            List<string> cut = new List<string>();   // registry walks that hit a bound: told to the user
             ScanIfeo(f, SOFT, cut);
 
             // ---- extra SOFTWARE persistence (Active Setup, Notify, Policies, SilentProcessExit, class hijack) ----
             ScanExtraSoftware(f, SOFT);
 
             // ---- SYSTEM: control set, BootExecute, Services ----
-            string ccs = "ControlSet001";
-            foreach (string[] v in Reg.Values(SYS + "\\Select"))
-                if (v[0].Equals("Current", StringComparison.OrdinalIgnoreCase))
-                {
-                    int n = 1; try { n = Convert.ToInt32(v[1].Replace("0x", ""), 16); } catch { }
-                    ccs = "ControlSet" + n.ToString("D3");
-                }
+            // the set the NEXT boot uses is Select\Default (Current only records the last boot): a mismatch is shown
+            string selWarn;
+            ccs = PickControlSet(Reg.Values(SYS + "\\Select"), delegate(string cs) { return Reg.KeyExists(SYS + "\\" + cs); }, out selWarn);
+            if (selWarn.Length > 0 && SYS.Length > 0) Add(f, "ControlSet (Select)", ccs, selWarn, SYS + "\\Select", "REVIEW", 3, null, null, null);
             // MiniNT on an installed Windows: after a reboot the event log stops writing (defence evasion; Windows also
             // behaves as WinPE in places). Info only if the target itself looks like a WinPE (InstallationType).
             string mnt = SYS + "\\" + ccs + "\\Control\\MiniNT";
@@ -3011,36 +3172,12 @@ namespace RescueScan
             // ---- Drivers folder (нестандартные файлы) ----
             ScanDrivers(f, winDir);
 
-            // ---- Scheduled tasks (+ anti-checker/watchdog) ----
-            string tasksDir = FsPath(winDir + "\\System32\\Tasks");
-            if (Directory.Exists(tasksDir))
+            // ---- Scheduled tasks: XML files + registry TaskCache (+ anti-checker/watchdog) ----
+            ScanTasks(f, FsPath(winDir + "\\System32\\Tasks"), SOFT, tgtLive, cut);
+            }
+            catch (Exception ex)
             {
-                List<string> all = new List<string>(), deniedDirs = new List<string>();
-                FilesBelow(tasksDir, 0, all, deniedDirs);   // (Directory.GetFiles AllDirectories threw on one locked folder)
-                foreach (string dd in deniedDirs)
-                    Add(f, "Scheduled Task (нет доступа)", dd.Substring(tasksDir.Length).TrimStart('\\'), "(папка задач не читается: права (DACL) изменены? — проверь вручную)",
-                        dd, tgtLive ? "REVIEW" : "SUSPECT", 3, null, null, null);
-                foreach (string tf in all)
-                {
-                    string body = "";
-                    try { body = File.ReadAllText(tf); } catch { }
-                    string risk = Risk(body);
-                    string wd = WatchdogRisk(body);
-                    if (risk == "" && wd == "SUSPECT") risk = "SUSPECT";
-                    string rel = tf.Substring(tasksDir.Length).TrimStart('\\');
-                    string cmd = ExtractTag(body, "Command");
-                    string args = ExtractTag(body, "Arguments");
-                    string shown = (cmd + " " + args).Trim();
-                    if (shown.Length == 0)
-                    {
-                        string cls = ExtractTag(body, "ClassId");
-                        if (cls.Length > 0) shown = "COM-обработчик " + cls;
-                        else if (body.IndexOf("<ComHandler", StringComparison.OrdinalIgnoreCase) >= 0) shown = "(COM-обработчик)";
-                        else shown = "(нет exec-команды)";
-                    }
-                    string cat = wd == "SUSPECT" ? "Task *checker?*" : "Scheduled Task";
-                    Add(f, cat, rel, shown, tf, risk, 2, null, null, tf);
-                }
+                Add(f, "Ошибка скана", ex.GetType().Name, "(скан прерван: " + Reg.OneLine(ex.Message, 200) + " — показано то, что найдено до ошибки)", "", "REVIEW", 3, null, null, null);
             }
 
             // keys that exist but could not be read: the scan is blind there (a deny-ACL is a known hiding trick; offline
@@ -3083,6 +3220,214 @@ namespace RescueScan
             }
         }
 
+        // Select values -> the control set to scan: Default (the next boot), else Current, else LastKnownGood, else 001;
+        // a set that does not exist is skipped. warn: why the pick is worth a look ("" = Default = Current, present).
+        internal static string PickControlSet(List<string[]> select, Predicate<string> exists, out string warn)
+        {
+            int def = -1, cur = -1, lkg = -1;
+            foreach (string[] v in select)
+            {
+                if (v[2] != "REG_DWORD") continue;
+                int n; try { n = Convert.ToInt32(v[1].Substring(2), 16); } catch { continue; }
+                if (n < 1 || n > 999) continue;
+                if (v[0].Equals("Default", StringComparison.OrdinalIgnoreCase)) def = n;
+                else if (v[0].Equals("Current", StringComparison.OrdinalIgnoreCase)) cur = n;
+                else if (v[0].Equals("LastKnownGood", StringComparison.OrdinalIgnoreCase)) lkg = n;
+            }
+            warn = "";
+            foreach (int n in new int[] { def, cur, lkg, 1 })
+            {
+                if (n < 0) continue;
+                string cs = "ControlSet" + n.ToString("D3");
+                if (!exists(cs)) { if (n == def) warn = "Select\\Default = " + n + ", но " + cs + " нет; "; continue; }
+                if (def > 0 && cur > 0 && def != cur) warn += "Select\\Default = " + def + ", Current = " + cur + ": следующая загрузка возьмёт Default — сканируется " + cs;
+                else if (n != def) warn += "сканируется " + cs;
+                return cs;
+            }
+            return "ControlSet001";
+        }
+
+        // One task as the registry TaskCache knows it (Windows 8+ runs tasks from here, not from the XML: research
+        // windows-semantics Q3). Keys = every TaskCache key of this task (removed together with it, backed up).
+        internal class TaskReg
+        {
+            public string Rel = "", TreeKey = "", Id = "";
+            public bool HasSD, HasActions, PathOk;
+            public int Index = -1;
+            public List<string[]> Acts;          // parsed Actions (null = none / not parsed)
+            public string Raw = "";              // printable strings of an unparsed Actions blob
+            public List<string> Keys = new List<string>();
+        }
+
+        // TaskCache\Tree walked recursively (bounded): relative task path (lower case) -> TaskReg.
+        internal static Dictionary<string, TaskReg> ReadTaskCache(string SOFT, List<string> cut)
+        {
+            Dictionary<string, TaskReg> res = new Dictionary<string, TaskReg>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(SOFT)) return res;
+            string tc = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache";
+            int budget = 20000;
+            TreeWalk(tc, tc + "\\Tree", "", 0, ref budget, res);
+            if (budget <= 0 && cut != null) cut.Add("TaskCache");
+            return res;
+        }
+
+        static void TreeWalk(string tc, string key, string rel, int depth, ref int budget, Dictionary<string, TaskReg> res)
+        {
+            if (--budget < 0) return;
+            if (rel.Length > 0)
+            {
+                string id = null; bool sd = false; int index = -1;
+                foreach (string[] v in Reg.Values(key))
+                {
+                    if (v[0].Equals("Id", StringComparison.OrdinalIgnoreCase)) id = v[1].Trim();
+                    else if (v[0].Equals("SD", StringComparison.OrdinalIgnoreCase)) sd = v[1].Length > 0;
+                    else if (v[0].Equals("Index", StringComparison.OrdinalIgnoreCase) && v[2] == "REG_DWORD")
+                        try { index = Convert.ToInt32(v[1].Substring(2), 16); } catch { }
+                }
+                if (id != null)
+                {
+                    TaskReg t = new TaskReg();
+                    t.Rel = rel; t.TreeKey = key; t.Id = id; t.HasSD = sd; t.Index = index;
+                    t.Keys.Add(key);
+                    if (Heur.IsGuid(id))   // a forged Id must never address another key
+                    {
+                        string tk = tc + "\\Tasks\\" + id;
+                        string path = null;
+                        foreach (string[] v in Reg.Values(tk))
+                            if (v[0].Equals("Path", StringComparison.OrdinalIgnoreCase)) path = v[1];
+                        // Tasks\{Id} belongs to THIS task only if its Path says so (another Tree entry may point at the
+                        // Id of a Windows task)
+                        t.PathOk = path != null && path.Trim().TrimStart('\\').Equals(rel, StringComparison.OrdinalIgnoreCase);
+                        if (t.PathOk)
+                        {
+                            t.Keys.Add(tk);
+                            byte[] blob = null;
+                            using (RegistryKey k = Reg.OpenKey(tk, false))
+                                if (k != null) try { blob = k.GetValue("Actions") as byte[]; } catch { }
+                            if (blob != null)
+                            {
+                                t.HasActions = true;
+                                t.Acts = Heur.TaskCacheActions(blob);
+                                if (t.Acts == null) t.Raw = string.Join(" | ", Heur.PrintableStrings(blob, 4).ToArray());
+                            }
+                            foreach (string trig in new string[] { "Boot", "Logon", "Plain", "Maintenance" })
+                                if (Reg.KeyExists(tc + "\\" + trig + "\\" + id)) t.Keys.Add(tc + "\\" + trig + "\\" + id);
+                        }
+                    }
+                    res[rel] = t;
+                    return;   // a task key has no task below it
+                }
+            }
+            if (depth >= 32) return;
+            foreach (string sk in Reg.Subkeys(key))
+                TreeWalk(tc, sk, (rel.Length > 0 ? rel + "\\" : "") + sk.Substring(sk.LastIndexOf('\\') + 1), depth + 1, ref budget, res);
+        }
+
+        // The command lines of a list of actions ("exec" -> command + arguments, "com" -> "COM-обработчик {clsid}").
+        static string ActText(List<string[]> acts)
+        {
+            List<string> parts = new List<string>();
+            foreach (string[] a in acts)
+                parts.Add(a[0] == "exec" ? (a[1] + " " + a[2]).Trim() : "COM-обработчик " + a[1] + (a[2].Length > 0 ? " " + a[2] : ""));
+            return string.Join("  ||  ", parts.ToArray());
+        }
+
+        // Risk of every exec action (command + arguments only: never the whole XML, whose xmlns is an http URL);
+        // a "checker" (re-creates autoruns / tasks) is always SUSPECT.
+        static string ActRisk(List<string[]> acts, ref bool checker)
+        {
+            string r = "";
+            foreach (string[] a in acts)
+            {
+                if (a[0] != "exec") continue;
+                string text = (a[1] + " " + a[2]).Trim();
+                r = Heur.Max(r, Risk(text));
+                if (WatchdogRisk(text) == "SUSPECT") { checker = true; r = "SUSPECT"; }
+            }
+            return r;
+        }
+
+        static HashSet<string> ExecKeys(List<string[]> acts)
+        {
+            HashSet<string> h = new HashSet<string>();
+            foreach (string[] a in acts) if (a[0] == "exec") h.Add(Heur.CmdKey(a[1], a[2])); else h.Add("com " + a[1].ToLowerInvariant());
+            return h;
+        }
+
+        // Scheduled tasks: every XML file below <tasksDir> joined with the registry TaskCache of SOFT. Rows are files
+        // (Kind 2) whose removal also removes (with backup) the task's TaskCache keys; tasks that exist only in the
+        // registry, or are hidden there (no SD), are Kind 1 on their Tree key. live: unreadable is REVIEW, not SUSPECT.
+        internal static void ScanTasks(List<Finding> f, string tasksDir, string SOFT, bool live, List<string> cut)
+        {
+            Dictionary<string, TaskReg> reg = ReadTaskCache(SOFT, cut);
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<string> all = new List<string>(), deniedDirs = new List<string>();
+            if (Directory.Exists(tasksDir)) FilesBelow(tasksDir, 0, all, deniedDirs);
+            foreach (string dd in deniedDirs)
+                Add(f, "Scheduled Task (нет доступа)", dd.Length > tasksDir.Length ? dd.Substring(tasksDir.Length).TrimStart('\\') : dd,
+                    "(папка задач не читается: права (DACL) изменены? — проверь вручную)", dd, live ? "REVIEW" : "SUSPECT", 3, null, null, null);
+            foreach (string tf in all)
+            {
+                string rel = tf.Substring(tasksDir.Length).Replace(Path.DirectorySeparatorChar, '\\').TrimStart('\\');
+                TaskReg tr; reg.TryGetValue(rel, out tr);
+                if (tr != null) seen.Add(rel);
+                string body = null, why = "";
+                try
+                {
+                    if (new FileInfo(tf).Length > 1024 * 1024) why = "больше 1 МБ — это не задача Windows";
+                    else body = File.ReadAllText(tf);
+                }
+                catch (Exception ex) { why = ex.Message; }
+                if (body == null)
+                {
+                    Add(f, "Scheduled Task (не читается)", rel, "(XML задачи не читается: " + Reg.OneLine(why, 160) + " — проверь вручную)"
+                        + (tr != null && tr.Acts != null ? "   реестр: " + ActText(tr.Acts) : ""), tf, live ? "REVIEW" : "SUSPECT", 3, null, null, null);
+                    continue;
+                }
+                List<string[]> acts = Heur.TaskXmlActions(body);
+                bool checker = false;
+                string risk = ActRisk(acts, ref checker);
+                string shown = ActText(acts);
+                if (shown.Length == 0) shown = "(нет действий в XML)";
+                string note = "";
+                if (tr != null)
+                {
+                    if (tr.Acts != null)
+                    {
+                        risk = Heur.Max(risk, ActRisk(tr.Acts, ref checker));
+                        HashSet<string> a = ExecKeys(acts), b = ExecKeys(tr.Acts);
+                        if (!a.SetEquals(b)) { note += "   ВНИМАНИЕ: в реестре (TaskCache — его и выполняет Windows) другое: " + ActText(tr.Acts); risk = Heur.Max(risk, "REVIEW"); }
+                    }
+                    else if (tr.Raw.Length > 0) note += "   реестр: " + tr.Raw;
+                    if (tr.HasActions && !tr.HasSD) { note += "   (скрыта: нет SD в TaskCache\\Tree)"; risk = "SUSPECT"; }
+                    if (tr.Index == 0) { note += "   (Index = 0 в TaskCache\\Tree: так задачу прячут)"; risk = Heur.Max(risk, "REVIEW"); }
+                }
+                Add(f, checker ? "Task *checker?*" : "Scheduled Task", rel, shown + note, tf, risk, 2, null, null, tf);
+                if (tr != null) f[f.Count - 1].AlsoKeys = tr.Keys;
+            }
+            // tasks Windows knows only from the registry (XML deleted or never written: GhostTask-style)
+            foreach (KeyValuePair<string, TaskReg> kv in reg)
+            {
+                if (seen.Contains(kv.Key)) continue;
+                TaskReg tr = kv.Value;
+                if (!tr.HasActions && !tr.PathOk) continue;   // Win7 orphan / foreign Id: nothing to run
+                string xml = Path.Combine(tasksDir, tr.Rel.Replace('\\', Path.DirectorySeparatorChar));
+                bool hidden = FsOps.Exists(xml);              // the file is there but its folder could not be listed
+                foreach (string dd in deniedDirs) if (QuarMan.Below(xml, dd)) hidden = true;
+                bool checker = false;
+                string shown = tr.Acts != null ? ActText(tr.Acts) : (tr.Raw.Length > 0 ? tr.Raw : "(действия не прочитаны)");
+                string risk = tr.Acts != null ? ActRisk(tr.Acts, ref checker) : "";
+                risk = Heur.Max(risk, tr.HasActions && !hidden ? "SUSPECT" : "REVIEW");
+                if (tr.HasActions && !tr.HasSD) risk = "SUSPECT";
+                shown += hidden ? "   (XML-файл есть, но его папка не читается)"
+                    : "   (нет XML-файла — задача только в реестре" + (tr.HasSD ? "" : ", без SD — скрытая") + ")";
+                Add(f, "Scheduled Task (только реестр)", tr.Rel, shown, tr.TreeKey, risk, 1, tr.TreeKey, null, null);
+                List<string> extra = new List<string>(tr.Keys);
+                extra.Remove(tr.TreeKey);
+                f[f.Count - 1].AlsoKeys = extra;
+            }
+        }
+
         // Every file below 'dir' without throwing (Directory.GetFiles with AllDirectories aborts the whole scan on one
         // folder it may not list). Folders that cannot be listed go to 'denied' (a task folder whose DACL locks out
         // SYSTEM / Administrators hides tasks from tools); junctions and symlinks are not followed (no loops).
@@ -3092,6 +3437,7 @@ namespace RescueScan
             try { files = Directory.GetFiles(dir); subs = Directory.GetDirectories(dir); }
             catch (UnauthorizedAccessException) { denied.Add(dir); return; }
             catch (System.Security.SecurityException) { denied.Add(dir); return; }
+            catch (PathTooLongException) { denied.Add(dir); return; }   // planted over-long chain: report, never abort
             catch { return; }
             res.AddRange(files);
             if (depth >= 32) return;
@@ -3229,10 +3575,11 @@ namespace RescueScan
         // ---- MODULE: extra SOFTWARE-hive persistence ----  (internal static: called by tests)
         internal static void ScanExtraSoftware(List<Finding> f, string SOFT)
         {
+            // Policies are shared between the 64- and 32-bit views (research windows-semantics Q4): only the native key counts
+            AddValuesRisk(f, "Policies Explorer Run", SOFT + "\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", "SUSPECT");
             string[] roots = { SOFT, SOFT + "\\Wow6432Node" };
             foreach (string R in roots)
             {
-                AddValuesRisk(f, "Policies Explorer Run", R + "\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", "SUSPECT");
                 AddValuesRisk(f, "RunServices", R + "\\Microsoft\\Windows\\CurrentVersion\\RunServices", "SUSPECT");
                 AddValuesRisk(f, "RunServicesOnce", R + "\\Microsoft\\Windows\\CurrentVersion\\RunServicesOnce", "SUSPECT");
                 // Active Setup StubPath (runs at logon)
@@ -3288,8 +3635,6 @@ namespace RescueScan
             foreach (string bhoRoot in new string[] { SOFT + "\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Browser Helper Objects", SOFT + "\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Browser Helper Objects" })
                 foreach (string sk in Reg.Subkeys(bhoRoot))
                     Add(f, "BHO", Last(sk), "(CLSID)", sk, "REVIEW", 1, sk, null, null);
-            // Explorer\Run (политика, HKLM)
-            AddValuesRisk(f, "Explorer\\Run (HKLM)", SOFT + "\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", "SUSPECT");
         }
 
         // ---- MODULE: extra SYSTEM-hive persistence (services & co.) ----
@@ -3334,10 +3679,29 @@ namespace RescueScan
             // Session Manager execute hooks
             string sm = CCS + "\\Control\\Session Manager";
             ScanSetupExecute(f, sm);
-            foreach (string vn in new string[] { "S0InitialCommand", "PlatformExecute", "AppCertDlls" })
-                foreach (string[] v in Reg.Values(sm))
-                    if (v[0].Equals(vn, StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
-                        Add(f, "SessionMgr " + vn, v[0], v[1].Replace("\\0", " "), sm, "SUSPECT", 0, sm, v[0], null);
+            ScanSessionManagerExtra(f, sm);
+        }
+
+        // Session Manager values that are absent / empty on a clean Windows (research windows-semantics Q2): any entry
+        // is SUSPECT and the value is deleted. AppCertDlls is a KEY whose values are DLL paths (loaded into every
+        // process that calls CreateProcess): each value is a row.
+        internal static void ScanSessionManagerExtra(List<Finding> f, string sm)
+        {
+            foreach (string vn in new string[] { "S0InitialCommand", "PlatformExecute", "Execute", "BootExecuteNoPnpSync", "SetupExecuteNoPnpSync" })
+            {
+                string[] items = Reg.ReadMulti(sm, vn);
+                if (items == null) continue;
+                List<string> used = new List<string>();
+                foreach (string e in items) if (e != null && e.Trim().Length > 0) used.Add(e);
+                if (used.Count > 0) Add(f, "SessionMgr " + vn, vn, string.Join(" | ", used.ToArray()), sm, "SUSPECT", 0, sm, vn, null);
+            }
+            string ac = sm + "\\AppCertDlls";
+            foreach (string[] v in Reg.Values(ac))
+            {
+                if (HiddenName(f, "AppCertDlls", ac, v[0])) continue;
+                if (v[1].Trim().Length == 0) continue;
+                Add(f, "AppCertDlls", v[0].Length > 0 ? v[0] : "(по умолчанию)", v[1], ac, "SUSPECT", 0, ac, v[0], null);
+            }
         }
 
         // ---- MODULE: drivers folder (non-.sys files are highly unusual) ----
@@ -3366,8 +3730,9 @@ namespace RescueScan
             if (body == null) return "";
             string l = body.ToLowerInvariant();
             // сильные индикаторы самовосстановления/перезаписи автозагрузки (без общих слов вроде "check")
-            string[] kw = { "reg add ", "reg import", "schtasks /create", "bcdedit", "-enc", "-encodedcommand",
-                "-w hidden", "-windowstyle hidden", "frombase64", "downloadstring", "mshta", "\\temp\\", "\\appdata\\local\\temp\\" };
+            // (-enc / -w hidden: Risk() parses PowerShell switches; a plain "-enc" substring also matched "-Encoding")
+            string[] kw = { "reg add ", "reg.exe add ", "reg import", "reg.exe import", "regedit /s", "regedit.exe /s", "schtasks /create",
+                "schtasks.exe /create", "bcdedit", "frombase64", "downloadstring", "mshta", "\\temp\\", "\\appdata\\local\\temp\\" };
             foreach (string k in kw) if (l.Contains(k)) return "SUSPECT";
             return "";
         }
@@ -3713,6 +4078,20 @@ namespace RescueScan
         // 1 = done, 2 = nothing to do (already default / already gone), 0 = failed (quarErr says why).
         // backup = the original goes to the quarantine first; no backup -> no change.
         int Remediate(Finding x, bool backup)
+        {
+            int r = RemediateMain(x, backup);
+            if (r == 0 || x.AlsoKeys == null) return r;
+            // a task: its XML (or Tree key) is gone - now its TaskCache keys, else Windows 8+ still runs it
+            foreach (string k in x.AlsoKeys)
+            {
+                int e = BackedDeleteKey(k, backup, x.Category + " (TaskCache)");
+                if (e == 0) return 0;
+                if (e == 1) r = 1;
+            }
+            return r;
+        }
+
+        int RemediateMain(Finding x, bool backup)
         {
             if (x == null || x.Kind == 3) return 0;
             if (x.Kind == 4) return BackedSet(x.DelKey, x.DelName, x.ResetData, x.ResetType, backup, x.Category + " -> дефолт");

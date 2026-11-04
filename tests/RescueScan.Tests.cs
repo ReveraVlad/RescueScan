@@ -85,6 +85,11 @@ namespace RescueScan.Tests
                 Run("RunProcess: stdin is closed (no wait for input)", ProcStdinClosed);
                 Run("RunProcess: output is capped but drained", ProcOutputCap);
                 Run("Risk(): clean Windows defaults never SUSPECT; evasions and LOLBins caught", RiskCases);
+                Run("Tasks: XML actions only (entities, prefixes, comments, COM)", TaskXmlCases);
+                Run("Tasks: TaskCache Actions blob parser + printable fallback", TaskCacheBlobCases);
+                Run("Tasks: XML + TaskCache join, registry-only/hidden tasks, cleanup keys", ScanTasksCases);
+                Run("Control set: Select\\Default, fallbacks, warnings", ControlSetCases);
+                Run("Session Manager extras + AppCertDlls key; Policies Run once", SessionMgrExtraCases);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
                 Run("Pairs/DeleteKey: registry symbolic links are not followed [win]", LinksWin);
@@ -1913,6 +1918,168 @@ namespace RescueScan.Tests
             True(Heur.Word("c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe -c x", "powershell"), "Word powershell.exe");
             True(!Heur.Word("c:\\program files\\msbuild\\x.exe", "msbuild"), "Word: folder name is not the program");
             True(Heur.SysDir("c:\\windows\\system32\\x.vbs") && Heur.SysDir("\\windows\\syswow64\\x") && !Heur.SysDir("c:\\windows\\x.vbs"), "SysDir");
+        }
+
+        static byte[] ActionsBlob(params string[] execs)   // execs: cmd, args, cmd, args ...  (GhostTask layout, version 3)
+        {
+            MemoryStream ms = new MemoryStream();
+            BinaryWriter w = new BinaryWriter(ms);
+            w.Write((ushort)3);
+            WStr(w, "Author");
+            for (int i = 0; i + 1 < execs.Length; i += 2)
+            {
+                w.Write((ushort)0x6666); WStr(w, ""); WStr(w, execs[i]); WStr(w, execs[i + 1]); WStr(w, ""); w.Write((ushort)0);
+            }
+            w.Flush();
+            return ms.ToArray();
+        }
+
+        static void WStr(BinaryWriter w, string s) { byte[] b = Encoding.Unicode.GetBytes(s); w.Write((uint)b.Length); w.Write(b); }
+
+        const string TaskNs = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n";
+
+        static string TaskXml(string actions) { return TaskNs + "<RegistrationInfo><Description>rundll32 powershell http</Description></RegistrationInfo><Actions Context=\"Author\">" + actions + "</Actions></Task>"; }
+
+        // Task XML: every action (any prefix, entities, CDATA, comments removed); never the xmlns / description
+        static void TaskXmlCases()
+        {
+            List<string[]> a = Heur.TaskXmlActions(TaskXml("<Exec><Command>%windir%\\system32\\rundll32.exe</Command><Arguments>/d acproxy.dll,PerformAutochkOperations</Arguments></Exec>"));
+            Eq(1, a.Count, "one action");
+            Eq("%windir%\\system32\\rundll32.exe|/d acproxy.dll,PerformAutochkOperations", a[0][1] + "|" + a[0][2], "exec");
+            a = Heur.TaskXmlActions(TaskXml("<!-- <Exec><Command>decoy.exe</Command></Exec> --><t:Exec xmlns:t=\"x\"><t:Command >C:\\a.exe</t:Command></t:Exec>"
+                + "<Exec><Command><![CDATA[powershell]]></Command><Arguments>-&#101;nc AAA &amp; x</Arguments></Exec><ComHandler><ClassId>{1}</ClassId><Data>d</Data></ComHandler>"));
+            Eq(3, a.Count, "comment dropped, two execs + COM");
+            Eq("C:\\a.exe", a[0][1], "prefixed exec, attribute-ish whitespace");
+            Eq("-enc AAA & x", a[1][2], "entities decoded");
+            Eq("com|{1}|d", a[2][0] + "|" + a[2][1] + "|" + a[2][2], "COM handler");
+            Eq("a<b>&\"'e", Heur.XmlText("a&lt;b&gt;&amp;&quot;&apos;&#x65;"), "XmlText");
+            Eq(0, Heur.TaskXmlActions("not xml").Count, "garbage");
+        }
+
+        // TaskCache Actions blob: exec actions, COM action, truncated -> null; printable fallback
+        static void TaskCacheBlobCases()
+        {
+            List<string[]> a = Heur.TaskCacheActions(ActionsBlob("C:\\Users\\Public\\upd.exe", "-w hidden -enc AAAA", "calc.exe", ""));
+            True(a != null, "parsed");
+            Eq(2, a.Count, "two actions");
+            Eq("C:\\Users\\Public\\upd.exe|-w hidden -enc AAAA", a[0][1] + "|" + a[0][2], "first");
+            Eq("calc.exe", a[1][1], "second (after flags)");
+            byte[] b = ActionsBlob("C:\\x.exe", "y");
+            byte[] cut = new byte[b.Length - 5]; Array.Copy(b, cut, cut.Length);
+            True(Heur.TaskCacheActions(cut) == null, "truncated -> null");
+            // COM action
+            MemoryStream ms = new MemoryStream(); BinaryWriter w = new BinaryWriter(ms);
+            w.Write((ushort)3); WStr(w, "A"); w.Write((ushort)0x7777); WStr(w, ""); Guid g = Guid.NewGuid(); w.Write(g.ToByteArray()); WStr(w, "data"); w.Flush();
+            a = Heur.TaskCacheActions(ms.ToArray());
+            True(a != null && a.Count == 1 && a[0][0] == "com" && a[0][1] == g.ToString("B") && a[0][2] == "data", "COM action");
+            List<string> p = Heur.PrintableStrings(cut, 4);
+            True(p.Exists(delegate(string s) { return s.Contains("C:\\x.exe"); }), "printable fallback shows the command");
+            True(Heur.IsGuid("{0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0}") && !Heur.IsGuid("{x}\\..\\a"), "IsGuid");
+            Eq(Heur.CmdKey("\"%windir%\\a.exe\"", "-x  y"), Heur.CmdKey("C:\\Windows\\a.exe".Replace("C:", ""), "-X y"), "CmdKey");
+        }
+
+        // ScanTasks: XML + TaskCache join, risk from actions only, TaskCache keys removed with the task,
+        // registry-only / SD-less tasks, XML vs registry mismatch, unreadable / denied
+        static void ScanTasksCases()
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "rs tasks " + Id);
+            string tasks = Path.Combine(dir, "Tasks");
+            string autochk = Path.Combine(Path.Combine(Path.Combine(tasks, "Microsoft"), "Windows"), "Autochk");
+            Directory.CreateDirectory(autochk);
+            try
+            {
+                string soft = Root + "\\tsoft";
+                string tc = "tsoft\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache";
+                string g1 = "{11111111-1111-1111-1111-111111111111}", g2 = "{22222222-2222-2222-2222-222222222222}", g3 = "{33333333-3333-3333-3333-333333333333}";
+                // 1) built-in task: clean although the XML has an http xmlns and "rundll32 powershell http" in its description
+                File.WriteAllText(Path.Combine(autochk, "Proxy"),
+                    TaskXml("<Exec><Command>%windir%\\system32\\rundll32.exe</Command><Arguments>/d acproxy.dll,PerformAutochkOperations</Arguments></Exec>"), Encoding.Unicode);
+                using (RegistryKey k = Make(tc + "\\Tree\\Microsoft\\Windows\\Autochk\\Proxy")) { k.SetValue("Id", g1); k.SetValue("SD", new byte[] { 1 }); k.SetValue("Index", 3); }
+                using (RegistryKey k = Make(tc + "\\Tasks\\" + g1)) { k.SetValue("Path", "\\Microsoft\\Windows\\Autochk\\Proxy"); k.SetValue("Actions", ActionsBlob("%windir%\\system32\\rundll32.exe", "/d acproxy.dll,PerformAutochkOperations")); }
+                using (RegistryKey k = Make(tc + "\\Plain\\" + g1)) { }
+                // 2) GhostTask overwrite: XML benign, registry runs something else
+                File.WriteAllText(Path.Combine(tasks, "Updater"), TaskXml("<Exec><Command>C:\\Windows\\System32\\defrag.exe</Command></Exec>"), Encoding.Unicode);
+                using (RegistryKey k = Make(tc + "\\Tree\\Updater")) { k.SetValue("Id", g2); k.SetValue("SD", new byte[] { 1 }); k.SetValue("Index", 3); }
+                using (RegistryKey k = Make(tc + "\\Tasks\\" + g2)) { k.SetValue("Path", "\\Updater"); k.SetValue("Actions", ActionsBlob("C:\\ProgramData\\x\\svc.exe", "")); }
+                // 3) registry-only task without SD (Tarrask), plus a Tree entry pointing at another task's Id
+                using (RegistryKey k = Make(tc + "\\Tree\\Hidden")) { k.SetValue("Id", g3); k.SetValue("Index", 1); }
+                using (RegistryKey k = Make(tc + "\\Tasks\\" + g3)) { k.SetValue("Path", "\\Hidden"); k.SetValue("Actions", ActionsBlob("C:\\Windows\\System32\\calc.exe", "")); }
+                using (RegistryKey k = Make(tc + "\\Logon\\" + g3)) { }
+                using (RegistryKey k = Make(tc + "\\Tree\\Thief")) { k.SetValue("Id", g1); k.SetValue("SD", new byte[] { 1 }); }
+                // 4) a checker that re-adds autoruns; 5) a big non-task file
+                File.WriteAllText(Path.Combine(tasks, "Checker"), TaskXml("<Exec><Command>cmd.exe</Command><Arguments>/c reg add HKCU\\x /v y /d z /f</Arguments></Exec>"), Encoding.Unicode);
+                File.WriteAllText(Path.Combine(tasks, "Big"), new string('x', 1024 * 1024 + 10));
+                List<Finding> f = new List<Finding>();
+                MainForm.ScanTasks(f, tasks, soft, false, new List<string>());
+                Finding proxy = FindName(f, "Microsoft\\Windows\\Autochk\\Proxy");
+                True(proxy != null, "built-in task listed");
+                Eq("", proxy.Risk, "built-in task is clean (no xmlns/description match, XML = registry)");
+                Eq(2, proxy.Kind, "task file");
+                Eq(3, proxy.AlsoKeys.Count, "Tree + Tasks + Plain keys go with the task");
+                True(proxy.AlsoKeys[1].EndsWith("\\Tasks\\" + g1) && proxy.AlsoKeys[2].EndsWith("\\Plain\\" + g1), "TaskCache key paths");
+                Finding up = FindName(f, "Updater");
+                Eq("REVIEW", up.Risk, "XML / registry mismatch");
+                True(up.Value.Contains("C:\\ProgramData\\x\\svc.exe"), "the command Windows really runs is shown");
+                Finding hid = FindName(f, "Hidden") ?? FindName(f, "hidden");   // (Mono's registry lower-cases key names)
+                Eq("SUSPECT", hid.Risk, "registry-only task without SD");
+                Eq(1, hid.Kind, "Tree key");
+                True(hid.DelKey.EndsWith("\\Tree\\Hidden", StringComparison.OrdinalIgnoreCase), "removes the Tree key");
+                Eq(2, hid.AlsoKeys.Count, "and Tasks + Logon");
+                Finding thief = FindName(f, "Thief") ?? FindName(f, "thief");
+                True(thief == null, "a Tree entry with a foreign Id and no Actions of its own is not acted on");
+                Eq("SUSPECT", FindName(f, "Checker").Risk, "checker (reg add) in the arguments");
+                Eq("Task *checker?*", FindName(f, "Checker").Category, "checker category");
+                Finding big = FindName(f, "Big");
+                Eq(3, big.Kind, "over-sized file: info only");
+                Eq("SUSPECT", big.Risk, "offline: unreadable task is SUSPECT");
+                f.Clear();
+                MainForm.ScanTasks(f, tasks, soft, true, new List<string>());
+                Eq("REVIEW", FindName(f, "Big").Risk, "live: REVIEW");
+                f.Clear();
+                MainForm.ScanTasks(f, Path.Combine(dir, "nope"), "", false, null);
+                Eq(0, f.Count, "no folder, no SOFTWARE: nothing, no exception");
+            }
+            finally { try { Directory.Delete(dir, true); } catch { } }
+        }
+
+        static void ControlSetCases()
+        {
+            Predicate<string> has12 = delegate(string cs) { return cs == "ControlSet001" || cs == "ControlSet002"; };
+            string w;
+            List<string[]> sel = new List<string[]>();
+            sel.Add(new string[] { "Current", "0x1", "REG_DWORD" }); sel.Add(new string[] { "Default", "0x1", "REG_DWORD" }); sel.Add(new string[] { "LastKnownGood", "0x2", "REG_DWORD" });
+            Eq("ControlSet001", MainForm.PickControlSet(sel, has12, out w), "default"); Eq("", w, "no warning");
+            sel[1] = new string[] { "Default", "0x2", "REG_DWORD" };
+            Eq("ControlSet002", MainForm.PickControlSet(sel, has12, out w), "Default wins (next boot)"); True(w.Length > 0, "mismatch warned");
+            sel[1] = new string[] { "Default", "0x63", "REG_DWORD" };
+            Eq("ControlSet001", MainForm.PickControlSet(sel, has12, out w), "missing Default -> Current"); True(w.Contains("ControlSet099"), "warned");
+            sel.Clear(); sel.Add(new string[] { "Default", "a\n    Current    REG_DWORD    0x2", "REG_SZ" });
+            Eq("ControlSet001", MainForm.PickControlSet(sel, has12, out w), "a REG_SZ never counts");
+        }
+
+        // Session Manager extras: clean (absent / empty) = no row; AppCertDlls is a key whose values are DLLs;
+        // HKLM Policies\Explorer\Run is listed once, the Wow6432Node copy (not consulted) not at all
+        static void SessionMgrExtraCases()
+        {
+            using (RegistryKey k = Make("smx")) { k.SetValue("Execute", new string[] { "" }, RegistryValueKind.MultiString); k.SetValue("PlatformExecute", new string[0], RegistryValueKind.MultiString); }
+            List<Finding> f = new List<Finding>();
+            MainForm.ScanSessionManagerExtra(f, Root + "\\smx");
+            Eq(0, f.Count, "clean defaults: no rows");
+            using (RegistryKey k = Make("smx")) { k.SetValue("BootExecuteNoPnpSync", new string[] { "evil" }, RegistryValueKind.MultiString); k.SetValue("AppCertDlls", "decoy (a value, not the key)"); }
+            using (RegistryKey k = Make("smx\\AppCertDlls")) { k.SetValue("x", "C:\\ProgramData\\ac.dll"); k.SetValue("e", ""); }
+            MainForm.ScanSessionManagerExtra(f, Root + "\\smx");
+            Eq(2, f.Count, "NoPnpSync + one AppCertDll");
+            Finding a = FindName(f, "x");
+            Eq("SUSPECT", a.Risk, "AppCertDll SUSPECT");
+            Eq(0, a.Kind, "value deleted, not the key");
+            True(a.DelKey.EndsWith("\\AppCertDlls"), "in the AppCertDlls key");
+            Eq("SUSPECT", FindName(f, "BootExecuteNoPnpSync").Risk, "BootExecuteNoPnpSync");
+            using (RegistryKey k = Make("pol\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run")) k.SetValue("gpo", "C:\\Program Files\\x\\a.exe");
+            using (RegistryKey k = Make("pol\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run")) k.SetValue("w", "C:\\x.exe");
+            f.Clear();
+            MainForm.ScanExtraSoftware(f, Root + "\\pol");
+            int n = 0; foreach (Finding x in f) if (x.Name == "gpo" || x.Name == "w") n++;
+            Eq(1, n, "Policies Run once, native only");
         }
     }
 }
