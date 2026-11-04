@@ -174,8 +174,9 @@ namespace RescueScan
         // Paths are "<ROOT>\sub\key", ROOT = HKLM | HKEY_LOCAL_MACHINE | HKCU | HKEY_CURRENT_USER | HKU | HKEY_USERS |
         // HKCR | HKEY_CLASSES_ROOT; always the 64-bit view on 64-bit Windows (also from a 32-bit build).
         // Missing key / access denied => empty result (or false), never an exception to the UI.
-        internal const int PairsMaxDepth = 64;      // Pairs: levels below the start key
-        internal const int PairsMaxKeys = 250000;   // Pairs: keys visited per call
+        internal const int PairsMaxDepth = 64;         // Pairs: levels below the start key
+        internal static int PairsMaxKeys = 250000;     // Pairs: keys visited per call (not const: tests lower the bounds)
+        internal static int PairsMinShare = 50000;     // Pairs: a subtree may always use this much of what is left
 
         internal static RegistryView View
         {
@@ -200,6 +201,7 @@ namespace RescueScan
         }
 
         // Opens a key by full path; the caller disposes it. null if missing / access denied / unknown root.
+        // A key that exists but may not be read is remembered (NoteDenied) so a scan can say so.
         internal static RegistryKey OpenKey(string path, bool writable)
         {
             RegistryHive hive; string sub;
@@ -210,7 +212,32 @@ namespace RescueScan
                 if (sub.Trim('\\').Length == 0) return b;
                 using (b) return b.OpenSubKey(sub, writable);
             }
+            catch (System.Security.SecurityException) { if (!writable) NoteDenied(path); return null; }
+            catch (UnauthorizedAccessException) { if (!writable) NoteDenied(path); return null; }
             catch { return null; }
+        }
+
+        // ---- keys that exist but could not be opened for reading (DACL changed: a known hiding trick) ----
+        // Values/Subkeys/Pairs return nothing for them (like reg.exe did); Scan lists them so the user knows the scan is
+        // incomplete there. Bounded and de-duplicated (the live guard reads Winlogon every 3 s).
+        static readonly object deniedLock = new object();
+        static List<string> denied = new List<string>();
+        static readonly HashSet<string> deniedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        static void NoteDenied(string path)
+        {
+            lock (deniedLock) if (denied.Count < 1000 && deniedSet.Add(path)) denied.Add(path);
+        }
+
+        // Returns the keys noted since the last call and starts a new list.
+        internal static List<string> TakeDenied()
+        {
+            lock (deniedLock)
+            {
+                List<string> r = denied;
+                denied = new List<string>(); deniedSet.Clear();
+                return r;
+            }
         }
 
         // {name, data, type} for every value of a key. Names are exact (the unnamed default value is ""); data is the
@@ -256,31 +283,67 @@ namespace RescueScan
         // number of visited keys are bounded.
         public static List<string[]> Pairs(string key, string valName)
         {
+            bool truncated;
+            return Pairs(key, valName, out truncated);
+        }
+
+        // truncated = a bound was hit (depth, or too many keys): the result may be incomplete and the caller must say so.
+        public static List<string[]> Pairs(string key, string valName, out bool truncated)
+        {
             List<string[]> res = new List<string[]>();
+            truncated = false;
             using (RegistryKey k = OpenKey(key, false))
             {
                 if (k == null) return res;
                 int budget = PairsMaxKeys;
-                PairsRec(k, key.TrimEnd('\\'), valName, 1, ref budget, res);
+                PairsRec(k, key.TrimEnd('\\'), valName, 1, ref budget, ref truncated, res);
             }
             return res;
         }
 
-        static void PairsRec(RegistryKey k, string path, string valName, int depth, ref int budget, List<string[]> res)
+        // Children first, subtrees second: the value of EVERY child is read before any subtree is entered, and each
+        // subtree may use only a fair share of the remaining budget (at least PairsMinShare). A padding key with
+        // 250,000 descendants that sorts before the real services / IFEO entries can therefore not use up the budget
+        // and hide them; if the budget still runs out, 'truncated' tells the user.
+        static void PairsRec(RegistryKey k, string path, string valName, int depth, ref int budget, ref bool truncated, List<string[]> res)
         {
             if (depth > PairsMaxDepth || IsLink(k)) return;
+            List<string> kids = new List<string>();
             foreach (string s in Names(k, true))
             {
                 if (s.Length == 0) continue;   // NUL-prefixed hidden name: opening "" would re-open k itself
-                if (--budget < 0) return;
-                using (RegistryKey c = OpenChild(k, s, false))
+                if (budget <= 0) { truncated = true; break; }
+                budget--;
+                string cp = path + "\\" + s;
+                bool deny;
+                using (RegistryKey c = OpenChild(k, s, false, out deny))
                 {
-                    if (c == null) continue;
-                    string cp = path + "\\" + s, data, type;
+                    if (c == null) { if (deny) NoteDenied(cp); continue; }
+                    string data, type;
                     if (TryGetValue(c, valName, out data, out type)) res.Add(new string[] { cp, data, type });
-                    PairsRec(c, cp, valName, depth + 1, ref budget, res);
+                    if (IsLink(c) || !HasSubkeys(c)) continue;
+                    if (depth < PairsMaxDepth) kids.Add(s); else truncated = true;
                 }
             }
+            for (int i = 0; i < kids.Count; i++)
+            {
+                if (budget <= 0) { truncated = true; break; }
+                int share = Math.Max(Math.Min(PairsMinShare, budget), budget / (kids.Count - i)), left = share;
+                using (RegistryKey c = OpenChild(k, kids[i], false))
+                    if (c != null) PairsRec(c, path + "\\" + kids[i], valName, depth + 1, ref left, ref truncated, res);
+                budget -= share - left;   // the unused part of the share goes back to the siblings after it
+            }
+        }
+
+        static bool HasSubkeys(RegistryKey k)
+        {
+            try { return k.SubKeyCount > 0; } catch { return true; }
+        }
+
+        // Immediate subkey names of a key (no paths). Empty if missing / access denied.
+        internal static string[] SubkeyNames(string key)
+        {
+            using (RegistryKey k = OpenKey(key, false)) return k == null ? new string[0] : Names(k, true);
         }
 
         // true if the key exists (also when it exists but cannot be read).
@@ -482,7 +545,7 @@ namespace RescueScan
         // (a link stored in an OFFLINE hive points into the registry of the running WinPE; a link loop would make the
         // recursion endless; RegistryKey.DeleteSubKeyTree follows links and would delete the link TARGET's subtree).
         const int REG_OPTION_OPEN_LINK = 0x8, KEY_READ = 0x20019, KEY_DELETE = 0x10000, KEY_WOW64_64KEY = 0x100;
-        const int REG_LINK = 6, ERROR_MORE_DATA = 234;
+        const int REG_LINK = 6, ERROR_MORE_DATA = 234, ERROR_ACCESS_DENIED = 5;
         static volatile bool nativeBroken;   // P/Invoke failed unexpectedly: reads fall back to the managed API
 
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegOpenKeyExW")]
@@ -499,13 +562,22 @@ namespace RescueScan
         // forDelete adds DELETE access and never falls back to the link-following managed API on Windows.
         static RegistryKey OpenChild(RegistryKey parent, string name, bool forDelete)
         {
+            bool deny;
+            return OpenChild(parent, name, forDelete, out deny);
+        }
+
+        // deny = the child exists but access was denied (ERROR_ACCESS_DENIED / SecurityException).
+        static RegistryKey OpenChild(RegistryKey parent, string name, bool forDelete, out bool deny)
+        {
+            deny = false;
             if (UseNative)
             {
                 try
                 {
                     IntPtr h;
                     int sam = KEY_READ | (forDelete ? KEY_DELETE : 0) | (View == RegistryView.Registry64 ? KEY_WOW64_64KEY : 0);
-                    if (NRegOpenKeyEx(parent.Handle, name, REG_OPTION_OPEN_LINK, sam, out h) != 0 || h == IntPtr.Zero) return null;
+                    int rc = NRegOpenKeyEx(parent.Handle, name, REG_OPTION_OPEN_LINK, sam, out h);
+                    if (rc != 0 || h == IntPtr.Zero) { deny = rc == ERROR_ACCESS_DENIED; return null; }
                     SafeRegistryHandle sh = new SafeRegistryHandle(h, true);
                     try { return RegistryKey.FromHandle(sh, View); }
                     catch { sh.Dispose(); throw; }
@@ -513,7 +585,10 @@ namespace RescueScan
                 catch (Exception) { nativeBroken = true; if (forDelete) return null; }
             }
             else if (forDelete && IsWindows) return null;
-            try { return parent.OpenSubKey(name, forDelete); } catch { return null; }
+            try { return parent.OpenSubKey(name, forDelete); }
+            catch (System.Security.SecurityException) { deny = true; return null; }
+            catch (UnauthorizedAccessException) { deny = true; return null; }
+            catch { return null; }
         }
 
         static bool IsLink(RegistryKey k)
@@ -1325,6 +1400,7 @@ namespace RescueScan
             if (t == null) { MessageBox.Show("Сначала выбери установку Windows."); return; }
             Cursor.Current = Cursors.WaitCursor;
             lv.Items.Clear();
+            Reg.TakeDenied();                                     // unreadable keys are collected per scan
             string winDir = t.WinDir;                             // e.g. D:\Windows
             // (re)mount the hives of THIS installation (live: read in place); all repair actions then use this target
             string warn = PrepareTarget(t);
@@ -1368,12 +1444,15 @@ namespace RescueScan
 
             // ---- IFEO debugger hijacks ----
             string ifeo = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
-            foreach (string[] pr in Reg.Pairs(ifeo, "Debugger"))
+            bool cutWalk;
+            List<string> cut = new List<string>();   // registry walks that hit a bound: told to the user
+            foreach (string[] pr in Reg.Pairs(ifeo, "Debugger", out cutWalk))
             {
                 string sub = pr[0]; string dbg = pr[1];
                 string target = sub.Substring(sub.LastIndexOf('\\') + 1);
                 Add(f, "IFEO Debugger", target, dbg, sub, "SUSPECT", 1, sub, null, null);
             }
+            if (cutWalk) cut.Add("IFEO");
 
             // ---- extra SOFTWARE persistence (Active Setup, Notify, Policies, SilentProcessExit, class hijack) ----
             ScanExtraSoftware(f, SOFT);
@@ -1394,7 +1473,7 @@ namespace RescueScan
                     Add(f, "BootExecute", v[0], dt, sm, dt.ToLower().StartsWith("autocheck autochk") && dt.Length < 40 ? "" : "SUSPECT", 0, sm, v[0], null);
                 }
             // suspicious services/drivers only
-            foreach (string[] pr in Reg.Pairs(SYS + "\\" + ccs + "\\Services", "ImagePath"))
+            foreach (string[] pr in Reg.Pairs(SYS + "\\" + ccs + "\\Services", "ImagePath", out cutWalk))
             {
                 string img = pr[1];
                 if (Risk(img) == "SUSPECT")
@@ -1403,8 +1482,9 @@ namespace RescueScan
                     Add(f, "Service/Driver", svc, img, pr[0], "SUSPECT", 1, pr[0], null, null);
                 }
             }
+            if (cutWalk) cut.Add("Services");
             // svchost-hosted ServiceDll, LSA packages, Print Monitors, SessionMgr extras
-            ScanExtraSystem(f, SYS + "\\" + ccs);
+            ScanExtraSystem(f, SYS + "\\" + ccs, cut);
 
             // ---- Per-user hives (mounted / located by PrepareTarget) ----
             string usersDir = curDrive + "\\Users";
@@ -1470,6 +1550,18 @@ namespace RescueScan
                     Add(f, cat, rel, shown, tf, risk, 2, null, null, tf);
                 }
             }
+
+            // keys that exist but could not be read: the scan is blind there (a deny-ACL is a known hiding trick; offline
+            // the scan runs as SYSTEM, so a denied key is deliberate; live, a few keys may be protected legitimately)
+            List<string> dn = Reg.TakeDenied();
+            for (int i = 0; i < dn.Count; i++)
+            {
+                if (i == 50) { Add(f, "Нет доступа к ключу", "…", "(и ещё " + (dn.Count - 50) + ")", "", tgtLive ? "REVIEW" : "SUSPECT", 3, null, null, null); break; }
+                Add(f, "Нет доступа к ключу", Last(dn[i]), "(ключ есть, но не читается: права (DACL) изменены? — скан его не видит, проверь вручную)",
+                    dn[i], tgtLive ? "REVIEW" : "SUSPECT", 3, null, null, null);
+            }
+            if (cut.Count > 0)
+                warn = (warn.Length > 0 ? warn + " " : "") + "обход " + string.Join("/", cut.ToArray()) + " неполный (слишком много или слишком глубоко вложенных ключей) — часть записей могла не попасть в скан.";
 
             // populate + build flagged-path set for the Explorer highlight
             lastFindings = f;
@@ -1600,10 +1692,11 @@ namespace RescueScan
         }
 
         // ---- MODULE: extra SYSTEM-hive persistence (services & co.) ----
-        void ScanExtraSystem(List<Finding> f, string CCS)
+        void ScanExtraSystem(List<Finding> f, string CCS, List<string> cut)
         {
             // svchost-hosted ServiceDll (classic hiding spot inside a shared svchost group)
-            foreach (string[] pr in Reg.Pairs(CCS + "\\Services", "ServiceDll"))
+            bool cutWalk;
+            foreach (string[] pr in Reg.Pairs(CCS + "\\Services", "ServiceDll", out cutWalk))
                 if (Risk(pr[1]) == "SUSPECT")
                 {
                     string p = pr[0]; string nm = p;
@@ -1611,6 +1704,7 @@ namespace RescueScan
                     if (i >= 0) { nm = p.Substring(i + 10); int j = nm.IndexOf('\\'); if (j > 0) nm = nm.Substring(0, j); }
                     Add(f, "svchost ServiceDll", nm, pr[1], pr[0], "SUSPECT", 0, pr[0], "ServiceDll", null);
                 }
+            if (cutWalk) cut.Add("ServiceDll");
             // LSA authentication/security/notification packages (DLLs loaded by lsass)
             string lsa = CCS + "\\Control\\Lsa";
             string[] lsaVals = { "Authentication Packages", "Security Packages", "Notification Packages" };

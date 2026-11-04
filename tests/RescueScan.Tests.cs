@@ -8,6 +8,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using Microsoft.Win32;
 
@@ -36,6 +38,7 @@ namespace RescueScan.Tests
                 Run("Subkeys: full paths with the caller's root spelling", SubkeysPaths);
                 Run("Pairs: descendants only, nested, data", PairsNested);
                 Run("Pairs: depth bound", PairsDepth);
+                Run("Pairs: fair share - a padded sibling cannot hide later keys; truncation reported", PairsFairShare);
                 Run("Scan filter: AddValues keeps (x)/REG_x/trail /q\"uote, skips default", ScanFilterAddValues);
                 Run("Scan filter: AddValuesRisk keeps (x)/REG_x", ScanFilterAddValuesRisk);
                 Run("Scan filter: class hijack looks only at the default value", ScanFilterClassHijack);
@@ -55,6 +58,7 @@ namespace RescueScan.Tests
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
                 Run("Pairs/DeleteKey: registry symbolic links are not followed [win]", LinksWin);
                 Run("Export: exit code AND file [win]", ExportWin);
+                Run("Values/Pairs: a key with a deny-ACL is noted, not silently skipped [win]", DeniedWin);
             }
             finally
             {
@@ -361,8 +365,10 @@ namespace RescueScan.Tests
             using (RegistryKey k = Make("ifeo\\b.exe")) k.SetValue("GlobalFlag", 512, RegistryValueKind.DWord);
             using (RegistryKey k = Make("ifeo\\b.exe\\deep\\deeper")) k.SetValue("Debugger", new string[] { "x", "y" }, RegistryValueKind.MultiString);
             using (RegistryKey k = Make("ifeo\\c.exe")) k.SetValue("Debugger", 5, RegistryValueKind.DWord);
-            List<string[]> p = Reg.Pairs(Root + "\\ifeo", "Debugger");
+            bool cut;
+            List<string[]> p = Reg.Pairs(Root + "\\ifeo", "Debugger", out cut);
             Eq(3, p.Count, "descendants with the value (the start key itself is excluded)");
+            True(!cut, "small tree: not truncated");
             Dictionary<string, string> m = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (string[] x in p) m[x[0]] = x[1];
             Eq("C:\\evil.exe", m.ContainsKey(Root + "\\ifeo\\a.exe") ? m[Root + "\\ifeo\\a.exe"] : null, "a.exe");
@@ -381,9 +387,41 @@ namespace RescueScan.Tests
                 if (i == Reg.PairsMaxDepth || i == Reg.PairsMaxDepth + 1) cur.SetValue("ImagePath", "level" + i);
             }
             cur.Close();
-            List<string[]> p = Reg.Pairs(Root + "\\depth", "ImagePath");
+            bool cut;
+            List<string[]> p = Reg.Pairs(Root + "\\depth", "ImagePath", out cut);
             Eq(1, p.Count, "only keys within PairsMaxDepth levels");
             Eq("level" + Reg.PairsMaxDepth, p[0][1], "deepest allowed level found");
+            True(cut, "the depth bound is reported as truncation");
+        }
+
+        // A sibling with more descendants than the whole budget, sorted (or enumerated) first, must not hide the keys
+        // after it: every child's own value is read first, and each subtree gets only a fair share of the budget.
+        static void PairsFairShare()
+        {
+            int oldMax = Reg.PairsMaxKeys, oldShare = Reg.PairsMinShare;
+            try
+            {
+                Reg.PairsMaxKeys = 100; Reg.PairsMinShare = 10;   // the app uses 250000 / 50000
+                using (RegistryKey b = HKCU())
+                    for (int j = 0; j < 3; j++)
+                        using (RegistryKey s = b.CreateSubKey(Sub + "\\fair\\Services\\aa" + j))
+                            for (int i = 0; i < 60; i++) s.CreateSubKey("k" + i).Close();
+                using (RegistryKey k = Make("fair\\Services\\evilsvc")) k.SetValue("ImagePath", "C:\\Windows\\Temp\\x.exe -enc AAAA");
+                using (RegistryKey k = Make("fair\\Services\\zz\\Parameters")) k.SetValue("ServiceDll", "C:\\Windows\\Temp\\y.dll");
+                bool cut;
+                List<string[]> p = Reg.Pairs(Root + "\\fair\\Services", "ImagePath", out cut);
+                Eq(1, p.Count, "depth-1 value next to 180 padding keys found (budget 100)");
+                True(p[0][0].EndsWith("\\evilsvc", StringComparison.OrdinalIgnoreCase), "evilsvc: " + p[0][0]);
+                True(cut, "budget exhausted -> truncation reported");
+                p = Reg.Pairs(Root + "\\fair\\Services", "ServiceDll", out cut);
+                Eq(1, p.Count, "depth-2 value of the last service still found (fair share)");
+                True(cut, "truncation reported");
+                Reg.PairsMaxKeys = oldMax; Reg.PairsMinShare = oldShare;
+                p = Reg.Pairs(Root + "\\fair\\Services", "ServiceDll", out cut);
+                Eq(1, p.Count, "real bounds: found");
+                True(!cut, "real bounds: 186 keys are not truncated");
+            }
+            finally { Reg.PairsMaxKeys = oldMax; Reg.PairsMinShare = oldShare; }
         }
 
         // ------------------------------------------------------------------ scan-side filters
@@ -730,6 +768,42 @@ namespace RescueScan.Tests
             True(!Reg.KeyExists(Root + "\\lnk\\holder"), "holder gone");
             True(Reg.KeyExists(Root + "\\lnk\\target\\child"), "link target's subtree untouched");
             Eq("T", Find(Reg.Values(Root + "\\lnk\\target"), "Debugger")[1], "link target's values untouched");
+        }
+
+        // A key whose DACL denies reading: Values/Pairs see nothing (like reg.exe did), but the key is noted for the scan.
+        static void DeniedWin()
+        {
+            WindowsOnly();
+            using (RegistryKey k = Make("deny\\locked")) k.SetValue("ImagePath", "C:\\Windows\\Temp\\x.exe");
+            SecurityIdentifier me = WindowsIdentity.GetCurrent().User;
+            RegistryAccessRule rule = new RegistryAccessRule(me, RegistryRights.QueryValues | RegistryRights.EnumerateSubKeys, AccessControlType.Deny);
+            using (RegistryKey b = HKCU())
+            using (RegistryKey k = b.OpenSubKey(Sub + "\\deny\\locked", RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.ReadPermissions | RegistryRights.ChangePermissions))
+            {
+                RegistrySecurity s = k.GetAccessControl();
+                s.AddAccessRule(rule);
+                k.SetAccessControl(s);
+            }
+            try
+            {
+                Reg.TakeDenied();
+                Eq(0, Reg.Values(Root + "\\deny\\locked").Count, "unreadable key -> no values");
+                bool cut;
+                Eq(0, Reg.Pairs(Root + "\\deny", "ImagePath", out cut).Count, "Pairs: unreadable child -> nothing");
+                List<string> d = Reg.TakeDenied();
+                True(d.Contains(Root + "\\deny\\locked"), "noted as denied: " + string.Join(" | ", d.ToArray()));
+                Eq(0, Reg.TakeDenied().Count, "TakeDenied starts a new list");
+            }
+            finally
+            {
+                using (RegistryKey b = HKCU())   // the owner may always change the DACL: undo, so the cleanup can delete it
+                using (RegistryKey k = b.OpenSubKey(Sub + "\\deny\\locked", RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.ReadPermissions | RegistryRights.ChangePermissions))
+                {
+                    RegistrySecurity s = k.GetAccessControl();
+                    s.RemoveAccessRule(rule);
+                    k.SetAccessControl(s);
+                }
+            }
         }
 
         static void ExportWin()
