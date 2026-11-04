@@ -3168,22 +3168,7 @@ namespace RescueScan
                 string name = tu[0];
                 string U = tu[1];
                 if (U.Length == 0) continue;   // hive not available
-                AddValues(f, "Run [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-                AddValues(f, "RunOnce [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
-                AddValuesRisk(f, "Policies Run [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", "SUSPECT");
-                string usf = U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders";
-                foreach (string[] v in Reg.Values(usf))
-                    if (v[0].Equals("Startup", StringComparison.OrdinalIgnoreCase) && v[1].IndexOf("Startup", StringComparison.OrdinalIgnoreCase) < 0)
-                        Add(f, "Startup redirect [" + name + "]", v[0], v[1], usf, "SUSPECT", 0, usf, v[0], null);
-                string uw = U + "\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
-                foreach (string[] v in Reg.Values(uw))
-                    if (v[0].Equals("Load", StringComparison.OrdinalIgnoreCase) || v[0].Equals("Run", StringComparison.OrdinalIgnoreCase))
-                        Add(f, "Win Load/Run [" + name + "]", v[0], v[1], uw, "SUSPECT", 0, uw, v[0], null);
-                // desktop wallpaper (for "effects"/hijacked desktop)
-                string dk = U + "\\Control Panel\\Desktop";
-                foreach (string[] v in Reg.Values(dk))
-                    if (v[0].Equals("Wallpaper", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
-                        Add(f, "Обои [" + name + "]", v[0], v[1], dk, "REVIEW", 0, dk, v[0], null);
+                ScanUserHive(f, name, U);
             }
 
             // ---- Filesystem: Startup folders ----
@@ -3556,6 +3541,68 @@ namespace RescueScan
             }
         }
 
+        // One user hive (NTUSER.DAT mounted at U). Per-user shell / logon hooks that are absent on a clean profile
+        // (research coverage-gaps #7-9, #25): HKCU Winlogon Shell/Userinit/Taskman and Policies\System\Shell override
+        // the machine shell (winlocker classic) - deleting the value lets the HKLM default apply; HKCU cmd AutoRun runs
+        // in every cmd.exe; Environment\UserInitMprLogonScript runs at logon; the screensaver is REVIEW unless it is
+        // a System32 .scr (clean) or suspicious.
+        internal static void ScanUserHive(List<Finding> f, string name, string U)
+        {
+            AddValues(f, "Run [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+            AddValues(f, "RunOnce [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+            AddValuesRisk(f, "Policies Run [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", "SUSPECT");
+            string usf = U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders";
+            foreach (string[] v in Reg.Values(usf))
+                if (v[0].Equals("Startup", StringComparison.OrdinalIgnoreCase) && v[1].IndexOf("Startup", StringComparison.OrdinalIgnoreCase) < 0)
+                    Add(f, "Startup redirect [" + name + "]", v[0], v[1], usf, "SUSPECT", 0, usf, v[0], null);
+            string uw = U + "\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
+            foreach (string[] v in Reg.Values(uw))
+                if ((v[0].Equals("Load", StringComparison.OrdinalIgnoreCase) || v[0].Equals("Run", StringComparison.OrdinalIgnoreCase)) && v[1].Trim().Length > 0)
+                    Add(f, "Win Load/Run [" + name + "]", v[0], v[1], uw, "SUSPECT", 0, uw, v[0], null);
+            // desktop wallpaper (for "effects"/hijacked desktop)
+            string dk = U + "\\Control Panel\\Desktop";
+            foreach (string[] v in Reg.Values(dk))
+                if (v[0].Equals("Wallpaper", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
+                    Add(f, "Обои [" + name + "]", v[0], v[1], dk, "REVIEW", 0, dk, v[0], null);
+            string uwl = U + "\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
+            foreach (string[] v in Reg.Values(uwl))
+                if ((v[0].Equals("Shell", StringComparison.OrdinalIgnoreCase) || v[0].Equals("Userinit", StringComparison.OrdinalIgnoreCase)
+                    || v[0].Equals("Taskman", StringComparison.OrdinalIgnoreCase)) && v[1].Trim().Length > 0)
+                    Add(f, "Winlogon " + v[0] + " [" + name + "]", v[0], v[1], uwl, "SUSPECT", 0, uwl, v[0], null);
+            string ups = U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
+            foreach (string[] v in Reg.Values(ups))
+                if (v[0].Equals("Shell", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
+                    Add(f, "Policies Shell [" + name + "]", v[0], v[1], ups, "SUSPECT", 0, ups, v[0], null);
+            string ucp = U + "\\Software\\Microsoft\\Command Processor";
+            foreach (string[] v in Reg.Values(ucp))
+                if (v[0].Equals("AutoRun", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
+                    Add(f, "cmd AutoRun [" + name + "]", v[0], v[1], ucp, "SUSPECT", 0, ucp, v[0], null);
+            string env = U + "\\Environment";
+            foreach (string[] v in Reg.Values(env))
+                if (v[0].Equals("UserInitMprLogonScript", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
+                    Add(f, "Logon script [" + name + "]", v[0], v[1], env, "SUSPECT", 0, env, v[0], null);
+            foreach (string sk in new string[] { U + "\\Control Panel\\Desktop", U + "\\Software\\Policies\\Microsoft\\Windows\\Control Panel\\Desktop" })
+                foreach (string[] v in Reg.Values(sk))
+                    if (v[0].Equals("SCRNSAVE.EXE", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
+                    {
+                        string r = ScreensaverRisk(v[1]);
+                        Add(f, "Заставка [" + name + "]", v[0], v[1], sk, r, 0, sk, v[0], null);
+                    }
+        }
+
+        // a .scr in System32 / SysWOW64 (or a bare name, loaded from there) = ""; in a user-writable folder (profile,
+        // ProgramData: the Gazer trick) or otherwise suspicious = SUSPECT; elsewhere (vendor saver) REVIEW
+        internal static string ScreensaverRisk(string data)
+        {
+            string n = Heur.NormPath(data);
+            List<string> t = Heur.Tokens(n);
+            string img = t.Count > 0 ? t[0] : "";
+            if (img.EndsWith(".scr") && (img.IndexOf('\\') < 0 || Heur.SysDir(img))) return "";
+            if (n.Contains("\\users\\") || n.Contains("\\programdata\\") || n.Contains("\\appdata\\")) return "SUSPECT";
+            string r = Risk(Regex.Replace(data, @"\.scr\b", ".exe", RegexOptions.IgnoreCase));   // any .scr is SUSPECT for Risk()
+            return r == "SUSPECT" ? r : "REVIEW";
+        }
+
         // Value names are exact; only the real unnamed default value ("") is skipped, so names such as "(x)" or
         // "REG_x" are scanned too. internal static: called by tests.
         internal static void AddValues(List<Finding> f, string cat, string key)
@@ -3604,6 +3651,10 @@ namespace RescueScan
         {
             // Policies are shared between the 64- and 32-bit views (research windows-semantics Q4): only the native key counts
             AddValuesRisk(f, "Policies Explorer Run", SOFT + "\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", "SUSPECT");
+            string pss = SOFT + "\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";   // "Custom User Interface" (absent by default)
+            foreach (string[] v in Reg.Values(pss))
+                if (v[0].Equals("Shell", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
+                    Add(f, "Policies Shell (HKLM)", v[0], v[1], pss, "SUSPECT", 0, pss, v[0], null);
             string[] roots = { SOFT, SOFT + "\\Wow6432Node" };
             foreach (string R in roots)
             {

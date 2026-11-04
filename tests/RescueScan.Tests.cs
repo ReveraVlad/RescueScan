@@ -91,6 +91,7 @@ namespace RescueScan.Tests
                 Run("Control set: Select\\Default, fallbacks, warnings", ControlSetCases);
                 Run("Session Manager extras + AppCertDlls key; Policies Run once", SessionMgrExtraCases);
                 Run("Services/ServiceDll listing + Active Setup built-ins", ServiceAndActiveSetupCases);
+                Run("User hive: per-user shell, cmd AutoRun, logon script, screensaver", UserHiveCases);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
                 Run("Pairs/DeleteKey: registry symbolic links are not followed [win]", LinksWin);
@@ -2147,6 +2148,41 @@ namespace RescueScan.Tests
             int clean2 = 0, rev = 0;
             foreach (Finding x in f) if (x.Category == "Active Setup") { if (x.Risk == "") clean2++; else if (x.Risk == "REVIEW") rev++; }
             Eq(1, clean2, "Themes Setup row clean"); Eq(1, rev, "unknown component REVIEW");
+        }
+
+        // Per-user hive: a clean profile (OneDrive in Run, Wallpaper, a System32 screensaver, empty Load) has no
+        // SUSPECT row; HKCU Winlogon Shell, Policies\System\Shell, cmd AutoRun, logon script are SUSPECT value rows.
+        static void UserHiveCases()
+        {
+            using (RegistryKey k = Make("u1\\Software\\Microsoft\\Windows\\CurrentVersion\\Run")) k.SetValue("OneDrive", "\"C:\\Users\\V\\AppData\\Local\\Microsoft\\OneDrive\\OneDrive.exe\" /background");
+            using (RegistryKey k = Make("u1\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows")) k.SetValue("Load", "");
+            using (RegistryKey k = Make("u1\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon")) { k.SetValue("ExcludeProfileDirs", "AppData\\Local"); k.SetValue("BuildNumber", 19045); }
+            using (RegistryKey k = Make("u1\\Control Panel\\Desktop")) { k.SetValue("Wallpaper", "C:\\Windows\\web\\wallpaper\\Windows\\img0.jpg"); k.SetValue("SCRNSAVE.EXE", "C:\\Windows\\system32\\Mystify.scr"); }
+            using (RegistryKey k = Make("u1\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders")) k.SetValue("Startup", "%USERPROFILE%\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup", RegistryValueKind.ExpandString);
+            List<Finding> f = new List<Finding>();
+            MainForm.ScanUserHive(f, "V", Root + "\\u1");
+            foreach (Finding x in f) True(x.Risk != "SUSPECT", "clean profile: " + x.Category + " " + x.Value);
+            Eq("", FindName(f, "SCRNSAVE.EXE").Risk, "System32 screensaver clean");
+            using (RegistryKey k = Make("u2\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon")) k.SetValue("shell", "explorer.exe,%APPDATA%\\msconfig.dat");
+            using (RegistryKey k = Make("u2\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System")) { k.SetValue("Shell", "C:\\ProgramData\\lock.exe"); k.SetValue("DisableTaskMgr", 1); }
+            using (RegistryKey k = Make("u2\\Software\\Microsoft\\Command Processor")) k.SetValue("AutoRun", "C:\\ProgramData\\x.bat");
+            using (RegistryKey k = Make("u2\\Environment")) { k.SetValue("UserInitMprLogonScript", "C:\\Users\\V\\x.bat"); k.SetValue("TEMP", "%USERPROFILE%\\AppData\\Local\\Temp"); }
+            using (RegistryKey k = Make("u2\\Control Panel\\Desktop")) k.SetValue("SCRNSAVE.EXE", "C:\\Users\\V\\AppData\\Roaming\\x.scr");
+            using (RegistryKey k = Make("u2\\Software\\Policies\\Microsoft\\Windows\\Control Panel\\Desktop")) k.SetValue("SCRNSAVE.EXE", "D:\\Saver\\nice.scr ");
+            f.Clear();
+            MainForm.ScanUserHive(f, "V", Root + "\\u2");
+            Finding sh = FindName(f, "shell");
+            True(sh != null && sh.Risk == "SUSPECT" && sh.Kind == 0 && sh.DelName == "shell", "HKCU Winlogon Shell: SUSPECT, delete the override value");
+            Finding ps = null; foreach (Finding x in f) if (x.Category.StartsWith("Policies Shell")) ps = x;
+            True(ps != null && ps.Risk == "SUSPECT", "Policies\\System\\Shell");
+            Eq("SUSPECT", FindName(f, "AutoRun").Risk, "HKCU cmd AutoRun");
+            Eq("SUSPECT", FindName(f, "UserInitMprLogonScript").Risk, "logon script");
+            int scr = 0; foreach (Finding x in f) if (x.Name == "SCRNSAVE.EXE") { scr++; True(x.Risk == "SUSPECT" || x.Risk == "REVIEW", "screensaver listed"); }
+            Eq(2, scr, "both screensaver values");
+            Eq("REVIEW", MainForm.ScreensaverRisk("D:\\Saver\\nice.scr"), "outside System32 but no other sign: REVIEW");
+            Eq("SUSPECT", MainForm.ScreensaverRisk("C:\\Users\\V\\AppData\\Roaming\\x.scr"), "profile .scr");
+            Eq("", MainForm.ScreensaverRisk("scrnsave.scr"), "bare name");
+            Eq(4 + 2, f.Count, "no other rows (TEMP, DisableTaskMgr not listed here)");
         }
     }
 }
