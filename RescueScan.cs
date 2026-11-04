@@ -748,6 +748,148 @@ namespace RescueScan
         public override string ToString() { return WinDir + (Live ? " (живая — эта ОС)" : " (офлайн)"); }
     }
 
+    // reg.exe-style runner: exit code; outp = stdout (+ stderr on failure). Injectable so tests can simulate reg.exe.
+    internal delegate int ToolRunner(string args, out string outp);
+
+    // Bookkeeping of the hives RescueScan mounts under HKLM: RS_SOFT, RS_SYS and RS_U<n>. Only the instance that holds
+    // the mount role (MainForm.OtherInstanceAlive() == false) mounts or unloads anything, so every RS_* mount this
+    // instance did not make is stale (crashed / killed earlier run) and may be unloaded - and no instance can pull a
+    // hive from under another one. reg.exe, the registry / file probes, the HKLM listing and the instance check are
+    // injected: tests simulate them without Windows.
+    class HiveMounts
+    {
+        internal const int MaxUserMounts = 1000;   // RS_U0 .. RS_U999
+        internal const string OtherInstanceMsg = "запущен другой RescueScan — кусты монтирует только он: закрой его окно и нажми «Сканировать» ещё раз. ";
+        internal readonly List<string> Mounted = new List<string>();   // names WE loaded + stale ones that refused to unload (retried)
+        readonly ToolRunner reg;
+        readonly Predicate<string> keyExists, fileExists;
+        readonly Func<string[]> hklmNames;
+        readonly Func<bool> otherInstance;
+
+        internal HiveMounts(ToolRunner reg, Predicate<string> keyExists, Predicate<string> fileExists, Func<string[]> hklmNames, Func<bool> otherInstance)
+        {
+            this.reg = reg; this.keyExists = keyExists; this.fileExists = fileExists; this.hklmNames = hklmNames; this.otherInstance = otherInstance;
+        }
+
+        // RS_SOFT, RS_SYS, RS_U<digits> (any case): the names RescueScan mounts at.
+        internal static bool IsOurName(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return false;
+            if (n.Equals("RS_SOFT", StringComparison.OrdinalIgnoreCase) || n.Equals("RS_SYS", StringComparison.OrdinalIgnoreCase)) return true;
+            if (n.Length < 5 || !n.StartsWith("RS_U", StringComparison.OrdinalIgnoreCase)) return false;
+            for (int i = 4; i < n.Length; i++) if (n[i] < '0' || n[i] > '9') return false;
+            return true;
+        }
+
+        bool Has(string name)
+        {
+            foreach (string m in Mounted) if (m.Equals(name, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        // " (reg.exe's message)" for a warning; a reason already in the warning is not repeated for every hive.
+        static string Why(int rc, string o, StringBuilder warn)
+        {
+            string m = Reg.OneLine((o ?? "").Replace(Reg.RegToolsHint, ""), 200);
+            if ((o ?? "").Contains(Reg.RegToolsHint) && warn.ToString().IndexOf(Reg.RegToolsHint, StringComparison.Ordinal) < 0)
+                warn.Append(Reg.RegToolsHint + " ");
+            if (m.Length == 0) return rc != 0 ? " (код " + rc + ")" : "";
+            return warn.ToString().IndexOf(m, StringComparison.Ordinal) >= 0 ? " (та же причина)" : " (" + m + ")";
+        }
+
+        // reg unload HKLM\<name>. null = gone afterwards; else " (reason)".
+        string Unload(string name, StringBuilder warn)
+        {
+            string o;
+            int rc = reg("unload " + Reg.QuoteArg("HKLM\\" + name), out o);
+            if (!keyExists("HKLM\\" + name)) return null;
+            return Why(rc, o, warn);
+        }
+
+        // Unloads EVERY RS_* mount left by a crashed or killed earlier run - also names this run will not reuse (RS_U7
+        // when only two profiles are mounted now). One that cannot be unloaded is reported by name and kept in Mounted:
+        // retried on rescan / exit, and never used as a target. Nothing is touched while another instance holds the
+        // mount role (they are its mounts).
+        internal void CleanupStale(StringBuilder warn)
+        {
+            string[] names;
+            try { names = hklmNames(); } catch { return; }
+            foreach (string n in names)
+            {
+                if (!IsOurName(n) || Has(n)) continue;
+                if (otherInstance()) return;
+                string why = Unload(n, warn);
+                if (why == null) warn.Append("выгружен старый HKLM\\" + n + " (от прошлого запуска). ");
+                else { warn.Append("HKLM\\" + n + " остался от прошлого запуска и не выгружается" + why + ". "); Mounted.Add(n); }
+            }
+        }
+
+        // Mounts 'file' at HKLM\<name>: 0 = mounted, 1 = failed, 2 = the name is held (another instance has the mount role,
+        // or an old mount there cannot be unloaded). A failed mount is never pretended to have worked.
+        internal int Mount(string name, string file, StringBuilder warn)
+        {
+            string p = "HKLM\\" + name, o;
+            if (otherInstance())
+            {
+                if (warn.ToString().IndexOf(OtherInstanceMsg, StringComparison.Ordinal) < 0) warn.Append(OtherInstanceMsg);
+                return 2;
+            }
+            if (!fileExists(file)) { warn.Append("нет файла " + file + ". "); return 1; }   // reg load would CREATE an empty hive
+            if (keyExists(p))
+            {
+                string why = Unload(name, warn);
+                if (why != null)
+                {
+                    warn.Append(p + " занят старым монтированием (прошлый запуск? regedit?) и не выгружается" + why + ". ");
+                    if (!Has(name)) Mounted.Add(name);   // retried on rescan / exit
+                    return 2;
+                }
+                Mounted.RemoveAll(delegate(string m) { return m.Equals(name, StringComparison.OrdinalIgnoreCase); });
+                warn.Append("выгружен старый " + p + ". ");
+            }
+            int rc = reg("load " + Reg.QuoteArg(p) + " " + Reg.QuoteArg(file), out o);
+            if (rc != 0 || !keyExists(p)) { warn.Append("не смонтирован " + file + Why(rc, o, warn) + ". "); return 1; }
+            Mounted.Add(name);
+            return 0;
+        }
+
+        // Mounts a user hive at the next free HKLM\RS_U<n> (names held by a stale mount are skipped). Returns the root, or
+        // "" and counts it in 'failed' (also when all MaxUserMounts names are used up: never silently unscanned).
+        internal string MountUser(string file, StringBuilder warn, ref int next, ref int failed)
+        {
+            while (next < MaxUserMounts)
+            {
+                string name = "RS_U" + next++;
+                if (Has(name) || keyExists("HKLM\\" + name)) continue;
+                if (Mount(name, file, warn) == 0) return "HKLM\\" + name;
+                failed++;
+                return "";
+            }
+            failed++;
+            return "";
+        }
+
+        // Unloads everything in Mounted. "" = all gone; else a Russian description of what stays mounted (kept in Mounted:
+        // retried on the next rescan and on exit).
+        internal string UnloadAll()
+        {
+            if (Mounted.Count == 0) return "";
+            GC.Collect(); GC.WaitForPendingFinalizers();   // a leaked RegistryKey handle into a hive would block the unload
+            List<string> still = new List<string>();
+            StringBuilder why = new StringBuilder();
+            foreach (string m in Mounted)
+            {
+                string w = Unload(m, why);
+                if (w == null) continue;
+                still.Add(m);
+                if (why.Length == 0) why.Append(w);
+            }
+            Mounted.Clear(); Mounted.AddRange(still);
+            if (still.Count == 0) return "";
+            return "не выгружено: HKLM\\" + string.Join(", HKLM\\", still.ToArray()) + why + " (закрой regedit и повтори)";
+        }
+    }
+
     class MainForm : Form
     {
         ComboBox cboWin;
@@ -757,7 +899,8 @@ namespace RescueScan
         TabControl tabs;
         ListView lvProc; Label lblProc;
         ListView lvFiles; TextBox txtPath; Label lblFiles;
-        List<string> mounted = new List<string>();     // hives WE loaded under HKLM (e.g. RS_SOFT): unloaded on rescan / exit
+        // hives WE mounted under HKLM (RS_SOFT, RS_SYS, RS_U<n>): unloaded on rescan / exit
+        HiveMounts mounts = new HiveMounts(Reg.RunCode, Reg.KeyExists, File.Exists, delegate { return Reg.SubkeyNames("HKLM"); }, OtherInstanceAlive);
         // ---- scan target: ONE source of truth for the scan AND every repair/unlock/assoc/IFEO/policy action ----
         bool tgtReady = false;       // prepared by Scan (or by the first action before any scan)
         bool tgtLive = false;        // the target is the running OS (live registry)
@@ -765,8 +908,10 @@ namespace RescueScan
         string tgtSoft = "";         // SOFTWARE root: HKLM\RS_SOFT (offline) / HKLM\SOFTWARE (live); "" = not available
         string tgtSys = "";          // SYSTEM root:   HKLM\RS_SYS  (offline) / HKLM\SYSTEM   (live); "" = not available
         List<string[]> tgtUsers = new List<string[]>();   // {name, hive root (HKLM\RS_U<n> / HKU\<SID>) or "", profile dir}
-        // Held while a RescueScan GUI runs: an RS_* mount found at start is stale (crashed run) only if no other
-        // instance is alive; a live instance's mounts must not be unloaded and replaced under its feet.
+        // The MOUNT ROLE: only the RescueScan GUI that holds this mutex mounts or unloads hives (HiveMounts). A second
+        // instance never does, so the holder may treat every RS_* mount it did not make as stale, and neither instance
+        // can unload or replace a hive the other one is using. A second instance takes the role over once the holder
+        // has exited (released or abandoned mutex). UI thread only: a mutex belongs to the thread that acquired it.
         static Mutex instanceMutex;
         static bool otherInstance = true;
 
@@ -775,10 +920,14 @@ namespace RescueScan
             if (!otherInstance) return false;
             try
             {
-                if (instanceMutex == null) instanceMutex = new Mutex(false, "Global\\RescueScan_GUI");
+                if (instanceMutex == null)
+                {
+                    try { instanceMutex = new Mutex(false, "Global\\RescueScan_GUI"); }
+                    catch { instanceMutex = new Mutex(false, "Local\\RescueScan_GUI"); }   // no right to create a global one
+                }
                 otherInstance = !instanceMutex.WaitOne(0);
             }
-            catch (AbandonedMutexException) { otherInstance = false; }   // the previous GUI ended without releasing it
+            catch (AbandonedMutexException) { otherInstance = false; }   // the previous holder ended without releasing it: ours now
             catch { otherInstance = false; }
             return otherInstance;
         }
@@ -1238,51 +1387,11 @@ namespace RescueScan
         }
 
         // Unloads every hive WE mounted; the target is no longer prepared afterwards. Returns "" or a Russian description
-        // of what could NOT be unloaded (those stay in 'mounted' and are retried on the next rescan / on exit).
+        // of what could NOT be unloaded (those stay mounted and are retried on the next rescan / on exit).
         string UnloadAll()
         {
             tgtReady = false; tgtSoft = ""; tgtSys = ""; tgtUsers.Clear();
-            if (mounted.Count == 0) return "";
-            GC.Collect(); GC.WaitForPendingFinalizers();   // a leaked RegistryKey handle into a hive would block the unload
-            List<string> still = new List<string>();
-            foreach (string m in mounted)
-            {
-                string o;
-                Reg.RunCode("unload " + Reg.QuoteArg("HKLM\\" + m), out o);
-                if (Reg.KeyExists("HKLM\\" + m)) still.Add(m);
-            }
-            mounted.Clear(); mounted.AddRange(still);
-            if (still.Count == 0) return "";
-            return "не выгружено: HKLM\\" + string.Join(", HKLM\\", still.ToArray()) + " (закрой regedit и повтори)";
-        }
-
-        // Mounts a hive file at HKLM\<name>: 0 = mounted, 1 = load failed, 2 = the name is held by an older mount (crashed
-        // earlier run, regedit...) that cannot be unloaded -> the new mount is NOT pretended to have worked.
-        int MountHive(string name, string file, StringBuilder warn)
-        {
-            string p = "HKLM\\" + name, o;
-            if (!File.Exists(file)) { warn.Append("нет файла " + file + ". "); return 1; }   // reg load would CREATE an empty hive
-            if (Reg.KeyExists(p))
-            {
-                if (OtherInstanceAlive() && !mounted.Contains(name))
-                {
-                    warn.Append(p + " смонтирован другим запущенным RescueScan — закрой его и повтори. ");
-                    return 2;
-                }
-                Reg.RunCode("unload " + Reg.QuoteArg(p), out o);
-                if (Reg.KeyExists(p))
-                {
-                    warn.Append(p + " занят старым монтированием (прошлый запуск? regedit?) и не выгружается. ");
-                    if (!mounted.Contains(name)) mounted.Add(name);   // try again on exit
-                    return 2;
-                }
-                mounted.Remove(name);
-                warn.Append("выгружен старый " + p + ". ");
-            }
-            Reg.RunCode("load " + Reg.QuoteArg(p) + " " + Reg.QuoteArg(file), out o);
-            if (!Reg.KeyExists(p)) return 1;
-            mounted.Add(name);
-            return 0;
+            return mounts.UnloadAll();
         }
 
         // Prepares the target used by the scan AND by all repair actions: unloads old mounts; OFFLINE mounts SOFTWARE,
@@ -1294,31 +1403,24 @@ namespace RescueScan
             StringBuilder warn = new StringBuilder();
             string uf = UnloadAll();
             if (uf.Length > 0) warn.Append(uf + ". ");
+            mounts.CleanupStale(warn);   // ALL RS_* left by a crashed / killed earlier run, not only the names reused below
             tgtWinDir = t.WinDir; tgtLive = t.Live;
             curDrive = t.WinDir.Substring(0, 2);   // D:
             if (tgtLive) { tgtSoft = "HKLM\\SOFTWARE"; tgtSys = "HKLM\\SYSTEM"; }
             else
             {
                 string cfg = t.WinDir + "\\System32\\config";
-                if (MountHive("RS_SOFT", cfg + "\\SOFTWARE", warn) == 0) tgtSoft = "HKLM\\RS_SOFT";
+                if (mounts.Mount("RS_SOFT", cfg + "\\SOFTWARE", warn) == 0) tgtSoft = "HKLM\\RS_SOFT";
                 else warn.Append("SOFTWARE не смонтирован. ");
-                if (MountHive("RS_SYS", cfg + "\\SYSTEM", warn) == 0) tgtSys = "HKLM\\RS_SYS";
+                if (mounts.Mount("RS_SYS", cfg + "\\SYSTEM", warn) == 0) tgtSys = "HKLM\\RS_SYS";
                 else warn.Append("SYSTEM не смонтирован. ");
             }
-            int ui = 0, failed = 0;
+            int next = 0, failed = 0;
             foreach (string[] p in DiscoverProfiles())
             {
                 string root = "", nt = p[1] + "\\NTUSER.DAT";
                 if (tgtLive && p[2].Length > 0 && Reg.KeyExists("HKU\\" + p[2])) root = "HKU\\" + p[2];   // logged on: already loaded
-                else if (File.Exists(nt))
-                    while (ui < 100)
-                    {
-                        string mp = "RS_U" + ui;
-                        int r = MountHive(mp, nt, warn);
-                        if (r == 2) { ui++; continue; }   // name held by a stale mount: use the next one
-                        if (r == 0) { root = "HKLM\\" + mp; ui++; } else failed++;
-                        break;
-                    }
+                else if (File.Exists(nt)) root = mounts.MountUser(nt, warn, ref next, ref failed);
                 tgtUsers.Add(new string[] { p[0], root, p[1] });
             }
             if (failed > 0) warn.Append("не смонтировано профилей: " + failed + ". ");

@@ -50,6 +50,12 @@ namespace RescueScan.Tests
                 Run("Values: a value deleted during the read is not a hidden name", ValuesRace);
                 Run("Live mode: ProfileImagePath -> folders on the TARGET drive", ProfileDirs);
                 Run("Live mode: SamePath / WinTarget labels", LiveHelpers);
+                Run("Mounts: RS_* names", MountNames);
+                Run("Mounts: mount / missing file / file in use / unload all", MountBasic);
+                Run("Mounts: every stale RS_* cleaned up, held ones reported and skipped", MountStale);
+                Run("Mounts: old mount at the same name replaced, or the mount fails", MountSameName);
+                Run("Mounts: another instance's hives are never touched", MountOtherInstance);
+                Run("Mounts: user mount names used up -> counted as not mounted", MountUserCap);
                 Run("RunProcess: big stderr does not deadlock", ProcBigStderr);
                 Run("RunProcess: exit code + stderr on failure", ProcFailure);
                 Run("RunProcess: timeout kills the child", ProcTimeout);
@@ -658,6 +664,174 @@ namespace RescueScan.Tests
                 string w = MainForm.RunningWinDir();
                 True(w.Length > 3 && Directory.Exists(w + "\\System32"), "RunningWinDir: " + w);
             }
+        }
+
+        // ------------------------------------------------------------------ hive mount bookkeeping (simulated reg.exe)
+        // A fake HKLM with mount points, hive files, mounts that refuse to unload (regedit has them open) and hive
+        // files that cannot be loaded (in use); reg.exe "load"/"unload" are parsed with the reference argv parser.
+        class FakeReg
+        {
+            public readonly HashSet<string> Keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);    // "HKLM\RS_SOFT"
+            public readonly HashSet<string> Files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            public readonly HashSet<string> Pinned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);  // unload fails
+            public readonly HashSet<string> InUse = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // load fails
+            public readonly Dictionary<string, string> Loaded = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            public readonly List<string> Calls = new List<string>();
+            public bool Other;   // another instance holds the mount role
+
+            public int Run(string args, out string outp)
+            {
+                Calls.Add(args);
+                List<string> a = ParseArgs(args);
+                if (a.Count == 3 && a[0] == "load")
+                {
+                    if (Keys.Contains(a[1])) { outp = "ERROR: name in use"; return 1; }
+                    if (InUse.Contains(a[2])) { outp = "ERROR: The process cannot access the file because it is being used by another process."; return 1; }
+                    Keys.Add(a[1]); Loaded[a[1]] = a[2]; outp = "The operation completed successfully."; return 0;
+                }
+                if (a.Count == 2 && a[0] == "unload")
+                {
+                    if (!Keys.Contains(a[1])) { outp = "ERROR: The system was unable to find the specified registry key or value."; return 1; }
+                    if (Pinned.Contains(a[1])) { outp = "ERROR: Access is denied."; return 1; }
+                    Keys.Remove(a[1]); Loaded.Remove(a[1]); outp = "The operation completed successfully."; return 0;
+                }
+                outp = "ERROR: Invalid syntax."; return 1;
+            }
+
+            public string[] HklmNames()
+            {
+                List<string> n = new List<string> { "HARDWARE", "SAM", "SECURITY", "SOFTWARE", "SYSTEM" };
+                foreach (string k in Keys) n.Add(k.Substring(5));
+                return n.ToArray();
+            }
+
+            public HiveMounts Make()
+            {
+                return new HiveMounts(Run, delegate(string k) { return Keys.Contains(k); }, delegate(string f) { return Files.Contains(f); },
+                                      HklmNames, delegate { return Other; });
+            }
+
+            public int Count(string verb) { int n = 0; foreach (string c in Calls) if (c.StartsWith(verb + " ")) n++; return n; }
+        }
+
+        static void MountNames()
+        {
+            foreach (string n in new string[] { "RS_SOFT", "rs_soft", "RS_SYS", "RS_U0", "RS_U17", "rs_u999" })
+                True(HiveMounts.IsOurName(n), "ours: " + n);
+            foreach (string n in new string[] { "", null, "SOFTWARE", "RS_SOFTX", "RS_U", "RS_Ux", "RS_U1a", "RS_OTHER", "XRS_SOFT" })
+                True(!HiveMounts.IsOurName(n), "not ours: " + Show(n));
+        }
+
+        static void MountBasic()
+        {
+            FakeReg r = new FakeReg();
+            string soft = "D:\\Windows\\System32\\config\\SOFTWARE", sys = "D:\\Windows\\System32\\config\\SYSTEM";
+            r.Files.Add(soft);
+            HiveMounts m = r.Make();
+            StringBuilder w = new StringBuilder();
+            Eq(0, m.Mount("RS_SOFT", soft, w), "mounted");
+            Eq("load \"HKLM\\RS_SOFT\" \"D:\\Windows\\System32\\config\\SOFTWARE\"", r.Calls[0], "reg.exe arguments");
+            Eq(soft, r.Loaded["HKLM\\RS_SOFT"], "the right file");
+            Eq(1, m.Mount("RS_SYS", sys, w), "missing hive file -> failed (reg load would create an empty hive)");
+            Eq(1, r.Calls.Count, "...without running reg.exe");
+            True(w.ToString().Contains("нет файла " + sys), "reported: " + w);
+            r.Files.Add(sys); r.InUse.Add(sys);
+            Eq(1, m.Mount("RS_SYS", sys, w), "file in use -> failed");
+            True(w.ToString().Contains("being used by another process"), "reg.exe's reason in the warning: " + w);
+            True(!r.Keys.Contains("HKLM\\RS_SYS"), "nothing pretended");
+            Eq(1, m.Mounted.Count, "only RS_SOFT is ours");
+            Eq("", m.UnloadAll(), "unload all");
+            Eq(0, r.Keys.Count, "nothing left mounted");
+            Eq(0, m.Mounted.Count, "bookkeeping cleared");
+        }
+
+        // A crashed run left RS_SOFT and RS_U0..RS_U5; one of them is held open (regedit). All are cleaned up at the start,
+        // not only the names reused now; the one that stays is reported, never reused and retried on exit.
+        static void MountStale()
+        {
+            FakeReg r = new FakeReg();
+            foreach (string k in new string[] { "HKLM\\RS_SOFT", "HKLM\\RS_U0", "HKLM\\RS_U1", "HKLM\\RS_U2", "HKLM\\RS_U3", "HKLM\\RS_U4", "HKLM\\RS_U5", "HKLM\\RS_OTHER" })
+                r.Keys.Add(k);
+            r.Pinned.Add("HKLM\\RS_U3");
+            HiveMounts m = r.Make();
+            StringBuilder w = new StringBuilder();
+            m.CleanupStale(w);
+            Eq(7, r.Count("unload"), "every stale RS_* unloaded once (RS_OTHER is not ours)");
+            True(r.Keys.Contains("HKLM\\RS_OTHER") && r.Keys.Contains("HKLM\\RS_U3") && r.Keys.Count == 2, "left: RS_OTHER, RS_U3 (pinned)");
+            True(w.ToString().Contains("HKLM\\RS_U3 остался от прошлого запуска и не выгружается (ERROR: Access is denied.)"), "reported by name with the reason: " + w);
+            Eq("RS_U3", string.Join(",", m.Mounted.ToArray()), "kept for a retry on exit");
+            string[] users = { "D:\\Users\\a\\NTUSER.DAT", "D:\\Users\\b\\NTUSER.DAT", "D:\\Users\\c\\NTUSER.DAT", "D:\\Users\\d\\NTUSER.DAT" };
+            foreach (string u in users) r.Files.Add(u);
+            int next = 0, failed = 0;
+            List<string> roots = new List<string>();
+            foreach (string u in users) roots.Add(m.MountUser(u, w, ref next, ref failed));
+            Eq("HKLM\\RS_U0,HKLM\\RS_U1,HKLM\\RS_U2,HKLM\\RS_U4", string.Join(",", roots.ToArray()), "RS_U3 (held) skipped");
+            Eq(0, failed, "no failures");
+            Eq("D:\\Users\\d\\NTUSER.DAT", r.Loaded["HKLM\\RS_U4"], "the 4th profile is at RS_U4");
+            string left = m.UnloadAll();
+            True(left.StartsWith("не выгружено: HKLM\\RS_U3") && left.Contains("Access is denied"), "what stays mounted is reported: " + left);
+            Eq("RS_U3", string.Join(",", m.Mounted.ToArray()), "still retried later");
+            r.Pinned.Clear();
+            Eq("", m.UnloadAll(), "retry succeeds once regedit is closed");
+            Eq("HKLM\\RS_OTHER", string.Join(",", new List<string>(r.Keys).ToArray()), "a foreign key is never touched");
+        }
+
+        // An old mount at the very name we need: unloaded and replaced; if it cannot be unloaded the new mount fails.
+        static void MountSameName()
+        {
+            FakeReg r = new FakeReg();
+            string soft = "E:\\Windows\\System32\\config\\SOFTWARE", sys = "E:\\Windows\\System32\\config\\SYSTEM";
+            r.Files.Add(soft); r.Files.Add(sys);
+            r.Keys.Add("HKLM\\RS_SOFT"); r.Loaded["HKLM\\RS_SOFT"] = "D:\\Windows\\System32\\config\\SOFTWARE";
+            r.Keys.Add("HKLM\\RS_SYS"); r.Pinned.Add("HKLM\\RS_SYS");
+            HiveMounts m = r.Make();
+            StringBuilder w = new StringBuilder();
+            Eq(0, m.Mount("RS_SOFT", soft, w), "stale mount replaced");
+            Eq(soft, r.Loaded["HKLM\\RS_SOFT"], "now the selected installation's hive");
+            True(w.ToString().Contains("выгружен старый HKLM\\RS_SOFT"), "reported: " + w);
+            Eq(2, m.Mount("RS_SYS", sys, w), "held name -> 2, not pretended");
+            True(w.ToString().Contains("HKLM\\RS_SYS занят старым монтированием") && w.ToString().Contains("Access is denied"), "reported: " + w);
+            Eq(0, r.Count("load \"HKLM\\RS_SYS\""), "no load attempted over it");
+            True(m.Mounted.Contains("RS_SYS"), "retried on exit");
+        }
+
+        // While another instance holds the mount role nothing is mounted or unloaded: its hives stay its own.
+        static void MountOtherInstance()
+        {
+            FakeReg r = new FakeReg();
+            r.Other = true;
+            string soft = "D:\\Windows\\System32\\config\\SOFTWARE", nt = "D:\\Users\\a\\NTUSER.DAT";
+            r.Files.Add(soft); r.Files.Add(nt);
+            r.Keys.Add("HKLM\\RS_SOFT"); r.Keys.Add("HKLM\\RS_U0");
+            HiveMounts m = r.Make();
+            StringBuilder w = new StringBuilder();
+            m.CleanupStale(w);
+            Eq(2, m.Mount("RS_SOFT", soft, w), "refused");
+            Eq(2, m.Mount("RS_SYS", soft, w), "refused");
+            int next = 0, failed = 0;
+            Eq("", m.MountUser(nt, w, ref next, ref failed), "user hive refused");
+            Eq(1, failed, "counted as not mounted");
+            Eq(0, r.Calls.Count, "reg.exe never ran");
+            Eq(2, r.Keys.Count, "the other instance's mounts untouched");
+            string msg = w.ToString();
+            Eq(msg.IndexOf(HiveMounts.OtherInstanceMsg), msg.LastIndexOf(HiveMounts.OtherInstanceMsg), "explained once");
+            True(msg.Contains(HiveMounts.OtherInstanceMsg), "explained: " + msg);
+            Eq("", m.UnloadAll(), "nothing of ours to unload");
+            Eq(2, r.Keys.Count, "...and nothing unloaded");
+        }
+
+        // Every user mount name used up: the rest is counted as not mounted (was: silently left unscanned after 100).
+        static void MountUserCap()
+        {
+            FakeReg r = new FakeReg();
+            for (int i = 0; i < HiveMounts.MaxUserMounts; i++) r.Keys.Add("HKLM\\RS_U" + i);   // every name held
+            HiveMounts m = r.Make();
+            r.Files.Add("D:\\Users\\z\\NTUSER.DAT");
+            StringBuilder w = new StringBuilder();
+            int next = 0, failed = 0;
+            Eq("", m.MountUser("D:\\Users\\z\\NTUSER.DAT", w, ref next, ref failed), "no free name");
+            Eq(1, failed, "counted");
+            Eq(0, r.Calls.Count, "held names are skipped, not unloaded");
         }
 
         // ------------------------------------------------------------------ processes
