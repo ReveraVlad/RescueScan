@@ -1075,6 +1075,15 @@ namespace RescueScan.Tests
             e.RootKind = "SYSTEM";
             Eq("HKLM\\SYSTEM", MainForm.Resolve(e, "HKLM\\SOFTWARE", "HKLM\\SYSTEM", live), "SYSTEM live");
             Eq("", MainForm.Resolve(e, "HKLM\\RS_SOFT", "", users), "SYSTEM not mounted");
+            List<string[]> none = new List<string[]>();
+            True(MainForm.Locate("HKU\\S-1-5-21-9-9-9-1005\\Software\\x", "HKLM\\SOFTWARE", "HKLM\\SYSTEM", none, out kind, out uid, out rel, out rr, out phys), "live: any loaded user hive");
+            Eq("S-1-5-21-9-9-9-1005|Software\\x|HKEY_USERS\\S-1-5-21-9-9-9-1005", uid + "|" + rel + "|" + rr, "live user parts");
+            True(!MainForm.Locate("HKU\\S-1-5-21-9-9-9-1005_Classes\\x", "HKLM\\SOFTWARE", "HKLM\\SYSTEM", none, out kind, out uid, out rel, out rr, out phys), "_Classes hive is not a user hive");
+            True(!MainForm.Locate("HKU\\S-1-5-21-9-9-9-1005\\x", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", none, out kind, out uid, out rel, out rr, out phys), "offline: a live HKU hive is not the target");
+            True(!MainForm.Locate("HKCU\\Software\\x", "HKLM\\SOFTWARE", "HKLM\\SYSTEM", none, out kind, out uid, out rel, out rr, out phys), "HKCU spelling is not mapped");
+            e.RootKind = "USER"; e.UserId = "S-1-5-21-9-9-9-1005";
+            Eq("HKU\\S-1-5-21-9-9-9-1005", MainForm.Resolve(e, "HKLM\\SOFTWARE", "HKLM\\SYSTEM", none), "live restore into the loaded hive");
+            Eq("", MainForm.Resolve(e, "HKLM\\RS_SOFT", "HKLM\\RS_SYS", none), "offline: not mounted");
             Eq("1A2B3C4D\\WINDOWS", MainForm.InstallId("D:\\Windows", "1A2B3C4D"), "install id: serial + folder, not the letter");
             Eq(MainForm.InstallId("D:\\Windows", "1A2B3C4D"), MainForm.InstallId("C:\\WINDOWS", "1A2B3C4D"), "same installation seen as D: in WinPE and C: live");
             Eq("D:\\WINDOWS", MainForm.InstallId("D:\\Windows", ""), "no serial: path");

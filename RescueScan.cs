@@ -3456,8 +3456,23 @@ namespace RescueScan
                         regRoot = sid.Length > 0 ? "HKEY_USERS\\" + sid : FullRoot(u[1]);
                         break;
                     }
+            if (kind.Length == 0 && soft == "HKLM\\SOFTWARE" && key.StartsWith("HKU\\", StringComparison.OrdinalIgnoreCase))
+            {
+                // live target: a loaded user hive that is not one of the scanned profiles (e.g. a user whose profile
+                // folder is elsewhere): identified by its SID
+                string sid = key.Substring(4).Split('\\')[0];
+                if (UserSid(sid)) { kind = "USER"; uid = sid; phys = "HKU\\" + sid; regRoot = "HKEY_USERS\\" + sid; }
+            }
             if (kind.Length == 0) return false;
             rel = key.Length > phys.Length ? key.Substring(phys.Length + 1) : "";
+            return true;
+        }
+
+        // S-1-5-21-... (local / domain) or S-1-12-1-... (Azure AD) user SID, not a *_Classes hive
+        internal static bool UserSid(string sid)
+        {
+            if (string.IsNullOrEmpty(sid) || !(sid.StartsWith("S-1-5-21-", StringComparison.OrdinalIgnoreCase) || sid.StartsWith("S-1-12-1-", StringComparison.OrdinalIgnoreCase))) return false;
+            for (int i = 2; i < sid.Length; i++) if (sid[i] != '-' && (sid[i] < '0' || sid[i] > '9')) return false;
             return true;
         }
 
@@ -3480,6 +3495,7 @@ namespace RescueScan
                 string dir = "dir:" + (u[2].Length > 2 && u[2][1] == ':' ? u[2].Substring(2) : u[2]);
                 if ((sid.Length > 0 && sid.Equals(e.UserId, StringComparison.OrdinalIgnoreCase)) || dir.Equals(e.UserId, StringComparison.OrdinalIgnoreCase)) return u[1];
             }
+            if (soft == "HKLM\\SOFTWARE" && UserSid(e.UserId)) return "HKU\\" + e.UserId;   // live: a loaded user hive
             return "";
         }
 
@@ -4119,7 +4135,7 @@ namespace RescueScan
         }
 
         // Per-user hive roots of the target: the profiles of the scan; live also every loaded HKU\<user SID> (users
-        // logged on in another session; over-the-shoulder elevation makes HKCU the ADMIN's hive) and HKCU itself.
+        // logged on in another session; over-the-shoulder elevation makes HKCU the ADMIN's hive, also listed there).
         List<string> UserRoots()
         {
             List<string> b = new List<string>();
@@ -4127,10 +4143,8 @@ namespace RescueScan
             foreach (string[] u in tgtUsers) if (u[1].Length > 0 && seen.Add(u[1])) b.Add(u[1]);
             if (tgtReady && tgtLive)
             {
-                foreach (string sid in Reg.SubkeyNames("HKU"))
-                    if ((sid.StartsWith("S-1-5-21-", StringComparison.OrdinalIgnoreCase) || sid.StartsWith("S-1-12-1-", StringComparison.OrdinalIgnoreCase))
-                        && !sid.EndsWith("_Classes", StringComparison.OrdinalIgnoreCase) && seen.Add("HKU\\" + sid)) b.Add("HKU\\" + sid);
-                b.Add("HKCU");
+                foreach (string sid in Reg.SubkeyNames("HKU"))   // the elevated admin's own HKCU is one of these too
+                    if (UserSid(sid) && seen.Add("HKU\\" + sid)) b.Add("HKU\\" + sid);
             }
             return b;
         }
@@ -4462,7 +4476,8 @@ namespace RescueScan
                 msg += failed == 0 ? "Папка удалена. " : "Папка удалена не полностью (ошибок " + failed + ": " + err + "). ";
             }
             quarErr = "";
-            int r = BackedDeleteKey(pk, tgtReady && tgtLive, "профиль " + n);
+            bool bk = EnsureTarget() && tgtLive;   // the backup needs the live system as the prepared target
+            int r = BackedDeleteKey(pk, bk, "профиль " + n);
             msg += r == 1 ? "ProfileList очищен." : r == 2 ? "Записи ProfileList нет." : "ProfileList не очищен: " + quarErr;
             MessageBox.Show(msg, "Профиль");
             AccRefresh();
