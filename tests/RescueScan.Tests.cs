@@ -47,6 +47,7 @@ namespace RescueScan.Tests
                 Run("DeleteKey: whole tree, refusals, missing => false", DeleteKeyTree);
                 Run("KeyExists", KeyExistsCases);
                 Run("NUL in names/paths: never aliased, never acted on", NulNames);
+                Run("Values: a value deleted during the read is not a hidden name", ValuesRace);
                 Run("Live mode: ProfileImagePath -> folders on the TARGET drive", ProfileDirs);
                 Run("Live mode: SamePath / WinTarget labels", LiveHelpers);
                 Run("RunProcess: big stderr does not deadlock", ProcBigStderr);
@@ -592,6 +593,30 @@ namespace RescueScan.Tests
             Eq("SUSPECT", hidden.Risk, "flagged");
             True(hidden.DelName == null && hidden.DelKey == null, "nothing to delete");
             True(FindName(f, "Shell") != null, "normal value still reported");
+        }
+
+        // Live, a value can disappear between the listing and the read (RunOnce, updaters): no false "hidden name" row.
+        static void ValuesRace()
+        {
+            using (RegistryKey k = Make("race")) { k.SetValue("RunOnceThing", "C:\\x.exe"); k.SetValue("Stay", "C:\\y.exe"); }
+            Reg.BeforeValueRead = delegate(RegistryKey key, string name)
+            {
+                if (name != "RunOnceThing") return;
+                using (RegistryKey b = HKCU())
+                using (RegistryKey w = b.OpenSubKey(Sub + "\\race", true)) w.DeleteValue(name, false);
+            };
+            try
+            {
+                List<string[]> v = Reg.Values(Root + "\\race");
+                Eq(1, v.Count, "the value deleted during the read is just gone");
+                Eq("Stay", v[0][0], "the other value is still listed");
+                using (RegistryKey k = Make("race")) k.SetValue("RunOnceThing", "C:\\x.exe");   // deleted again during the scan
+                List<Finding> f = new List<Finding>();
+                MainForm.AddValues(f, "RunOnce (HKLM)", Root + "\\race");
+                Eq(1, f.Count, "one finding (Stay)");
+                foreach (Finding x in f) True(!x.Name.StartsWith("(скрытое"), "no hidden-name alarm: " + x.Name);
+            }
+            finally { Reg.BeforeValueRead = null; }
         }
 
         // ------------------------------------------------------------------ live mode / target helpers

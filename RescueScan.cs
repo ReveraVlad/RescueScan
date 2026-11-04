@@ -253,15 +253,25 @@ namespace RescueScan
                 // the NUL: "\0x" -> "" aliases the default value, "a\0x" -> "a". Such a name shows up twice or cannot
                 // be read back; it is returned as <cut name> + "\0" so it never matches (or deletes) a real name.
                 HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                HashSet<string> again = null;   // a second listing, made at the first name that cannot be read
                 foreach (string n in Names(k, false))
                 {
                     string data, type;
-                    if (!seen.Add(n) || !TryGetValue(k, n, out data, out type)) { res.Add(new string[] { n + "\0", "", "" }); continue; }
-                    res.Add(new string[] { n, data, type });
+                    if (!seen.Add(n)) { res.Add(new string[] { n + "\0", "", "" }); continue; }   // listed twice: NUL-cut alias
+                    if (BeforeValueRead != null) BeforeValueRead(k, n);
+                    if (TryGetValue(k, n, out data, out type)) { res.Add(new string[] { n, data, type }); continue; }
+                    // Live, a value may simply have been deleted since the listing (RunOnce, an updater): that is not a
+                    // hidden name. Only a name that is listed again but still cannot be read is one.
+                    if (again == null) again = new HashSet<string>(Names(k, false), StringComparer.OrdinalIgnoreCase);
+                    if (!again.Contains(n)) continue;
+                    if (TryGetValue(k, n, out data, out type)) res.Add(new string[] { n, data, type });
+                    else res.Add(new string[] { n + "\0", "", "" });
                 }
             }
             return res;
         }
+
+        internal static Action<RegistryKey, string> BeforeValueRead = null;   // tests only: simulates a change during the read
 
         // Full paths of the immediate subkeys, with the same root spelling/prefix as 'key' (can be passed on as is).
         public static List<string> Subkeys(string key)
@@ -427,7 +437,10 @@ namespace RescueScan
                     data = rt == 5 && raw.Length == 4 ? "0x" + BitConverter.ToUInt32(raw, 0).ToString("x") : Hex(raw);   // like reg.exe
                     return true;
                 }
-                if (o == null) return false;   // Mono reports a missing value as Unknown
+                // .NET on Windows THROWS for a missing value (above), so Unknown means the value exists but its bytes
+                // are not available (native read failed): report it as REG_UNKNOWN, not as missing / hidden.
+                // Mono reports a missing value as Unknown.
+                if (o == null && !IsWindows) return false;
             }
             type = KindName(kind);
             data = FormatData(o);
