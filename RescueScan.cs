@@ -1,7 +1,10 @@
-// RescueScan - offline persistence scanner/remover for Windows Recovery (WinRE/WinPE)
-// GUI (WinForms, .NET Framework 4.x). Orchestrates reg.exe so it works identically in WinPE.
-// Build: csc /target:winexe /win32manifest:app.manifest /out:RescueScan.exe RescueScan.cs
-//        (references System.Windows.Forms, System.Drawing, System.Core)
+// RescueScan - defensive persistence scanner/remover for Windows: OFFLINE from a WinPE that contains .NET
+// (ADK WinPE + WinPE-WMI + WinPE-NetFx; stock WinRE has no .NET and cannot run it) or LIVE on the infected system.
+// GUI: WinForms, .NET Framework 4.x, C# 5, one file. Registry through Microsoft.Win32/advapi32; reg.exe only to
+// load/unload offline hives (HKLM\RS_SOFT, RS_SYS, RS_U<n>), bcdedit/net by full System32 path.
+// Build: build.ps1 (= csc -codepage:65001 -target:winexe -platform:anycpu -win32manifest:app.manifest
+//        -out:RescueScan.exe -r:System.Windows.Forms.dll -r:System.Drawing.dll -r:System.Core.dll
+//        -r:System.Management.dll RescueScan.cs).  Tests: tests/run-tests.ps1 (Windows), tests/run-tests.sh (Mono).
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -2438,7 +2441,7 @@ namespace RescueScan
         {
             Current = this;
             OtherInstanceAlive();   // take the instance marker (UI thread) as early as possible
-            Text = "RescueScan  -  scanner + task manager + explorer (WinRE)";
+            Text = "RescueScan  -  scanner + task manager + explorer (WinPE / live)";
             Width = 1080; Height = 660; StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(860, 500);
 
@@ -2675,7 +2678,7 @@ namespace RescueScan
             f.StartPosition = FormStartPosition.CenterScreen; f.FormBorderStyle = FormBorderStyle.FixedDialog;
             f.MinimizeBox = false; f.MaximizeBox = false; f.TopMost = true;
             Label l = new Label(); l.Left = 12; l.Top = 12; l.Width = 460; l.Height = 56;
-            l.Text = "На каком диске установлена Windows для проверки?\r\n• в WinRE — выбери офлайн-установку (напр. D:\\Windows)\r\n• на живой ОС — свою (C:\\Windows)";
+            l.Text = "На каком диске установлена Windows для проверки?\r\n• в WinPE (с .NET) — выбери офлайн-установку (напр. D:\\Windows)\r\n• на живой ОС — свою (C:\\Windows)";
             ListBox lb = new ListBox(); lb.Left = 12; lb.Top = 72; lb.Width = 460; lb.Height = 130;
             foreach (object it in cboWin.Items) lb.Items.Add(it);
             if (lb.Items.Count == 0) lb.Items.Add("(Windows не найдена — выберешь вручную в приложении)");
@@ -2693,13 +2696,15 @@ namespace RescueScan
         {
             return
 "RescueScan — защитный инструмент для чистки заражённой Windows. Написан на C# (.NET Framework 4.x, WinForms).\r\n" +
-"Два режима: ОФЛАЙН (загрузился в WinRE/WinPE, цель выключена — вирус не сопротивляется) и ЖИВОЙ (запущен в заражённой ОС от админа).\r\n" +
-"Требуется .NET Framework 4.x. В WinPE НЕ запустится без компонентов WinPE-WMI + WinPE-NetFx в boot.wim (стоковый WinPE не содержит .NET).\r\n" +
+"Два режима: ОФЛАЙН (загрузился в WinPE, цель выключена — вирус не сопротивляется) и ЖИВОЙ (запущен в заражённой ОС от админа).\r\n" +
+"Требуется .NET Framework 4.x. В WinPE НЕ запустится без компонентов WinPE-WMI + WinPE-NetFx в boot.wim. Стоковый WinRE («Дополнительные\r\n" +
+"параметры -> Командная строка») .NET не содержит — там программа не стартует; RescueScan.cmd рядом с exe проверит это и объяснит.\r\n" +
 "\r\n" +
 "ЦВЕТА: Красный = SUSPECT (сильный признак: temp, -enc/hidden, интерпретатор+загрузка, двойное расширение, exe в drivers).\r\n" +
 "       Жёлтый = REVIEW (легит, но частое у малвари место: AppData/ProgramData/Downloads/автозагрузка) — просто глянь.\r\n" +
 "\r\n" +
 "1) АВТОЗАГРУЗКА (полная): «Найти ОС» -> «Сканировать» -> ВСЕ точки автозапуска. Кнопки: Обезвредить / Карантин / Удалить / Экспорт / Pre-boot.\r\n" +
+"   Экспорт: CSV через «;» (кавычки удваиваются; ячейка, начинающаяся с = + - @, получает апостроф — формула из имени вируса не сработает).\r\n" +
 "   Pre-boot (ESP/BCD): хранилища BCD (системное + \\EFI\\Microsoft\\Boot\\BCD каждого ESP с буквой) и файлы ESP — только ИНФОРМАЦИЯ,\r\n" +
 "   кнопками не удаляется (загрузчики Linux/производителя легитимны): чинить вручную (bcdedit / bcdboot).\r\n" +
 "   ОБЕЗВРЕДИТЬ (defuse): службе -> Start=4/ErrorControl=1, IFEO -> убрать только значение Debugger, Winlogon/BootExecute -> дефолт.\r\n" +
@@ -2709,11 +2714,18 @@ namespace RescueScan
 "\r\n" +
 "2) АВТОЗАПУСК (кратко): только Run/RunOnce/Планировщик/Startup — как «Автозагрузка» в Диспетчере задач Windows.\r\n" +
 "\r\n" +
-"3) ДИСПЕТЧЕР ЗАДАЧ: процессы с путём и риском. Завершить / Завершить дерево. «Поверх всех окон». «Watchdog» — если вирус\r\n" +
-"   закроет RescueScan, напарник его перезапустит и запишет в лог (%TEMP%\\rescuescan.log). По умолчанию выключен.\r\n" +
+"3) ДИСПЕТЧЕР ЗАДАЧ: процессы с путём и риском. Завершить / Завершить дерево — сначала список и подтверждение. Дерево: сначала\r\n" +
+"   родитель (чтобы не успел перезапустить детей), потом потомки, потом ещё пара свежих снимков — добить появившихся. Сам RescueScan,\r\n" +
+"   его watchdog, Idle и System не завершаются; критические процессы Windows (smss, csrss, wininit, winlogon, services, lsass, в WinPE\r\n" +
+"   winpeshl) — только после второго явного «Да» (иначе синий экран). PID, сменивший владельца после «Обновить», не трогается.\r\n" +
+"   «Поверх всех окон». «Watchdog» — если вирус закроет RescueScan, напарник его перезапустит и запишет в лог (%TEMP%\\rescuescan.log);\r\n" +
+"   перезапущенное окно снова управляет watchdog'ом (обычное закрытие его останавливает) и возвращает «Стеречь Winlogon».\r\n" +
+"   По умолчанию выключен. Ограничение: «taskkill /f /im RescueScan.exe» убивает оба процесса сразу — против такого вируса чисти офлайн.\r\n" +
 "\r\n" +
 "4) ПРОВОДНИК: видит СКРЫТЫЕ и СИСТЕМНЫЕ файлы (серым/оранжевым). Красный = найден сканом. Кнопки: Запустить (ручной запуск exe,\r\n" +
 "   если сломан шелл), Переименовать, Карантин, Удалить, Снять скрытие (убрать H/S/R), Кто ссылается (из какой автозагрузки стартует файл).\r\n" +
+"   Запустить: .exe/.com — напрямую, БЕЗ ассоциаций (подменённый exefile не сработает с правами админа); .bat/.cmd — через cmd.exe после\r\n" +
+"   предупреждения; всё остальное НЕ выполняется, а открывается как текст в Блокноте. Программа с IFEO-перехватом не запускается.\r\n" +
 "   Удалить: корни дисков и системные папки (Windows, Program Files, ProgramData, Users…) не удаляются; папка — только после второго\r\n" +
 "   подтверждения; «только чтение» снимается; имена с точкой/пробелом в конце удаляются правильно; ссылки (junction) не обходятся.\r\n" +
 "\r\n" +
@@ -2742,7 +2754,9 @@ namespace RescueScan
 "   Каждое изменение реестра сохраняется в карантин ДО изменения; уже исправленное предыдущим шагом повторно не трогается.\r\n" +
 "   Тумблеры «Запуск вместо Explorer» и «Запуск до Windows/пре-бут» ВЫКЛЮЧЕНЫ (shell-hijack + boot-персистентность) — включим после одобрения CVP.\r\n" +
 "\r\n" +
-"ГРАНИЦЫ: чистит уровень ОС + загрузчик/ESP. Имплант в прошивку (BIOS/SPI) НЕ трогает — только перепрошивка. Офлайн-сброс пароля (правка SAM) — chntpw/DaRT.\r\n";
+"ГРАНИЦЫ: чистит уровень ОС + загрузчик/ESP. Имплант в прошивку (BIOS/SPI) НЕ трогает — только перепрошивка. Офлайн-сброс пароля (правка SAM) — chntpw/DaRT.\r\n" +
+"ОШИБКИ: непредвиденная ошибка показывается по-русски и пишется в лог (%TEMP%\\rescuescan.log); при аварийном выходе смонтированные\r\n" +
+"   кусты RS_* выгружаются. Без System.Management (WinPE без WinPE-WMI) не работает только вкладка «Аккаунты».\r\n";
         }
 
         // ================= WATCHDOG control (user-mode) =================
