@@ -53,6 +53,10 @@ namespace RescueScan.Tests
                 Run("RunProcess: big stderr does not deadlock", ProcBigStderr);
                 Run("RunProcess: exit code + stderr on failure", ProcFailure);
                 Run("RunProcess: timeout kills the child", ProcTimeout);
+                Run("RunProcess: timeout message without arguments (passwords)", ProcTimeoutNoArgs);
+                Run("OneLine: tool output for a status line", OneLineCases);
+                Run("ToolHijack: IFEO Debugger / filter / VerifierDlls / SilentProcessExit", ToolHijackCases);
+                Run("RegToolsBlocked: DisableRegistryTools DWORD", RegToolsBlockedCases);
                 Run("RunProcess: stdin is closed (no wait for input)", ProcStdinClosed);
                 Run("RunProcess: output is capped but drained", ProcOutputCap);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
@@ -704,6 +708,78 @@ namespace RescueScan.Tests
             Eq(-1, rc, "timeout -> -1");
             True(w.ElapsedMilliseconds < 15000, "returned after the timeout, not after the child (" + w.ElapsedMilliseconds + " ms)");
             True(o.Length > 0, "message");
+        }
+
+        // The timeout message names the tool and its sub-command only: "net user NAME PASSWORD" must not end up on screen.
+        static void ProcTimeoutNoArgs()
+        {
+            string o;
+            int rc = OnWindows ? Reg.RunProcess(Reg.SysExe("cmd"), "/c " + Reg.QuoteArg("ping -n 31 127.0.0.1 >nul & rem s3cret"), 700, out o)
+                               : Reg.RunProcess("/bin/sh", "-c " + Reg.QuoteArg("sleep 30") + " s3cret", 700, out o);
+            Eq(-1, rc, "timeout");
+            True(!o.Contains("s3cret") && !o.Contains("sleep") && !o.Contains("ping"), "no arguments in the message: " + o);
+            True(o.Contains(OnWindows ? "cmd.exe /c" : "sh -c"), "tool and sub-command named: " + o);
+        }
+
+        static void OneLineCases()
+        {
+            Eq("a b c", Reg.OneLine("  a\r\n\tb  c \n", 100), "whitespace collapsed");
+            Eq("abc…", Reg.OneLine("abcdef", 3), "capped");
+            Eq("", Reg.OneLine(null, 5), "null");
+            Eq("ОШИБКА: x", Reg.OneLine("ОШИБКА:\r\n x\r\n", 50), "Cyrillic kept");
+        }
+
+        // IFEO of the running system hijacks a tool by its FILE NAME: Debugger, VerifierDlls, a filter subkey with a
+        // Debugger (only with UseFilter), or GlobalFlag 0x200 + a SilentProcessExit monitor; native and Wow6432Node.
+        static void ToolHijackCases()
+        {
+            string soft = Root + "\\hj";   // stands for HKLM\SOFTWARE
+            string ifeo = "hj\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\";
+            Eq("", Reg.ToolHijack(soft, "C:\\Windows\\System32\\reg.exe"), "no IFEO key");
+            using (RegistryKey k = Make(ifeo + "reg.exe")) { k.SetValue("MitigationOptions", new byte[] { 1, 0 }, RegistryValueKind.Binary); k.SetValue("Debugger", ""); }
+            Eq("", Reg.ToolHijack(soft, "C:\\Windows\\System32\\reg.exe"), "harmless values / empty Debugger");
+            using (RegistryKey k = Make(ifeo + "reg.exe")) k.SetValue("Debugger", "C:\\evil.exe");
+            string h = Reg.ToolHijack(soft, "C:\\Windows\\System32\\reg.exe");
+            True(h.EndsWith("\\Debugger = C:\\evil.exe") && h.StartsWith(Root + "\\hj\\Microsoft", StringComparison.OrdinalIgnoreCase), "Debugger named with its key: " + h);
+            True(Reg.ToolHijack(soft, "reg.exe").Length > 0, "file name alone");
+
+            using (RegistryKey k = Make(ifeo + "net.exe\\0")) { k.SetValue("FilterFullPath", "C:\\Windows\\System32\\net.exe"); k.SetValue("Debugger", "C:\\evil2.exe"); }
+            Eq("", Reg.ToolHijack(soft, "net.exe"), "filter subkey without UseFilter is ignored (like Windows)");
+            using (RegistryKey k = Make(ifeo + "net.exe")) k.SetValue("UseFilter", 1, RegistryValueKind.DWord);
+            True(Reg.ToolHijack(soft, "net.exe").Contains("evil2"), "filter subkey with UseFilter");
+
+            using (RegistryKey k = Make(ifeo + "net1.exe")) k.SetValue("VerifierDlls", "evil.dll");
+            True(Reg.ToolHijack(soft, "net1.exe").Contains("VerifierDlls = evil.dll"), "VerifierDlls");
+
+            using (RegistryKey k = Make(ifeo + "bcdedit.exe")) k.SetValue("GlobalFlag", 0x200, RegistryValueKind.DWord);
+            Eq("", Reg.ToolHijack(soft, "bcdedit.exe"), "GlobalFlag 0x200 without a monitor");
+            using (RegistryKey k = Make("hj\\Microsoft\\Windows NT\\CurrentVersion\\SilentProcessExit\\bcdedit.exe")) k.SetValue("MonitorProcess", "C:\\evil3.exe");
+            True(Reg.ToolHijack(soft, "bcdedit.exe").Contains("MonitorProcess = C:\\evil3.exe"), "SilentProcessExit monitor");
+            using (RegistryKey k = Make(ifeo + "bcdedit.exe")) k.SetValue("GlobalFlag", "0x00000200");
+            True(Reg.ToolHijack(soft, "bcdedit.exe").Length > 0, "GlobalFlag as REG_SZ text");
+            using (RegistryKey k = Make(ifeo + "bcdedit.exe")) k.SetValue("GlobalFlag", 0x100, RegistryValueKind.DWord);
+            Eq("", Reg.ToolHijack(soft, "bcdedit.exe"), "other GlobalFlag bits: the monitor does not run");
+
+            using (RegistryKey k = Make("hj\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\findstr.exe")) k.SetValue("Debugger", "x.exe");
+            True(Reg.ToolHijack(soft, "findstr.exe").Contains("Wow6432Node"), "Wow6432Node copy");
+        }
+
+        // reg.exe refuses everything while HKCU DisableRegistryTools is a non-zero DWORD.
+        static void RegToolsBlockedCases()
+        {
+            string u = Root + "\\usr";   // stands for HKCU
+            True(!Reg.RegToolsBlocked(u), "no policy");
+            using (RegistryKey k = Make("usr\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System"))
+            {
+                k.SetValue("DisableRegistryTools", 0, RegistryValueKind.DWord);
+                True(!Reg.RegToolsBlocked(u), "0 = allowed");
+                k.SetValue("DisableRegistryTools", 1, RegistryValueKind.DWord);
+                True(Reg.RegToolsBlocked(u), "1 = blocked");
+                k.SetValue("DisableRegistryTools", 2, RegistryValueKind.DWord);
+                True(Reg.RegToolsBlocked(u), "2 = blocked too (reg.exe checks for non-zero)");
+                k.SetValue("DisableRegistryTools", "1");
+                True(!Reg.RegToolsBlocked(u), "REG_SZ is not checked by reg.exe");
+            }
         }
 
         static void ProcStdinClosed()

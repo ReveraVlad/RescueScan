@@ -45,13 +45,108 @@ namespace RescueScan
         // Every variable part of args must be passed through QuoteArg.
         public static int RunCode(string args, out string outp)
         {
-            return RunProcess(SysExe("reg.exe"), args, RegTimeoutMs, out outp);
+            int rc = RunProcess(SysExe("reg.exe"), args, RegTimeoutMs, out outp);
+            if (rc != 0 && RegToolsBlocked("HKCU")) outp = (outp ?? "") + "\r\n" + RegToolsHint;
+            return rc;
+        }
+
+        // reg.exe refuses EVERY operation (load, unload, export, import...: exit code 1) while the HKCU policy value
+        // DisableRegistryTools is a non-zero DWORD (research windows-semantics Q6: reg.exe 10.0.26100 disassembly) - a
+        // classic winlocker restriction. Our own Microsoft.Win32 reads and writes are not affected by it.
+        // userRoot = HKCU (tests pass a throwaway key).
+        internal static bool RegToolsBlocked(string userRoot)
+        {
+            foreach (string[] v in Values(userRoot + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System"))
+                if (v[0].Equals("DisableRegistryTools", StringComparison.OrdinalIgnoreCase) && v[2] == "REG_DWORD" && v[1] != "0x0") return true;
+            return false;
+        }
+
+        internal const string RegToolsHint = "reg.exe заблокирован политикой DisableRegistryTools (HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System) — " +
+            "на живой ОС сначала нажми «Снять блокировки» на вкладке «Ремонт» и повтори.";
+
+        // Image File Execution Options of the RUNNING system apply to every process RescueScan starts, whatever its path
+        // (IFEO is keyed by the file name only): a Debugger, VerifierDlls, a filter subkey (UseFilter) with a Debugger, or
+        // a SilentProcessExit monitor on reg.exe / bcdedit.exe / net.exe would run the virus's program with our
+        // administrator token - and a fake reg.exe could forge results (an "exported" backup that is not one).
+        // Returns "" or what was found. softRoot = HKLM\SOFTWARE (tests pass a throwaway key).
+        internal static string ToolHijack(string softRoot, string exeName)
+        {
+            string name = exeName ?? "";
+            name = name.Substring(name.LastIndexOfAny(new char[] { '\\', '/' }) + 1);
+            foreach (string r in new string[] { softRoot, softRoot + "\\Wow6432Node" })
+            {
+                string k = r + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\" + name;
+                string hit = IfeoHit(k);
+                if (hit.Length > 0) return hit;
+                bool filter = false; long gflag = 0;
+                foreach (string[] v in Values(k))
+                {
+                    if (v[0].Equals("UseFilter", StringComparison.OrdinalIgnoreCase) && Num(v[1]) != 0) filter = true;
+                    if (v[0].Equals("GlobalFlag", StringComparison.OrdinalIgnoreCase)) gflag = Num(v[1]);
+                }
+                if (filter)
+                    foreach (string sk in Subkeys(k)) { hit = IfeoHit(sk); if (hit.Length > 0) return hit; }
+                if ((gflag & 0x200) != 0)   // FLG_MONITOR_SILENT_PROCESS_EXIT
+                {
+                    string spe = r + "\\Microsoft\\Windows NT\\CurrentVersion\\SilentProcessExit\\" + name;
+                    foreach (string[] v in Values(spe))
+                        if (v[0].Equals("MonitorProcess", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0) return spe + "\\" + v[0] + " = " + v[1];
+                }
+            }
+            return "";
+        }
+
+        static string IfeoHit(string k)
+        {
+            foreach (string[] v in Values(k))
+                if ((v[0].Equals("Debugger", StringComparison.OrdinalIgnoreCase) || v[0].Equals("VerifierDlls", StringComparison.OrdinalIgnoreCase))
+                    && v[1].Trim().Length > 0) return k + "\\" + v[0] + " = " + v[1];
+            return "";
+        }
+
+        // "0x200" (REG_DWORD text) or a decimal / hex string (GlobalFlag is sometimes REG_SZ); 0 if not a number.
+        static long Num(string s)
+        {
+            s = (s ?? "").Trim();
+            long n;
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                return long.TryParse(s.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out n) ? n : 0;
+            return long.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out n) ? n : 0;
+        }
+
+        // Tool output for a status line / log: one line, at most 'max' characters.
+        internal static string OneLine(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            StringBuilder sb = new StringBuilder();
+            bool gap = false;
+            foreach (char c in s)
+            {
+                if (char.IsWhiteSpace(c) || char.IsControl(c)) { gap = sb.Length > 0; continue; }
+                if (gap) { sb.Append(' '); gap = false; }
+                sb.Append(c);
+            }
+            string r = sb.ToString();
+            return r.Length > max ? r.Substring(0, max) + "…" : r;
         }
 
         // Runs a console tool hidden. stdout and stderr are drained concurrently (no pipe-buffer deadlock); on timeout
         // the child is killed and -1 is returned. outp = stdout, plus stderr when the exit code is not 0.
+        // A tool hijacked through IFEO on the running system is not started at all (-1, outp says why).
         internal static int RunProcess(string exe, string args, int timeoutMs, out string outp)
         {
+            string tool = Path.GetFileName(exe);
+            if (IsWindows)
+            {
+                string hijack = ToolHijack("HKLM\\SOFTWARE", tool);
+                if (hijack.Length == 0 && tool.Equals("net.exe", StringComparison.OrdinalIgnoreCase)) hijack = ToolHijack("HKLM\\SOFTWARE", "net1.exe");   // net.exe runs net1.exe
+                if (hijack.Length > 0)
+                {
+                    outp = "Запуск " + tool + " отменён: перехват через Image File Execution Options — " + hijack +
+                        ". Вместо " + tool + " запустилась бы чужая программа с правами администратора. Удали этот параметр (Debugger снимает «Снять блокировки» на вкладке «Ремонт») и повтори.";
+                    return -1;
+                }
+            }
             Process p = null;
             try
             {
@@ -76,7 +171,10 @@ namespace RescueScan
                     try { p.Kill(); } catch { }
                     try { p.WaitForExit(5000); } catch { }
                     to.Join(2000); te.Join(2000);
-                    outp = "Превышено время ожидания (" + ((timeoutMs + 999) / 1000) + " с): " + Path.GetFileName(exe) + " " + args;
+                    // only the tool and its sub-command: the arguments may hold a password (net user NAME PASSWORD)
+                    string verb = (args ?? "").Trim();
+                    int sp = verb.IndexOf(' ');
+                    outp = "Превышено время ожидания (" + ((timeoutMs + 999) / 1000) + " с): " + tool + " " + (sp > 0 ? verb.Substring(0, sp) : verb);
                     return -1;
                 }
                 // exit code is known; a grandchild that inherited the pipes must not hang us forever
@@ -164,10 +262,20 @@ namespace RescueScan
         // reg export KEY FILE /y. Success only if reg.exe exited with 0 AND a non-empty file is there.
         public static bool Export(string key, string file)
         {
+            string err;
+            return Export(key, file, out err);
+        }
+
+        // err = why it failed (reg.exe's own message, one line), "" on success.
+        public static bool Export(string key, string file, out string err)
+        {
             string o;
             int rc = RunCode("export " + QuoteArg(key) + " " + QuoteArg(file) + " /y", out o);
-            try { return rc == 0 && File.Exists(file) && new FileInfo(file).Length > 0; }
-            catch { return false; }
+            bool ok = false;
+            try { ok = rc == 0 && File.Exists(file) && new FileInfo(file).Length > 0; } catch { }
+            err = ok ? "" : OneLine(o, 300);
+            if (!ok && err.Length == 0) err = rc == 0 ? "reg export: файл не создан" : "reg export: код " + rc;
+            return ok;
         }
 
         // ================= registry access via Microsoft.Win32 (no "reg query" text parsing) =================
@@ -682,6 +790,7 @@ namespace RescueScan
         CheckBox chkTop, chkWatch;
         Button btnQuar, btnWho, btnQuarFile;
         string quarDir = "";
+        string quarErr = "";   // first failure reason of the last quarantine run (shown in the status line)
         ListView lvRepair; CheckBox chkGuard; bool guarding = false; Thread guardThread;
         ListView lvSimple;
         ListView lvQuar; string quarViewDir = ""; Label lblQuar;
@@ -1788,7 +1897,8 @@ namespace RescueScan
             if (curDrive == "") { MessageBox.Show("Сначала нажми «Сканировать» (нужен выбранный диск)."); return; }
             Cursor.Current = Cursors.WaitCursor;
             List<Finding> f = new List<Finding>();
-            string bo; RunProc("bcdedit", "/enum all", out bo);
+            string bo; int brc = RunProc("bcdedit", "/enum all", out bo);
+            if (brc != 0) { string w = Reg.OneLine(bo, 220); bo = ""; Add(f, "BCD", "(bcdedit не сработал)", w.Length > 0 ? w : "код " + brc, "BCD store", "REVIEW", 3, null, null, null); }
             ParseBcd(f, bo);
             int esps = 0;
             for (char c = 'A'; c <= 'Z'; c++)
@@ -1945,7 +2055,12 @@ namespace RescueScan
                 QLog("FILE\t" + path + "\t=>\t" + dst);
                 return true;
             }
-            catch (Exception ex) { QLog("FILE-FAIL\t" + path + "\t" + ex.Message); return false; }
+            catch (Exception ex) { QLog("FILE-FAIL\t" + path + "\t" + ex.Message); NoteQuarErr(ex.Message); return false; }
+        }
+
+        void NoteQuarErr(string why)
+        {
+            if (quarErr.Length == 0 && !string.IsNullOrEmpty(why)) quarErr = Reg.OneLine(why, 220);
         }
 
         // export a reg key to .reg (backup) then return true; caller deletes afterwards
@@ -1957,11 +2072,12 @@ namespace RescueScan
                 string safe = key.Replace("\\", "_").Replace("\"", "");
                 if (safe.Length > 80) safe = safe.Substring(safe.Length - 80);
                 string dst = Path.Combine(quarDir, "reg_" + safe + ".reg");
-                if (!Reg.Export(key, dst)) { QLog("REG-FAIL\t" + key + "\treg export failed"); return false; }   // no backup -> no delete
+                string err;
+                if (!Reg.Export(key, dst, out err)) { QLog("REG-FAIL\t" + key + "\treg export failed: " + err); NoteQuarErr(err); return false; }   // no backup -> no delete
                 QLog("REG\t" + key + "\t=>\t" + dst);
                 return true;
             }
-            catch (Exception ex) { QLog("REG-FAIL\t" + key + "\t" + ex.Message); return false; }
+            catch (Exception ex) { QLog("REG-FAIL\t" + key + "\t" + ex.Message); NoteQuarErr(ex.Message); return false; }
         }
 
         void QuarantineChecked(ListView target)
@@ -1972,6 +2088,7 @@ namespace RescueScan
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             List<ListViewItem> done = new List<ListViewItem>();
             int ok = 0, fail = 0, skip = 0;
+            quarErr = "";
             foreach (ListViewItem it in target.Items)
             {
                 if (!it.Checked) continue;
@@ -1984,7 +2101,8 @@ namespace RescueScan
                 if (r) { ok++; done.Add(it); } else fail++;
             }
             foreach (ListViewItem it in done) target.Items.Remove(it);
-            lblStatus.Text = "Карантин: " + ok + "   ошибок: " + fail + "   пропущено: " + skip + "   -> " + quarDir;
+            lblStatus.Text = "Карантин: " + ok + "   ошибок: " + fail + "   пропущено: " + skip + "   -> " + quarDir
+                + (fail > 0 && quarErr.Length > 0 ? "   причина: " + quarErr : "");
         }
 
         void QuarantineSelectedFiles()
@@ -2054,6 +2172,7 @@ namespace RescueScan
             if (MessageBox.Show("Восстановить отмеченные (" + n + ") на исходные места?", "Восстановление",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             int ok = 0, fail = 0;
+            string why = "";
             List<ListViewItem> done = new List<ListViewItem>();
             foreach (ListViewItem it in lvQuar.Items)
             {
@@ -2075,13 +2194,14 @@ namespace RescueScan
                     else if (e[0] == "REG")
                     {
                         string o; r = Reg.RunCode("import " + Reg.QuoteArg(e[2]), out o) == 0;
+                        if (!r && why.Length == 0) why = Reg.OneLine(o, 220);
                     }
                 }
-                catch { r = false; }
+                catch (Exception ex) { r = false; if (why.Length == 0) why = Reg.OneLine(ex.Message, 220); }
                 if (r) { ok++; done.Add(it); } else fail++;
             }
             foreach (ListViewItem it in done) lvQuar.Items.Remove(it);
-            lblQuar.Text = "Восстановлено: " + ok + "   ошибок: " + fail;
+            lblQuar.Text = "Восстановлено: " + ok + "   ошибок: " + fail + (fail > 0 && why.Length > 0 ? "   причина: " + why : "");
         }
 
         // ================= WHO REFERENCES A FILE =================
@@ -2426,7 +2546,7 @@ namespace RescueScan
 
         void QuarantineSuspectAll(out int ok, out int fail)
         {
-            ok = 0; fail = 0;
+            ok = 0; fail = 0; quarErr = "";
             foreach (Finding x in new List<Finding>(lastFindings))
             {
                 if (x.Risk != "SUSPECT") continue;
@@ -2455,7 +2575,7 @@ namespace RescueScan
             if (soft && oRestrict.Checked) { int i = RestoreRestrictions(); r.AppendLine("Снято ограничений политик: " + i); }
             if (soft && oAssoc.Checked) { int i = RestoreAssoc(); r.AppendLine("Ассоциации/иконки восстановлены (" + i + ")"); }
             if (oDefuse.Checked) { int d = 0; foreach (Finding x in lastFindings) if (x.Risk == "SUSPECT" && DefuseOne(x)) d++; r.AppendLine("Обезврежено якорей: " + d); }
-            if (oQuar.Checked) { int ok, fail; QuarantineSuspectAll(out ok, out fail); r.AppendLine("В карантин: " + ok + "  (ошибок " + fail + ")  -> " + quarDir); }
+            if (oQuar.Checked) { int ok, fail; QuarantineSuspectAll(out ok, out fail); r.AppendLine("В карантин: " + ok + "  (ошибок " + fail + ")  -> " + quarDir + (fail > 0 && quarErr.Length > 0 ? "\r\n   причина: " + quarErr : "")); }
             if (oWatch.Checked) { chkWatch.Checked = true; r.AppendLine("Watchdog включён"); }
             if (oScan.Checked) { Scan(); } // пересканировать, чтобы список отражал результат
             QuarAutoFind();
