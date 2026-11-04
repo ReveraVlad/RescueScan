@@ -91,6 +91,7 @@ namespace RescueScan.Tests
                 Run("Values/Pairs: a key with a deny-ACL is noted, not silently skipped [win]", DeniedWin);
                 Run("QuoteArg: round trip through the real CommandLineToArgvW [win]", QuoteArgWin);
                 Run("Mounts: real reg.exe save / load / read / unload [win, admin]", MountWin);
+                Run("Snapshot/SetRaw: odd REG_SZ and non-.NET types byte for byte [win]", RawRoundTripWin);
             }
             finally
             {
@@ -1165,6 +1166,31 @@ namespace RescueScan.Tests
             List<string[]> m = MainForm.RestrictionItems("HKLM\\RS_SOFT", true);
             True(m.Exists(delegate(string[] x) { return x[0] == "HKLM\\RS_SOFT\\Microsoft\\Windows\\CurrentVersion\\Policies\\System" && x[1] == "DisableTaskMgr"; }), "machine path");
             True(m.Exists(delegate(string[] x) { return x[0] == "HKLM\\RS_SOFT\\Policies\\Microsoft\\Windows\\System"; }), "machine DisableCMD");
+        }
+
+        // Native path: a REG_SZ without terminator, one with an embedded NUL and a REG_RESOURCE_LIST come back byte for byte
+        // through Snapshot -> .reg text -> Parse -> SetRaw.
+        static void RawRoundTripWin()
+        {
+            WindowsOnly();
+            string k = Root + "\\rawwin\\src", d = Root + "\\rawwin\\dst";
+            byte[][] data = { Encoding.Unicode.GetBytes("abc"), Encoding.Unicode.GetBytes("a\0b\0"), new byte[] { 1, 2, 3 } };
+            int[] types = { 1, 1, 8 };
+            for (int i = 0; i < 3; i++) True(Reg.SetRaw(k, "v" + i, types[i], data[i]), "SetRaw v" + i);
+            string err;
+            List<RegSection> snap = Reg.Snapshot(k, null, out err);
+            True(snap != null, "snapshot: " + err);
+            List<RegSection> back = RegFile.Parse(RegFile.Format(snap, out err), out err);
+            True(back != null, "parse: " + err);
+            foreach (RegVal v in back[0].Values) True(Reg.SetRaw(d, v.Name, v.Type, v.Data), "restore " + v.Name);
+            List<RegSection> again = Reg.Snapshot(d, null, out err);
+            for (int i = 0; i < 3; i++)
+            {
+                RegVal v = again[0].Values.Find(delegate(RegVal x) { return x.Name == "v" + i; });
+                True(v != null, "v" + i);
+                Eq(types[i], v.Type, "type v" + i);
+                Eq(Reg.Hex(data[i]), Reg.Hex(v.Data), "bytes v" + i);
+            }
         }
 
         static string JoinT(List<WinTarget> l)
