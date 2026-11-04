@@ -60,13 +60,15 @@ namespace RescueScan
                 psi.CreateNoWindow = true;
                 psi.RedirectStandardOutput = true;
                 psi.RedirectStandardError = true;
+                psi.RedirectStandardInput = true;   // closed below: a prompt (reg/net) gets EOF instead of waiting for a console
                 Encoding oem = OemEncoding();   // the child's new console writes OEM (866/437...), .NET would decode as ANSI
                 if (oem != null) { psi.StandardOutputEncoding = oem; psi.StandardErrorEncoding = oem; }
                 p = Process.Start(psi);
+                try { p.StandardInput.Close(); } catch { }
                 StreamReader so = p.StandardOutput, se = p.StandardError;
                 string[] text = new string[2];
-                Thread to = new Thread(delegate() { try { text[0] = so.ReadToEnd(); } catch { } });
-                Thread te = new Thread(delegate() { try { text[1] = se.ReadToEnd(); } catch { } });
+                Thread to = new Thread(delegate() { try { text[0] = ReadCapped(so); } catch { } });
+                Thread te = new Thread(delegate() { try { text[1] = ReadCapped(se); } catch { } });
                 to.IsBackground = true; te.IsBackground = true;
                 to.Start(); te.Start();
                 if (!p.WaitForExit(timeoutMs))
@@ -93,6 +95,18 @@ namespace RescueScan
             {
                 if (p != null) try { p.Dispose(); } catch { }
             }
+        }
+
+        // Drains a stream to the end but keeps at most 1 MB (a looping prompt must not eat all memory until the timeout).
+        static string ReadCapped(StreamReader r)
+        {
+            const int cap = 1 << 20;
+            StringBuilder sb = new StringBuilder();
+            char[] buf = new char[4096];
+            int n;
+            while ((n = r.Read(buf, 0, buf.Length)) > 0)
+                if (sb.Length < cap) sb.Append(buf, 0, Math.Min(n, cap - sb.Length));
+            return sb.ToString();
         }
 
         [DllImport("kernel32.dll")]
@@ -294,7 +308,7 @@ namespace RescueScan
             string s = o as string;
             if (s != null) { int z = s.IndexOf('\0'); return z >= 0 ? s.Substring(0, z) : s; }
             string[] m = o as string[];
-            if (m != null) return string.Join("\\0", m);
+            if (m != null) return string.Join("\\0", Array.FindAll(m, delegate(string e) { return e.Length > 0; }));   // reg.exe skips empty items
             if (o is int) return "0x" + ((uint)(int)o).ToString("x");
             if (o is long) return "0x" + ((ulong)(long)o).ToString("x");
             byte[] b = o as byte[];
@@ -340,12 +354,17 @@ namespace RescueScan
             object o = null;
             try { kind = k.GetValueKind(name); } catch { return false; }   // .NET: IOException for a missing value
             try { o = k.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames); } catch { }
-            if (kind == RegistryValueKind.Unknown || o == null)
+            if (kind == RegistryValueKind.Unknown)
             {
-                // REG_LINK, REG_RESOURCE_LIST, REG_DWORD_BIG_ENDIAN, custom types: .NET knows no kind / returns no data
+                // REG_LINK, REG_RESOURCE_LIST, REG_DWORD_BIG_ENDIAN, custom types: .NET knows no kind / often returns no data
                 int rt; byte[] raw;
-                if (RawValue(k, name, out rt, out raw)) { type = TypeName(rt); data = o != null ? FormatData(o) : Hex(raw); return true; }
-                if (o == null && kind == RegistryValueKind.Unknown) return false;   // Mono reports a missing value as Unknown
+                if (RawValue(k, name, out rt, out raw))
+                {
+                    type = TypeName(rt);
+                    data = rt == 5 && raw.Length == 4 ? "0x" + BitConverter.ToUInt32(raw, 0).ToString("x") : Hex(raw);   // like reg.exe
+                    return true;
+                }
+                if (o == null) return false;   // Mono reports a missing value as Unknown
             }
             type = KindName(kind);
             data = FormatData(o);
@@ -1027,6 +1046,7 @@ namespace RescueScan
         int MountHive(string name, string file, StringBuilder warn)
         {
             string p = "HKLM\\" + name, o;
+            if (!File.Exists(file)) { warn.Append("нет файла " + file + ". "); return 1; }   // reg load would CREATE an empty hive
             if (Reg.KeyExists(p))
             {
                 Reg.RunCode("unload " + Reg.QuoteArg(p), out o);
@@ -2348,7 +2368,10 @@ namespace RescueScan
             string n = AccName(); if (n == null) return;
             string p = Prompt("Новый пароль для «" + n + "» (пусто = снять пароль)", "");
             if (p == null) return;
-            string o; int rc = RunProc("net", "user " + Reg.QuoteArg(n) + " " + Reg.QuoteArg(p), out o);
+            // net1.exe treats ANY argument starting with "/" as a switch, even quoted: "/delete" would delete the account
+            if (p.StartsWith("/")) { MessageBox.Show("Пароль не может начинаться с «/»: net.exe примет его за ключ (например, /delete удалит аккаунт).", "Пароль"); return; }
+            // /Y: answer the ">14 characters" question instead of failing on it
+            string o; int rc = RunProc("net", "user " + Reg.QuoteArg(n) + " " + Reg.QuoteArg(p) + " /Y", out o);
             MessageBox.Show(rc == 0 ? "Пароль изменён для " + n : "Ошибка:\r\n" + o, "Пароль");
             AccRefresh();
         }
