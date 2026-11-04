@@ -94,6 +94,7 @@ namespace RescueScan.Tests
                 Run("User hive: per-user shell, cmd AutoRun, logon script, screensaver", UserHiveCases);
                 Run("RunOnceEx/AeDebug/UserList/Defender exclusions/Setup/DataBasePath/VerifierDlls", MachineExtrasCases);
                 Run("hosts: default clean, AV blocks / pharming SUSPECT, lists capped", HostsCases);
+                Run("Startup: .lnk targets, dropped programs, checker content; payload path", StartupAndPayloadCases);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
                 Run("Pairs/DeleteKey: registry symbolic links are not followed [win]", LinksWin);
@@ -2283,6 +2284,53 @@ namespace RescueScan.Tests
                 int sus = 0; foreach (Finding x in f) { Eq(3, x.Kind, "hosts rows are info"); if (x.Risk == "SUSPECT") sus++; }
                 Eq(1, sus, "Windows Update block");
                 f.Clear(); File.WriteAllText(h, def); MainForm.ScanHosts(f, h, false); Eq(0, f.Count, "default file: nothing");
+            }
+            finally { try { Directory.Delete(dir, true); } catch { } }
+        }
+
+        // minimal [MS-SHLLINK] file: header, LinkInfo with a LocalBasePath (ANSI), Unicode ARGUMENTS
+        static byte[] MakeLnk(string target, string args)
+        {
+            MemoryStream ms = new MemoryStream(); BinaryWriter w = new BinaryWriter(ms);
+            w.Write((uint)0x4C); w.Write(new byte[16]);
+            w.Write((uint)(0x2 | 0x20 | 0x80));   // HasLinkInfo | HasArguments | IsUnicode
+            w.Write(new byte[0x4C - 0x18]);
+            byte[] lbp = Encoding.ASCII.GetBytes(target + "\0");
+            int hdr = 0x1C, size = hdr + lbp.Length + 1;
+            w.Write((uint)size); w.Write((uint)hdr); w.Write((uint)1); w.Write((uint)0); w.Write((uint)hdr); w.Write((uint)0); w.Write((uint)(hdr + lbp.Length));
+            w.Write(lbp); w.Write((byte)0);
+            w.Write((ushort)args.Length); w.Write(Encoding.Unicode.GetBytes(args));
+            w.Flush(); return ms.ToArray();
+        }
+
+        // Startup items, .lnk targets, payload (not interpreter) of a command line
+        static void StartupAndPayloadCases()
+        {
+            Eq("C:\\Users\\x\\AppData\\Roaming\\evil.dll", Heur.PayloadPath("C:\\Windows\\System32\\rundll32.exe C:\\Users\\x\\AppData\\Roaming\\evil.dll,Start"), "rundll32 payload");
+            Eq("C:\\ProgramData\\a.ps1", Heur.PayloadPath("\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -nop -File C:\\ProgramData\\a.ps1"), "powershell -File payload");
+            Eq("", Heur.PayloadPath("powershell.exe -e JABz"), "only an interpreter: nothing flagged");
+            Eq("C:\\Program Files\\My App\\app.exe", Heur.PayloadPath("C:\\Program Files\\My App\\app.exe -min"), "unquoted path with spaces");
+            Eq("C:\\x\\a.sct", Heur.PayloadPath("regsvr32 /s /i:C:\\x\\a.sct scrobj.dll"), "switch:path");
+            string[] t = Heur.LnkTarget(MakeLnk("C:\\Windows\\System32\\cmd.exe", "/c start C:\\Users\\V\\a.vbs"));
+            True(t != null, "lnk parsed");
+            Eq("C:\\Windows\\System32\\cmd.exe", t[0], "lnk target"); Eq("/c start C:\\Users\\V\\a.vbs", t[1], "lnk arguments");
+            True(Heur.LnkTarget(new byte[] { 1, 2, 3 }) == null && Heur.LnkTarget(Encoding.ASCII.GetBytes(new string('x', 200))) == null, "not a link");
+            // (not below %TEMP%: a Temp path alone is SUSPECT)
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "rs startup " + Id);
+            Directory.CreateDirectory(dir);
+            try
+            {
+                string shown;
+                string l1 = Path.Combine(dir, "evil.lnk"); File.WriteAllBytes(l1, MakeLnk("C:\\Windows\\System32\\cmd.exe", "/c start C:\\Users\\V\\a.vbs"));
+                Eq("SUSPECT", MainForm.StartupRisk(l1, out shown), "lnk -> cmd + script in profile"); True(shown.Contains("a.vbs"), "target shown");
+                string l2 = Path.Combine(dir, "app.lnk"); File.WriteAllBytes(l2, MakeLnk("C:\\Program Files\\Vendor\\tray.exe", ""));
+                Eq("REVIEW", MainForm.StartupRisk(l2, out shown), "vendor shortcut REVIEW");
+                string e1 = Path.Combine(dir, "svch0st.exe"); File.WriteAllText(e1, "MZ");
+                Eq("SUSPECT", MainForm.StartupRisk(e1, out shown), "program dropped directly");
+                string t1 = Path.Combine(dir, "notes.txt"); File.WriteAllText(t1, "reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v x /d y");
+                Eq("SUSPECT", MainForm.StartupRisk(t1, out shown), "checker content");
+                string t2 = Path.Combine(dir, "readme.url"); File.WriteAllText(t2, "[InternetShortcut]\r\nURL=https://example.com/");
+                Eq("REVIEW", MainForm.StartupRisk(t2, out shown), "plain other file REVIEW");
             }
             finally { try { Directory.Delete(dir, true); } catch { } }
         }

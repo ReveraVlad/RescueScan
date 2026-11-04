@@ -1874,6 +1874,100 @@ namespace RescueScan
             return Regex.Replace(s, @"\s+", " ").Trim();
         }
 
+        // ---- payload of a command line / Startup shortcuts ----
+        static readonly string[] Launchers = { "rundll32", "regsvr32", "powershell", "pwsh", "cmd", "wscript", "cscript", "mshta", "conhost",
+            "python", "pythonw", "py", "node", "java", "javaw", "svchost", "msiexec", "explorer", "dllhost", "taskhostw", "schtasks", "start" };
+
+        // The file a command line is ABOUT: the first absolute path that is not a launcher / interpreter
+        // ("rundll32.exe C:\x\evil.dll,Start" -> C:\x\evil.dll; "powershell -File C:\a.ps1" -> C:\a.ps1); an unquoted
+        // path with spaces is joined up to its extension. "" = nothing but launchers (never point at powershell.exe).
+        internal static string PayloadPath(string s)
+        {
+            List<string> t = Tokens(s);
+            for (int i = 0; i < t.Count; i++)
+            {
+                string x = t[i];
+                int d = -1;
+                for (int k = 0; k + 2 < x.Length; k++)
+                    if (char.IsLetter(x[k]) && x[k + 1] == ':' && (x[k + 2] == '\\' || x[k + 2] == '/')) { d = k; break; }
+                if (d < 0) continue;
+                x = x.Substring(d);
+                int j = i;
+                while (!HasFileExt(x) && j + 1 < t.Count && s.IndexOf('"') < 0) { j++; x += " " + t[j]; }   // C:\Program Files\a b\x.exe
+                int c = x.IndexOf(','); if (c > 0) x = x.Substring(0, c);
+                x = x.TrimEnd(';', ')', '\'');
+                string nm = x.Substring(Math.Max(x.LastIndexOf('\\'), x.LastIndexOf('/')) + 1).ToLowerInvariant();
+                if (nm.EndsWith(".exe")) nm = nm.Substring(0, nm.Length - 4);
+                if (Array.IndexOf(Launchers, nm) >= 0) { i = j; continue; }
+                return x;
+            }
+            return "";
+        }
+
+        static bool HasFileExt(string p)
+        {
+            string nm = p.Substring(Math.Max(p.LastIndexOf('\\'), p.LastIndexOf('/')) + 1);
+            int c = nm.IndexOf(','); if (c > 0) nm = nm.Substring(0, c);
+            int dot = nm.LastIndexOf('.');
+            return dot > 0 && nm.Length - dot >= 2 && nm.Length - dot <= 5;
+        }
+
+        // A shell link (.lnk, [MS-SHLLINK]): {target path, arguments}; null = not a readable link. Target = LinkInfo
+        // LocalBasePath (+ CommonPathSuffix), else the RELATIVE_PATH string; IDList-only links give "".
+        internal static string[] LnkTarget(byte[] b)
+        {
+            try
+            {
+                if (b == null || b.Length < 0x4C || BitConverter.ToUInt32(b, 0) != 0x4C) return null;
+                uint flags = BitConverter.ToUInt32(b, 0x14);
+                bool uni = (flags & 0x80) != 0;
+                int pos = 0x4C;
+                if ((flags & 0x1) != 0) pos += 2 + BitConverter.ToUInt16(b, pos);              // LinkTargetIDList
+                string target = "";
+                if ((flags & 0x2) != 0)                                                          // LinkInfo
+                {
+                    int li = pos;
+                    int size = (int)BitConverter.ToUInt32(b, li);
+                    int hdr = (int)BitConverter.ToUInt32(b, li + 4);
+                    uint lflags = BitConverter.ToUInt32(b, li + 8);
+                    if ((lflags & 1) != 0)
+                    {
+                        int lbp = (int)BitConverter.ToUInt32(b, li + 16), suf = (int)BitConverter.ToUInt32(b, li + 24);
+                        if (hdr >= 0x24)
+                        {
+                            int lbpU = (int)BitConverter.ToUInt32(b, li + 28), sufU = (int)BitConverter.ToUInt32(b, li + 32);
+                            target = ZStr(b, li + lbpU, true) + (sufU > 0 ? ZStr(b, li + sufU, true) : "");
+                        }
+                        else target = ZStr(b, li + lbp, false) + (suf > 0 ? ZStr(b, li + suf, false) : "");
+                    }
+                    if (size < 4 || li + size > b.Length) return null;
+                    pos = li + size;
+                }
+                string[] str = new string[5];   // NAME, RELATIVE_PATH, WORKING_DIR, ARGUMENTS, ICON_LOCATION
+                for (int i = 0; i < 5; i++)
+                {
+                    if ((flags & (0x4u << i)) == 0) continue;
+                    int n = BitConverter.ToUInt16(b, pos); pos += 2;
+                    int bytes = uni ? n * 2 : n;
+                    if (pos + bytes > b.Length) return null;
+                    str[i] = uni ? Encoding.Unicode.GetString(b, pos, bytes) : Encoding.Default.GetString(b, pos, bytes);
+                    pos += bytes;
+                }
+                if (target.Length == 0 && str[1] != null) target = str[1];
+                return new string[] { target, str[3] ?? "" };
+            }
+            catch { return null; }
+        }
+
+        static string ZStr(byte[] b, int at, bool uni)
+        {
+            if (at < 0 || at >= b.Length) return "";
+            int e = at;
+            if (uni) { while (e + 1 < b.Length && (b[e] != 0 || b[e + 1] != 0)) e += 2; return Encoding.Unicode.GetString(b, at, e - at); }
+            while (e < b.Length && b[e] != 0) e++;
+            return Encoding.Default.GetString(b, at, e - at);
+        }
+
         // ---- hosts ----
         // Active lines of a hosts file as {address, name}: comments (#...) removed, one entry per name; the loopback
         // localhost lines are not returned.
@@ -3122,18 +3216,8 @@ namespace RescueScan
             Nav(curPath);
         }
 
-        static string ExtractPath(string s)
-        {
-            if (s == null) return "";
-            int i = -1;
-            for (int k = 0; k < s.Length - 2; k++)
-                if (char.IsLetter(s[k]) && s[k + 1] == ':' && (s[k + 2] == '\\' || s[k + 2] == '/')) { i = k; break; }
-            if (i < 0) return "";
-            bool q = (i > 0 && s[i - 1] == '"');
-            int j = i;
-            while (j < s.Length && (q ? s[j] != '"' : s[j] != ' ')) j++;
-            return s.Substring(i, j - i).Trim();
-        }
+        // the payload file of a command line (not its interpreter: R097/R100), see Heur.PayloadPath
+        static string ExtractPath(string s) { return Heur.PayloadPath(s); }
 
         // ---- Scan ----
         void Scan()
@@ -4185,6 +4269,35 @@ namespace RescueScan
             }
         }
 
+        // A Startup-folder item: software installs shortcuts, so a program or script placed there directly is SUSPECT;
+        // a .lnk is judged by its target + arguments (REVIEW at least); a small script also by its content (checker).
+        internal static string StartupRisk(string fp, out string shown)
+        {
+            shown = fp;
+            string ext = Path.GetExtension(fp).ToLowerInvariant();
+            string[] direct = { ".exe", ".com", ".scr", ".pif", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta", ".ps1" };
+            string r = Risk(fp);
+            if (Array.IndexOf(direct, ext) >= 0) r = "SUSPECT";
+            byte[] b = null;
+            try { if (new FileInfo(fp).Length <= 1024 * 1024) b = File.ReadAllBytes(fp); } catch { }
+            if (ext == ".lnk" && b != null)
+            {
+                string[] t = Heur.LnkTarget(b);
+                if (t != null && (t[0].Length > 0 || t[1].Length > 0))
+                {
+                    string cmd = (t[0].IndexOf(' ') >= 0 ? "\"" + t[0] + "\"" : t[0]) + (t[1].Length > 0 ? " " + t[1] : "");
+                    shown = fp + "  ->  " + cmd;
+                    r = Heur.Max(r, Risk(cmd));
+                }
+            }
+            else if (b != null && ext != ".exe" && ext != ".com" && ext != ".scr" && ext != ".pif")
+            {
+                string text = Encoding.Default.GetString(b);
+                if (WatchdogRisk(text) == "SUSPECT") { r = "SUSPECT"; shown = fp + "   (внутри: перезапись автозагрузки / задач — «чекер»)"; }
+            }
+            return r == "SUSPECT" ? "SUSPECT" : "REVIEW";
+        }
+
         void AddStartup(List<Finding> f, string dir, string cat)
         {
             List<string> files = new List<string>(), denied = new List<string>();
@@ -4193,7 +4306,8 @@ namespace RescueScan
             {
                 string nm = Path.GetFileName(fp);
                 if (nm.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase)) continue;
-                Add(f, cat, nm, fp, fp, Risk(fp) == "SUSPECT" ? "SUSPECT" : "REVIEW", 2, null, null, fp);
+                string shown, risk = StartupRisk(fp, out shown);
+                Add(f, cat, nm, shown, fp, risk, 2, null, null, fp);
             }
         }
 
