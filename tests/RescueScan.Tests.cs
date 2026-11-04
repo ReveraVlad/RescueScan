@@ -2115,6 +2115,9 @@ namespace RescueScan.Tests
             foreach (string c in clean) Eq("", MainForm.ServiceRisk(c), "clean service: " + c);
             Eq("REVIEW", MainForm.ServiceRisk("C:\\ProgramData\\WindowsTask\\svchost.exe"), "ProgramData service listed");
             Eq("REVIEW", MainForm.ServiceRisk("C:\\Users\\Public\\Libraries\\svc.exe"), "Public service listed");
+            Eq("REVIEW", MainForm.ServiceRisk("C:\\Windows\\RtkBtManServ.exe"), "vendor service in the Windows folder is REVIEW, not SUSPECT");
+            Eq("REVIEW", MainForm.ServiceRisk("\"C:\\Windows\\RtkBtManServ.exe\""), "quoted vendor service in the Windows folder is REVIEW");
+            Eq("SUSPECT", MainForm.ServiceRisk("C:\\Windows\\lsass.exe"), "System32 name masquerading in the Windows folder");
             Eq("REVIEW", MainForm.ServiceRisk("\"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\..\\..\\x\\MsMpEng.exe\""), "no .. games");
             string[] bad = {
                 "cmd.exe /c start C:\\ProgramData\\w\\checker.bat", "cmd /c C:\\Windows\\upd.bat", "wscript.exe C:\\Windows\\w.vbs",

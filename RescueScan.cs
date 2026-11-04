@@ -752,7 +752,12 @@ namespace RescueScan
                         if (KeyExists(key)) { err = "нет доступа к ключу " + key; return null; }
                         v.Delete = true;
                     }
-                    else if (!ReadRaw(k, valueName, out v.Type, out v.Data)) v.Delete = true;
+                    else if (!ReadRaw(k, valueName, out v.Type, out v.Data))
+                    {
+                        // unreadable is not absent: a backup that says "delete on restore" would destroy the real value
+                        if (ValueExists(k, valueName)) { err = "значение не читается: " + key + " \\ " + valueName; return null; }
+                        v.Delete = true;
+                    }
                     s.Values.Add(v);
                     res.Add(s);
                     return res;
@@ -4265,7 +4270,16 @@ namespace RescueScan
             foreach (string e in new string[] { ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta", ".ps1" })
                 if (image.EndsWith(e)) return "SUSPECT";
             if (first.Length >= 2 && first[1] == ':') first = first.Substring(2);
-            if (first.StartsWith("\\windows\\") && first.IndexOf('\\', 9) < 0) return "SUSPECT";   // C:\Windows\<x>.exe
+            if (first.StartsWith("\\windows\\") && first.IndexOf('\\', 9) < 0)   // C:\Windows\<x>.exe (directly in the Windows folder)
+            {
+                // Vendor services really live there (e.g. Realtek Bluetooth C:\Windows\RtkBtManServ.exe), so only a name that
+                // masquerades as a System32 binary (C:\Windows\svchost.exe) is SUSPECT; everything else is REVIEW.
+                foreach (string m in new string[] { "svchost", "lsass", "csrss", "winlogon", "services", "smss", "wininit", "spoolsv",
+                    "taskhost", "taskhostw", "dllhost", "conhost", "rundll32", "regsvr32", "dwm", "sihost", "wuauclt", "msiexec", "lsm",
+                    "ctfmon", "searchindexer", "audiodg", "wmiprvse" })
+                    if (image == m) return "SUSPECT";
+                return Heur.Max(r, "REVIEW");
+            }
             if (image == "rundll32") r = Heur.Max(r, "REVIEW");
             if (r == "REVIEW" && first.IndexOf("..") < 0)
             {
@@ -5518,7 +5532,13 @@ namespace RescueScan
             string c = x.Category;
             if (c.StartsWith("Service") || c.StartsWith("svchost"))
             {
-                string root = ServiceKeyOf(x.DelKey != null ? x.DelKey : x.Location);
+                string k = x.DelKey != null ? x.DelKey : x.Location;
+                string root = ServiceKeyOf(k);
+                // An ImagePath/ServiceDll planted in a NESTED subkey must never disable the real parent service
+                // (malware could steer Start=4 onto a boot driver): only the service key itself or its Parameters key.
+                if (root == null || !(string.Equals(k, root, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(k, root + "\\Parameters", StringComparison.OrdinalIgnoreCase))) return -1;
+                if (!Reg.KeyExists(root)) return 2;   // already removed (e.g. quarantined): never recreate a skeleton service key
                 int a = BackedSet(root, "Start", 4, RegistryValueKind.DWord, true, "Обезвредить: Start=4");
                 if (a == 0) return 0;
                 int b = BackedSet(root, "ErrorControl", 1, RegistryValueKind.DWord, true, "Обезвредить: ErrorControl=1");
@@ -5921,6 +5941,7 @@ namespace RescueScan
             string n = AccName(); if (n == null) return;
             string sid = lvAcc.SelectedItems[0].SubItems[4].Text;
             if (!SidLike(sid)) { MessageBox.Show("Странный SID: " + sid, "Профиль"); return; }
+            if (Reg.KeyExists("HKU\\" + sid)) { MessageBox.Show("Пользователь «" + n + "» сейчас вошёл в систему (его куст загружен в HKEY_USERS).\r\nСначала выйди из этой учётной записи или перезагрузи ПК, потом удаляй профиль.", "Профиль", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
             string win = RunningWinDir();
             string pl = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", pk = pl + "\\" + sid;
             string raw = "", pdir = "";
@@ -5939,17 +5960,18 @@ namespace RescueScan
                 "\r\n+ запись ProfileList (её бэкап — в карантин). Папка удаляется НЕОБРАТИМО.", "Удаление профиля", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
             string typed = Prompt("Для подтверждения введи имя пользователя: " + n, "");
             if (typed == null || typed != n) { MessageBox.Show("Имя не совпало — ничего не удалено.", "Профиль"); return; }
-            string msg = "";
+            quarErr = "";
+            if (!(EnsureTarget() && tgtLive)) { MessageBox.Show("Удаление профиля работает только когда целью выбрана ЖИВАЯ ОС (нужен бэкап записи ProfileList в карантин). Ничего не удалено.", "Профиль"); return; }
+            // ProfileList first (backed up to quarantine; abort if that fails), the irreversible folder delete only afterwards
+            int r = BackedDeleteKey(pk, true, "профиль " + n);
+            if (r == 0) { MessageBox.Show("ProfileList не очищен: " + quarErr + "\r\nПапка профиля НЕ удалялась.", "Профиль"); AccRefresh(); return; }
+            string msg = r == 1 ? "ProfileList очищен (бэкап в карантине). " : "Записи ProfileList нет. ";
             if (path.Length > 0 && FsOps.Exists(path))
             {
                 int failed = 0; string err = "";
                 FsOps.DeleteTree(path, ref failed, ref err);
-                msg += failed == 0 ? "Папка удалена. " : "Папка удалена не полностью (ошибок " + failed + ": " + err + "). ";
+                msg += failed == 0 ? "Папка удалена." : "Папка удалена не полностью (ошибок " + failed + ": " + err + ").";
             }
-            quarErr = "";
-            bool bk = EnsureTarget() && tgtLive;   // the backup needs the live system as the prepared target
-            int r = BackedDeleteKey(pk, bk, "профиль " + n);
-            msg += r == 1 ? "ProfileList очищен." : r == 2 ? "Записи ProfileList нет." : "ProfileList не очищен: " + quarErr;
             MessageBox.Show(msg, "Профиль");
             AccRefresh();
         }
