@@ -100,6 +100,7 @@ namespace RescueScan.Tests
                 Run("Process tree: critical processes", ProcCritical);
                 Run("Watchdog: event names, command lines, back-off, relaunch cap", WatchdogArgsCases);
                 Run("Launch: exe direct, batch via cmd, everything else as text", LaunchModes);
+                Run("Export: CSV cells quoted, quotes doubled, formulas neutralised", CsvCells);
                 Run("Process tree: real Toolhelp snapshot sees this process [win]", ProcSnapshotWin);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
@@ -2495,6 +2496,18 @@ namespace RescueScan.Tests
             True(par.ContainsKey(me), "own pid listed");
             True(names[me].EndsWith(".exe", StringComparison.OrdinalIgnoreCase), "Unicode image name: " + names[me]);
             True(par.Count > 5, "more than a handful of processes");
+        }
+        static void CsvCells()
+        {
+            Eq("\"\"", MainForm.CsvCell(null), "null");
+            Eq("\"plain\"", MainForm.CsvCell("plain"), "plain");
+            Eq("\"\"\"C:\\Program Files\\x.exe\"\" /a\"", MainForm.CsvCell("\"C:\\Program Files\\x.exe\" /a"), "quotes doubled, not replaced");
+            Eq("\"a;b\"", MainForm.CsvCell("a;b"), "separator inside quotes");
+            Eq("\"'=cmd|' /C calc'!A0\"", MainForm.CsvCell("=cmd|' /C calc'!A0"), "= neutralised");
+            foreach (string p in new string[] { "+", "-", "@", "\t", "\r" })
+                True(MainForm.CsvCell(p + "SUM(1)").StartsWith("\"'" + p), "prefix " + Show(p) + " neutralised");
+            Eq("\"a=b\"", MainForm.CsvCell("a=b"), "= inside is fine");
+            Eq("\"line1\nline2\"", MainForm.CsvCell("line1\nline2"), "newline kept inside the quoted cell");
         }
     }
 }

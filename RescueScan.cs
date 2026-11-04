@@ -5781,13 +5781,21 @@ namespace RescueScan
             foreach (ListViewItem it in lv.Items)
             {
                 Finding x = (Finding)it.Tag;
-                sb.AppendLine(Q(x.Category) + ";" + Q(x.Name) + ";" + Q(x.Value) + ";" + Q(x.Location) + ";" + x.Risk);
+                sb.AppendLine(CsvCell(x.Category) + ";" + CsvCell(x.Name) + ";" + CsvCell(x.Value) + ";" + CsvCell(x.Location) + ";" + CsvCell(x.Risk));
             }
             try { File.WriteAllText(sd.FileName, sb.ToString(), Encoding.UTF8); lblStatus.Text = "Сохранено: " + sd.FileName; }
             catch (Exception ex) { MessageBox.Show(ex.Message); }
         }
 
-        static string Q(string s) { if (s == null) return "\"\""; return "\"" + s.Replace("\"", "'") + "\""; }
+        // One CSV cell (RFC 4180): always quoted, quotes doubled (the evidence is kept as is). Names and commands come from
+        // the malware: a cell starting with = + - @ TAB CR would be a live formula in Excel/LibreOffice (DDE, HYPERLINK
+        // exfiltration), so it gets a leading apostrophe - the usual CSV-injection neutralisation (OWASP).
+        internal static string CsvCell(string s)
+        {
+            if (s == null) s = "";
+            if (s.Length > 0 && "=+-@\t\r".IndexOf(s[0]) >= 0) s = "'" + s;
+            return "\"" + s.Replace("\"", "\"\"") + "\"";
+        }
     }
 
     // ================= WATCHDOG (user-mode self-heal) =================
