@@ -5468,6 +5468,7 @@ namespace RescueScan
             string exe = p, args = "";
             if (mode == "cmd") { exe = Reg.SysExe("cmd.exe"); args = "/k " + Reg.QuoteArg(p); }
             else if (mode == "text") { exe = Reg.SysExe("notepad.exe"); args = Reg.QuoteArg(p); }
+            if (exe.IndexOf('\\') < 0) { MessageBox.Show("Нет " + exe + " в System32 — открыть нечем.", "Запуск"); return; }   // never a search-path lookup
             string hijack = Reg.IsWindows ? Reg.ToolHijack("HKLM\\SOFTWARE", Path.GetFileName(exe)) : "";
             if (hijack.Length > 0)
             {
