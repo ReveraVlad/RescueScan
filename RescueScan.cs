@@ -533,7 +533,14 @@ namespace RescueScan
         TabControl tabs;
         ListView lvProc; Label lblProc;
         ListView lvFiles; TextBox txtPath; Label lblFiles;
-        List<string> mounted = new List<string>();
+        List<string> mounted = new List<string>();     // hives WE loaded under HKLM (e.g. RS_SOFT): unloaded on rescan / exit
+        // ---- scan target: ONE source of truth for the scan AND every repair/unlock/assoc/IFEO/policy action ----
+        bool tgtReady = false;       // prepared by Scan (or by the first action before any scan)
+        bool tgtLive = false;        // the target is the running OS (live registry)
+        string tgtWinDir = "";       // e.g. D:\Windows
+        string tgtSoft = "";         // SOFTWARE root: HKLM\RS_SOFT (offline) / HKLM\SOFTWARE (live); "" = not available
+        string tgtSys = "";          // SYSTEM root:   HKLM\RS_SYS  (offline) / HKLM\SYSTEM   (live); "" = not available
+        List<string[]> tgtUsers = new List<string[]>();   // {name, hive root (HKLM\RS_U<n> / HKU\<SID>) or "", profile dir}
         string curDrive = "";
         string curPath = "";
         HashSet<string> flagged = new HashSet<string>();
@@ -687,12 +694,12 @@ namespace RescueScan
             Label rlbl = new Label(); rlbl.Left = 8; rlbl.Top = 38; rlbl.Width = 1030; rlbl.Text = "Красным — значение ≠ дефолт (подмена). «Снять блокировки» = убрать DisableTaskMgr/DisableRegistryTools/NoRun + IFEO-дебагеры. Работает офлайн и на живой ОС.";
             rbot.Controls.Add(bunlock); rbot.Controls.Add(bassoc); rbot.Controls.Add(rlbl);
             tp4.Controls.Add(lvRepair); tp4.Controls.Add(rbar); tp4.Controls.Add(rbot);
-            rref.Click += delegate { RepairRefresh(); };
+            rref.Click += delegate { RepairRefresh(true); };
             rdef.Click += delegate { RepairSet(false); };
             rcus.Click += delegate { RepairSet(true); };
             chkGuard.CheckedChanged += delegate { GuardToggle(); };
-            bunlock.Click += delegate { int a = RestoreRestrictions(); int b = ClearIFEODirect(); MessageBox.Show("Снято ограничений политик: " + a + "\r\nСнято IFEO-блокировок: " + b, "Разблокировка"); };
-            bassoc.Click += delegate { int a = RestoreAssoc(); MessageBox.Show("Восстановлено ассоциаций/иконок: " + a, "Ассоциации"); };
+            bunlock.Click += delegate { if (!RequireSoft("Снять блокировки")) return; int a = RestoreRestrictions(); int b = ClearIFEODirect(); MessageBox.Show("Снято ограничений политик: " + a + "\r\nСнято IFEO-блокировок: " + b + "\r\nЦель: " + TargetName(), "Разблокировка"); };
+            bassoc.Click += delegate { if (!RequireSoft("Вернуть ассоциации")) return; int a = RestoreAssoc(); MessageBox.Show("Восстановлено ассоциаций/иконок: " + a + "\r\nЦель: " + TargetName(), "Ассоциации"); };
 
             // ---- TAB (accounts): live net user ops ----
             Panel abar = new Panel(); abar.Dock = DockStyle.Top; abar.Height = 36;
@@ -758,7 +765,16 @@ namespace RescueScan
             btnDelete.Click += delegate { DeleteChecked(lv); };
             btnExport.Click += delegate { Export(); };
             this.TopMost = true;
-            this.FormClosing += delegate { stopping = true; guarding = false; StopWatchdog(); UnloadAll(); };
+            this.FormClosing += delegate(object s, FormClosingEventArgs e)
+            {
+                stopping = true; guarding = false; StopWatchdog();
+                string uf = UnloadAll();
+                if (uf.Length == 0) return;
+                Watchdog.Log("выход: " + uf);
+                if (e.CloseReason == CloseReason.UserClosing)
+                    MessageBox.Show("Не все кусты реестра выгружены: " + uf + "\r\nОни останутся смонтированными до перезагрузки (или выгрузи вручную: reg unload).",
+                        "RescueScan", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            };
             this.Load += delegate { StartupPick(); };
             this.Shown += delegate { RefreshProcs(); ShowDrives(); RepairRefresh(); QuarAutoFind(); AccRefresh(); };
         }
@@ -888,10 +904,88 @@ namespace RescueScan
             else lblStatus.Text = "Windows не найдена на подключённых дисках.";
         }
 
-        void UnloadAll()
+        // Unloads every hive WE mounted; the target is no longer prepared afterwards. Returns "" or a Russian description
+        // of what could NOT be unloaded (those stay in 'mounted' and are retried on the next rescan / on exit).
+        string UnloadAll()
         {
-            foreach (string m in mounted) Reg.Run("unload " + Reg.QuoteArg("HKLM\\" + m));
-            mounted.Clear();
+            tgtReady = false; tgtSoft = ""; tgtSys = ""; tgtUsers.Clear();
+            if (mounted.Count == 0) return "";
+            GC.Collect(); GC.WaitForPendingFinalizers();   // a leaked RegistryKey handle into a hive would block the unload
+            List<string> still = new List<string>();
+            foreach (string m in mounted)
+            {
+                string o;
+                Reg.RunCode("unload " + Reg.QuoteArg("HKLM\\" + m), out o);
+                if (Reg.KeyExists("HKLM\\" + m)) still.Add(m);
+            }
+            mounted.Clear(); mounted.AddRange(still);
+            if (still.Count == 0) return "";
+            return "не выгружено: HKLM\\" + string.Join(", HKLM\\", still.ToArray()) + " (закрой regedit и повтори)";
+        }
+
+        // Mounts a hive file at HKLM\<name>: 0 = mounted, 1 = load failed, 2 = the name is held by an older mount (crashed
+        // earlier run, regedit...) that cannot be unloaded -> the new mount is NOT pretended to have worked.
+        int MountHive(string name, string file, StringBuilder warn)
+        {
+            string p = "HKLM\\" + name, o;
+            if (Reg.KeyExists(p))
+            {
+                Reg.RunCode("unload " + Reg.QuoteArg(p), out o);
+                if (Reg.KeyExists(p))
+                {
+                    warn.Append(p + " занят старым монтированием (прошлый запуск? regedit?) и не выгружается. ");
+                    if (!mounted.Contains(name)) mounted.Add(name);   // try again on exit
+                    return 2;
+                }
+                mounted.Remove(name);
+                warn.Append("выгружен старый " + p + ". ");
+            }
+            Reg.RunCode("load " + Reg.QuoteArg(p) + " " + Reg.QuoteArg(file), out o);
+            if (!Reg.KeyExists(p)) return 1;
+            mounted.Add(name);
+            return 0;
+        }
+
+        // Prepares the target used by the scan AND by all repair actions: unloads old mounts, then mounts SOFTWARE,
+        // SYSTEM and the user hives of the selected Windows. Returns warnings for the status line ("" = all fine).
+        string PrepareTarget(string winDir, bool live)
+        {
+            StringBuilder warn = new StringBuilder();
+            string uf = UnloadAll();
+            if (uf.Length > 0) warn.Append(uf + ". ");
+            tgtWinDir = winDir; tgtLive = live;
+            curDrive = winDir.Substring(0, 2);   // D:
+            string cfg = winDir + "\\System32\\config";
+            if (MountHive("RS_SOFT", cfg + "\\SOFTWARE", warn) == 0) tgtSoft = "HKLM\\RS_SOFT";
+            else warn.Append("SOFTWARE не смонтирован. ");
+            if (MountHive("RS_SYS", cfg + "\\SYSTEM", warn) == 0) tgtSys = "HKLM\\RS_SYS";
+            else warn.Append("SYSTEM не смонтирован. ");
+            int ui = 0, failed = 0;
+            string usersDir = curDrive + "\\Users";
+            try
+            {
+                if (Directory.Exists(usersDir))
+                    foreach (string ud in Directory.GetDirectories(usersDir))
+                    {
+                        string name = Path.GetFileName(ud), nt = ud + "\\NTUSER.DAT";
+                        if (!File.Exists(nt)) continue;
+                        if (name.Equals("Default", StringComparison.OrdinalIgnoreCase) || name.Equals("Public", StringComparison.OrdinalIgnoreCase)) continue;
+                        string root = "";
+                        while (ui < 100)
+                        {
+                            string mp = "RS_U" + ui;
+                            int r = MountHive(mp, nt, warn);
+                            if (r == 2) { ui++; continue; }   // name held by a stale mount: use the next one
+                            if (r == 0) { root = "HKLM\\" + mp; ui++; } else failed++;
+                            break;
+                        }
+                        tgtUsers.Add(new string[] { name, root, ud });
+                    }
+            }
+            catch (Exception ex) { warn.Append("профили: " + ex.Message + " "); }
+            if (failed > 0) warn.Append("не смонтировано профилей: " + failed + ". ");
+            tgtReady = true;
+            return warn.ToString().Trim();
         }
 
         // ================= TASK MANAGER =================
@@ -1090,17 +1184,12 @@ namespace RescueScan
             Cursor.Current = Cursors.WaitCursor;
             lv.Items.Clear();
             string winDir = cboWin.SelectedItem.ToString();       // e.g. D:\Windows
-            curDrive = winDir.Substring(0, 2);                    // D:
-            string cfg = winDir + "\\System32\\config";
-
-            UnloadAll();
-            int rc; string o;
-            rc = Reg.RunCode("load " + Reg.QuoteArg("HKLM\\RS_SOFT") + " " + Reg.QuoteArg(cfg + "\\SOFTWARE"), out o); if (rc == 0) mounted.Add("RS_SOFT");
-            rc = Reg.RunCode("load " + Reg.QuoteArg("HKLM\\RS_SYS") + " " + Reg.QuoteArg(cfg + "\\SYSTEM"), out o); if (rc == 0) mounted.Add("RS_SYS");
+            // (re)mount the hives of THIS installation; all repair actions then use this same target
+            string warn = PrepareTarget(winDir, false);
 
             List<Finding> f = new List<Finding>();
-            string SOFT = "HKLM\\RS_SOFT";
-            string SYS = "HKLM\\RS_SYS";
+            string SOFT = tgtSoft;                                // "" = hive not mounted: nothing is read from it
+            string SYS = tgtSys;
 
             // ---- HKLM Run family ----
             AddValues(f, "Run (HKLM)", SOFT + "\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -1175,40 +1264,29 @@ namespace RescueScan
             // svchost-hosted ServiceDll, LSA packages, Print Monitors, SessionMgr extras
             ScanExtraSystem(f, SYS + "\\" + ccs);
 
-            // ---- Per-user hives ----
-            int ui = 0;
+            // ---- Per-user hives (mounted / located by PrepareTarget) ----
             string usersDir = curDrive + "\\Users";
-            if (Directory.Exists(usersDir))
+            foreach (string[] tu in tgtUsers)
             {
-                foreach (string ud in Directory.GetDirectories(usersDir))
-                {
-                    string nt = ud + "\\NTUSER.DAT";
-                    string name = Path.GetFileName(ud);
-                    if (!File.Exists(nt)) continue;
-                    if (name.Equals("Default", StringComparison.OrdinalIgnoreCase) || name.Equals("Public", StringComparison.OrdinalIgnoreCase)) continue;
-                    string mp = "RS_U" + ui;
-                    rc = Reg.RunCode("load " + Reg.QuoteArg("HKLM\\" + mp) + " " + Reg.QuoteArg(nt), out o);
-                    if (rc != 0) continue;
-                    mounted.Add(mp);
-                    string U = "HKLM\\" + mp;
-                    AddValues(f, "Run [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-                    AddValues(f, "RunOnce [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
-                    AddValuesRisk(f, "Policies Run [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", "SUSPECT");
-                    string usf = U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders";
-                    foreach (string[] v in Reg.Values(usf))
-                        if (v[0].Equals("Startup", StringComparison.OrdinalIgnoreCase) && v[1].IndexOf("Startup", StringComparison.OrdinalIgnoreCase) < 0)
-                            Add(f, "Startup redirect [" + name + "]", v[0], v[1], usf, "SUSPECT", 0, usf, v[0], null);
-                    string uw = U + "\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
-                    foreach (string[] v in Reg.Values(uw))
-                        if (v[0].Equals("Load", StringComparison.OrdinalIgnoreCase) || v[0].Equals("Run", StringComparison.OrdinalIgnoreCase))
-                            Add(f, "Win Load/Run [" + name + "]", v[0], v[1], uw, "SUSPECT", 0, uw, v[0], null);
-                    // desktop wallpaper (for "effects"/hijacked desktop)
-                    string dk = U + "\\Control Panel\\Desktop";
-                    foreach (string[] v in Reg.Values(dk))
-                        if (v[0].Equals("Wallpaper", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
-                            Add(f, "Обои [" + name + "]", v[0], v[1], dk, "REVIEW", 0, dk, v[0], null);
-                    ui++;
-                }
+                string name = tu[0];
+                string U = tu[1];
+                if (U.Length == 0) continue;   // hive not available
+                AddValues(f, "Run [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+                AddValues(f, "RunOnce [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+                AddValuesRisk(f, "Policies Run [" + name + "]", U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", "SUSPECT");
+                string usf = U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders";
+                foreach (string[] v in Reg.Values(usf))
+                    if (v[0].Equals("Startup", StringComparison.OrdinalIgnoreCase) && v[1].IndexOf("Startup", StringComparison.OrdinalIgnoreCase) < 0)
+                        Add(f, "Startup redirect [" + name + "]", v[0], v[1], usf, "SUSPECT", 0, usf, v[0], null);
+                string uw = U + "\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
+                foreach (string[] v in Reg.Values(uw))
+                    if (v[0].Equals("Load", StringComparison.OrdinalIgnoreCase) || v[0].Equals("Run", StringComparison.OrdinalIgnoreCase))
+                        Add(f, "Win Load/Run [" + name + "]", v[0], v[1], uw, "SUSPECT", 0, uw, v[0], null);
+                // desktop wallpaper (for "effects"/hijacked desktop)
+                string dk = U + "\\Control Panel\\Desktop";
+                foreach (string[] v in Reg.Values(dk))
+                    if (v[0].Equals("Wallpaper", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
+                        Add(f, "Обои [" + name + "]", v[0], v[1], dk, "REVIEW", 0, dk, v[0], null);
             }
 
             // ---- Filesystem: Startup folders ----
@@ -1259,9 +1337,14 @@ namespace RescueScan
             }
             Cursor.Current = Cursors.Default;
             int susp = 0; foreach (Finding x in f) if (x.Risk == "SUSPECT") susp++;
-            lblStatus.Text = "Записей: " + f.Count + "   подозрительных: " + susp + "   (ControlSet: " + ccs + ")";
+            lblStatus.Text = "Записей: " + f.Count + "   подозрительных: " + susp + "   (ControlSet: " + ccs + ")   цель: " + TargetName()
+                + (warn.Length > 0 ? "   ВНИМАНИЕ: " + warn : "");
             RepairRefresh();
             SimpleRefresh();
+            if (tgtSoft.Length == 0 || tgtSys.Length == 0)
+                MessageBox.Show("Кусты реестра системы " + tgtWinDir + " смонтированы не все:\r\n" + warn +
+                    "\r\n\r\nСкан реестра НЕПОЛНЫЙ. Ремонт/разблокировка для этой цели будут отменены (на живую ОС программа не переключается).",
+                    "RescueScan", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         // Value names are exact; only the real unnamed default value ("") is skipped, so names such as "(x)" or
@@ -1807,24 +1890,57 @@ namespace RescueScan
             if (lastFindings.Count == 0) lblStatus.Text = "Нажми «Сканировать».";
         }
 
-        // офлайн-куст если смонтирован, иначе живой HKLM\SOFTWARE
-        string SoftRoot() { return mounted.Contains("RS_SOFT") ? "HKLM\\RS_SOFT" : "HKLM\\SOFTWARE"; }
-        bool IsOffline() { return mounted.Contains("RS_SOFT"); }
+        // SOFTWARE root of the target the scan used. "" = not available: actions refuse (RequireSoft) instead of
+        // silently falling back to the live HKLM\SOFTWARE of the machine that runs the tool.
+        string SoftRoot() { return tgtSoft; }
+        bool IsOffline() { return tgtReady && !tgtLive; }
 
-        void RepairRefresh()
+        string TargetName() { return tgtReady ? tgtWinDir + (tgtLive ? " (живая)" : " (офлайн)") : "не выбрана"; }
+
+        // Target for actions = the one the last scan used; before the first scan, the installation picked in the list.
+        bool EnsureTarget()
+        {
+            if (tgtReady) return true;
+            if (cboWin.SelectedItem == null) return false;
+            string w = PrepareTarget(cboWin.SelectedItem.ToString(), false);
+            lblStatus.Text = "Цель: " + TargetName() + (w.Length > 0 ? "   ВНИМАНИЕ: " + w : "");
+            return tgtReady;
+        }
+
+        // Guard for every repair / unlock / assoc / IFEO / policy action: the target's SOFTWARE hive must be available.
+        bool RequireSoft(string what)
+        {
+            if (!EnsureTarget())
+            {
+                MessageBox.Show("Сначала выбери установку Windows («Найти ОС») и нажми «Сканировать».", what);
+                return false;
+            }
+            if (tgtSoft.Length > 0) return true;
+            MessageBox.Show("Куст SOFTWARE выбранной системы " + tgtWinDir + " не смонтирован — «" + what + "» отменено.\r\n" +
+                "Изменения НЕ применяются к системе, на которой запущена программа.\r\n" +
+                "Закрой regedit (если открыт) и нажми «Сканировать» ещё раз.", what, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        void RepairRefresh() { RepairRefresh(false); }
+
+        void RepairRefresh(bool prepare)
         {
             lvRepair.Items.Clear();
+            if (prepare) EnsureTarget();
             string root = SoftRoot();
             foreach (string[] a in Anchors())
             {
                 string cur = "(нет значения)";
-                foreach (string[] v in Reg.Values(root + "\\" + a[1]))
-                    if (v[0].Equals(a[2], StringComparison.OrdinalIgnoreCase)) cur = v[1];
+                if (root.Length == 0) cur = tgtReady ? "(куст SOFTWARE цели не смонтирован)" : "(цель не выбрана: «Сканировать» или «Обновить»)";
+                else
+                    foreach (string[] v in Reg.Values(root + "\\" + a[1]))
+                        if (v[0].Equals(a[2], StringComparison.OrdinalIgnoreCase)) cur = v[1];
                 string def = a[4] == "1" ? "(удалить значение)" : (a[3].Length == 0 ? "(пусто)" : a[3]);
                 ListViewItem it = new ListViewItem(new string[] { a[0], cur, def });
                 it.Tag = a;
                 bool good = a[4] == "1" ? (cur == "(нет значения)") : string.Equals(cur.Trim(), a[3], StringComparison.OrdinalIgnoreCase);
-                if (!good) it.BackColor = Color.FromArgb(255, 220, 220);
+                if (!good && root.Length > 0) it.BackColor = Color.FromArgb(255, 220, 220);
                 lvRepair.Items.Add(it);
             }
         }
@@ -1832,6 +1948,7 @@ namespace RescueScan
         void RepairSet(bool custom)
         {
             if (lvRepair.SelectedItems.Count == 0) { MessageBox.Show("Выбери строку в списке, потом жми «→ Дефолт» или «→ Своё…»."); return; }
+            if (!RequireSoft("Ремонт")) return;
             string root = SoftRoot();
             foreach (ListViewItem it in lvRepair.SelectedItems)
             {
@@ -1850,7 +1967,7 @@ namespace RescueScan
                 }
             }
             RepairRefresh();
-            lblStatus.Text = IsOffline() ? "Ремонт применён к офлайн-кусту." : "Ремонт применён к ЖИВОЙ системе (HKLM\\SOFTWARE).";
+            lblStatus.Text = IsOffline() ? "Ремонт применён к офлайн-кусту (" + tgtWinDir + ")." : "Ремонт применён к ЖИВОЙ системе (HKLM\\SOFTWARE).";
         }
 
         static string Prompt(string title, string def)
@@ -1972,6 +2089,7 @@ namespace RescueScan
         void RestoreWinlogonDefaults()
         {
             string root = SoftRoot();
+            if (root.Length == 0) return;   // never a fallback to the live HKLM (see RequireSoft)
             foreach (string[] a in Anchors())
             {
                 string key = root + "\\" + a[1];
@@ -1984,6 +2102,7 @@ namespace RescueScan
         int ClearIFEODirect()
         {
             int n = 0;
+            if (SoftRoot().Length == 0) return 0;
             string ifeo = SoftRoot() + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
             foreach (string sk in Reg.Subkeys(ifeo))
                 foreach (string[] v in Reg.Values(sk))
@@ -1996,7 +2115,7 @@ namespace RescueScan
         {
             List<string> b = new List<string>();
             b.Add(SoftRoot() + "\\Microsoft\\Windows\\CurrentVersion\\Policies");
-            foreach (string m in mounted) if (m.StartsWith("RS_U")) b.Add("HKLM\\" + m + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies");
+            foreach (string[] u in tgtUsers) if (u[1].Length > 0) b.Add(u[1] + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies");
             if (!IsOffline()) b.Add("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies");
             return b;
         }
@@ -2004,6 +2123,7 @@ namespace RescueScan
         int RestoreRestrictions()
         {
             int n = 0;
+            if (SoftRoot().Length == 0) return 0;
             string[] sysVals = { "DisableTaskMgr", "DisableRegistryTools", "DisableCMD", "DisableChangePassword" };
             string[] expVals = { "NoRun", "NoFolderOptions", "NoControlPanel", "NoDesktop", "NoViewContextMenu", "NoFind", "NoClose", "RestrictRun" };
             foreach (string b in PolicyBases())
@@ -2017,6 +2137,7 @@ namespace RescueScan
         int RestoreAssoc()
         {
             int n = 0; string root = SoftRoot() + "\\Classes";
+            if (SoftRoot().Length == 0) return 0;
             string cmd = "\"%1\" %*";
             string[][] map = { new string[]{".exe","exefile"}, new string[]{".com","comfile"}, new string[]{".bat","batfile"}, new string[]{".cmd","cmdfile"} };
             foreach (string[] m in map)
@@ -2067,10 +2188,13 @@ namespace RescueScan
             Cursor.Current = Cursors.WaitCursor;
             StringBuilder r = new StringBuilder();
             if (oScan.Checked) { Scan(); r.AppendLine("Скан: записей " + lastFindings.Count); }
-            if (oWinlogon.Checked) { RestoreWinlogonDefaults(); r.AppendLine("Winlogon Shell/Userinit -> дефолт"); }
-            if (oIFEO.Checked) { int i = ClearIFEODirect(); r.AppendLine("Снято IFEO-блокировок: " + i); }
-            if (oRestrict.Checked) { int i = RestoreRestrictions(); r.AppendLine("Снято ограничений политик: " + i); }
-            if (oAssoc.Checked) { int i = RestoreAssoc(); r.AppendLine("Ассоциации/иконки восстановлены (" + i + ")"); }
+            bool soft = EnsureTarget() && SoftRoot().Length > 0;   // repairs act only on the scanned target, never on a fallback
+            if (!soft && (oWinlogon.Checked || oIFEO.Checked || oRestrict.Checked || oAssoc.Checked))
+                r.AppendLine("ВНИМАНИЕ: куст SOFTWARE цели (" + TargetName() + ") не смонтирован — Winlogon/IFEO/ограничения/ассоциации НЕ тронуты.");
+            if (soft && oWinlogon.Checked) { RestoreWinlogonDefaults(); r.AppendLine("Winlogon Shell/Userinit -> дефолт"); }
+            if (soft && oIFEO.Checked) { int i = ClearIFEODirect(); r.AppendLine("Снято IFEO-блокировок: " + i); }
+            if (soft && oRestrict.Checked) { int i = RestoreRestrictions(); r.AppendLine("Снято ограничений политик: " + i); }
+            if (soft && oAssoc.Checked) { int i = RestoreAssoc(); r.AppendLine("Ассоциации/иконки восстановлены (" + i + ")"); }
             if (oDefuse.Checked) { int d = 0; foreach (Finding x in lastFindings) if (x.Risk == "SUSPECT" && DefuseOne(x)) d++; r.AppendLine("Обезврежено якорей: " + d); }
             if (oQuar.Checked) { int ok, fail; QuarantineSuspectAll(out ok, out fail); r.AppendLine("В карантин: " + ok + "  (ошибок " + fail + ")  -> " + quarDir); }
             if (oWatch.Checked) { chkWatch.Checked = true; r.AppendLine("Watchdog включён"); }
