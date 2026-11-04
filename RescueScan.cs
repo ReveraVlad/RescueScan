@@ -2226,6 +2226,41 @@ namespace RescueScan
         }
     }
 
+    // Fast Startup / hibernation of an OFFLINE target. A normal «Завершение работы» with Fast Startup (default since
+    // Windows 8) hibernates the kernel session into <system drive>\hiberfil.sys, including the loaded SYSTEM/SOFTWARE
+    // hives and NTFS caches. Changes made from WinPE are then discarded when Windows resumes (the malware's values come
+    // back) or corrupt the volume. Signature of the first 4 bytes: "hibr"/"HIBR" = valid image (ntfs-3g refuses to
+    // mount read-write for the same reason), "rstr"/"RSTR" = resume in progress; zeros / "wake" / no file = no image.
+    static class Hiber
+    {
+        internal static bool ActiveSignature(byte[] head)
+        {
+            if (head == null || head.Length < 4) return false;
+            string sig = Encoding.ASCII.GetString(head, 0, 4).ToLowerInvariant();
+            return sig == "hibr" || sig == "rstr";
+        }
+
+        // "C:" -> true when C:\hiberfil.sys holds an active hibernation image. Unreadable / missing = false.
+        internal static bool Active(string drive)
+        {
+            if (string.IsNullOrEmpty(drive) || drive.Length < 2 || drive[1] != ':') return false;
+            return ActiveFile(drive.Substring(0, 2) + "\\hiberfil.sys");
+        }
+
+        internal static bool ActiveFile(string f)
+        {
+            try
+            {
+                if (!File.Exists(f)) return false;
+                byte[] b = new byte[4];
+                using (FileStream fs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    if (fs.Read(b, 0, 4) < 4) return false;
+                return ActiveSignature(b);
+            }
+            catch { return false; }
+        }
+    }
+
     // File-system operations that work for every name Win32 can store: on Windows through \\?\ paths (names ending in
     // "." or " ", which the normal path rules silently strip and then hit a DIFFERENT file), without following
     // junctions / symlinks, read-only / hidden / system cleared first. Elsewhere (Mono, tests) the managed API.
@@ -2699,6 +2734,9 @@ namespace RescueScan
 "Два режима: ОФЛАЙН (загрузился в WinPE, цель выключена — вирус не сопротивляется) и ЖИВОЙ (запущен в заражённой ОС от админа).\r\n" +
 "Требуется .NET Framework 4.x. В WinPE НЕ запустится без компонентов WinPE-WMI + WinPE-NetFx в boot.wim. Стоковый WinRE («Дополнительные\r\n" +
 "параметры -> Командная строка») .NET не содержит — там программа не стартует; RescueScan.cmd рядом с exe проверит это и объяснит.\r\n" +
+"ГИБЕРНАЦИЯ: если офлайн-Windows выключена с «Быстрым запуском» (в <диск>\\hiberfil.sys живой образ памяти), при включении она продолжит\r\n" +
+"   из образа — изменения отсюда потеряются или повредят диск. Скан это покажет, а любое изменение на этом диске спросит подтверждение.\r\n" +
+"   Правильно: загрузиться в ту Windows, сделать «Перезагрузку» (или shutdown /s /full /t 0) и только потом чистить.\r\n" +
 "\r\n" +
 "ЦВЕТА: Красный = SUSPECT (сильный признак: temp, -enc/hidden, интерпретатор+загрузка, двойное расширение, exe в drivers).\r\n" +
 "       Жёлтый = REVIEW (легит, но частое у малвари место: AppData/ProgramData/Downloads/автозагрузка) — просто глянь.\r\n" +
@@ -3056,6 +3094,8 @@ namespace RescueScan
             mounts.CleanupStale(warn);   // ALL RS_* left by a crashed / killed earlier run, not only the names reused below
             tgtWinDir = t.WinDir; tgtLive = t.Live;
             curDrive = t.WinDir.Substring(0, 2);   // D:
+            if (!t.Live && Hiber.Active(curDrive))
+                warn.Append("Windows на " + curDrive + " ГИБЕРНИРОВАНА (Быстрый запуск) — изменения отсюда могут потеряться: сначала «Перезагрузка» в ней. ");
             if (guarding && !tgtLive)   // the guard writes the RUNNING OS's Winlogon: only while that is the target
             {
                 chkGuard.Checked = false; guarding = false;
@@ -3372,6 +3412,7 @@ namespace RescueScan
         void DeleteFile()
         {
             if (lvFiles.SelectedItems.Count == 0) { MessageBox.Show("Выбери файл/папку."); return; }
+            if (!HiberGuardFiles("Удалить")) return;
             List<string> files = new List<string>(), dirs = new List<string>(), refused = new List<string>();
             foreach (ListViewItem it in lvFiles.SelectedItems)
             {
@@ -3409,6 +3450,7 @@ namespace RescueScan
         void Unhide()
         {
             if (lvFiles.SelectedItems.Count == 0) { MessageBox.Show("Выбери элемент."); return; }
+            if (!HiberGuardFiles("Снять скрытие")) return;
             foreach (ListViewItem it in lvFiles.SelectedItems)
             {
                 string p = ((string)it.Tag).Substring(2);
@@ -3423,6 +3465,7 @@ namespace RescueScan
             if (lvFiles.SelectedItems.Count != 1) { MessageBox.Show("Выбери ровно один элемент."); return; }
             string tag = (string)lvFiles.SelectedItems[0].Tag;
             if (!tag.StartsWith("F|") && !tag.StartsWith("D|")) return;
+            if (!HiberGuardFiles("Переименовать")) return;
             string p = tag.Substring(2);
             string parent = null;
             try { parent = Path.GetDirectoryName(p.TrimEnd('\\')); } catch { }
@@ -4835,6 +4878,7 @@ namespace RescueScan
         {
             int n = 0; foreach (ListViewItem it in target.Items) if (it.Checked) n++;
             if (n == 0) { MessageBox.Show("Ничего не отмечено."); return; }
+            if (!HiberGuard("Карантин", null)) return;
             if (MessageBox.Show("Карантин отмеченных (" + n + ")?\r\nФайлы переносятся в папку карантина, значения и ветки реестра сохраняются в .reg и удаляются " +
                 "(Winlogon Shell/Userinit, BootExecute и т.п. не удаляются, а возвращаются к дефолту — тоже с бэкапом).\r\n" +
                 "Папка: <диск цели>\\RescueScan_Quarantine\\<дата_время> (не на RAM-диске X:).", "Карантин",
@@ -4859,6 +4903,7 @@ namespace RescueScan
         void QuarantineSelectedFiles()
         {
             if (lvFiles.SelectedItems.Count == 0) { MessageBox.Show("Выбери файл."); return; }
+            if (!HiberGuardFiles("Карантин")) return;
             int ok = 0, fail = 0;
             quarErr = "";
             foreach (ListViewItem it in lvFiles.SelectedItems)
@@ -4958,6 +5003,7 @@ namespace RescueScan
             List<ListViewItem> items = new List<ListViewItem>();
             foreach (ListViewItem it in lvQuar.Items) if (it.Checked) { sel.Add((ManEntry)it.Tag); items.Add(it); }
             if (sel.Count == 0) { MessageBox.Show("Отметь, что восстановить."); return; }
+            if (!HiberGuard("Восстановить", null)) return;
             if (MessageBox.Show("Восстановить отмеченные (" + sel.Count + ") на исходные места?\r\nФайл, который сейчас лежит на месте оригинала, не удаляется, а переименовывается (*.before-restore-…).",
                 "Восстановление", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             bool anyReg = sel.Exists(delegate(ManEntry e) { return e.Type == "REG"; });
@@ -5174,8 +5220,42 @@ namespace RescueScan
         }
 
         // Guard for every repair / unlock / assoc / IFEO / policy action: the target's SOFTWARE hive must be available.
+        // Before any change to an OFFLINE target whose Windows is hibernated (Fast Startup): warn and ask once per target
+        // drive (default «Нет»). path != null: an Explorer action - only paths on that target drive are guarded.
+        string hiberAck = "";
+        bool HiberGuard(string what, string path)
+        {
+            WinTarget t = cboWin.SelectedItem as WinTarget;
+            string drive = tgtReady && tgtWinDir.Length >= 2 ? tgtWinDir.Substring(0, 2) : (t != null && t.WinDir.Length >= 2 ? t.WinDir.Substring(0, 2) : "");
+            bool live = tgtReady ? tgtLive : (t != null && t.Live);
+            if (live || drive.Length == 0) return true;   // the running OS cannot be hibernated
+            if (path != null && !path.StartsWith(drive, StringComparison.OrdinalIgnoreCase)) return true;
+            if (hiberAck.Equals(drive, StringComparison.OrdinalIgnoreCase) || !Hiber.Active(drive)) return true;
+            if (MessageBox.Show("Windows на " + drive + " не выключена, а ГИБЕРНИРОВАНА («Быстрый запуск»: " + drive + "\\hiberfil.sys содержит образ памяти).\r\n\r\n" +
+                    "При следующем включении она продолжит работу из этого образа: изменения, сделанные отсюда, потеряются (вирус вернётся),\r\n" +
+                    "а файловая система может повредиться.\r\n\r\nПравильно: загрузись в эту Windows и сделай «Перезагрузку» (или shutdown /s /full /t 0,\r\n" +
+                    "или отключи «Быстрый запуск»), затем снова запусти RescueScan. Сканировать можно и так.\r\n\r\n" +
+                    "Всё равно выполнить «" + what + "» (и дальнейшие изменения на " + drive + " в этом сеансе)?",
+                    "Гибернация / Быстрый запуск", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                return false;
+            hiberAck = drive;
+            Watchdog.Log("гибернация: пользователь разрешил изменения на " + drive + " несмотря на hiberfil.sys");
+            return true;
+        }
+
+        bool HiberGuardFiles(string what)
+        {
+            foreach (ListViewItem it in lvFiles.SelectedItems)
+            {
+                string tag = it.Tag as string;
+                if (tag != null && tag.Length > 2 && !HiberGuard(what, tag.Substring(2))) return false;
+            }
+            return true;
+        }
+
         bool RequireSoft(string what)
         {
+            if (!HiberGuard(what, null)) return false;
             if (!EnsureTarget())
             {
                 MessageBox.Show("Сначала выбери установку Windows («Найти ОС») и нажми «Сканировать».", what);
@@ -5376,6 +5456,7 @@ namespace RescueScan
 
         void DefuseChecked(ListView target)
         {
+            if (!HiberGuard("Обезвредить", null)) return;
             int done = 0, skip = 0, fail = 0, already = 0;
             quarErr = "";
             foreach (ListViewItem it in target.Items)
@@ -5534,6 +5615,7 @@ namespace RescueScan
         {
             if (MessageBox.Show("Запустить авто-очистку по выбранным тумблерам?\r\nПодозрительное уйдёт в Карантин, каждое изменение реестра сохраняется туда же (можно вернуть). Дефолты будут восстановлены.",
                 "Изи-очистка", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            if (!HiberGuard("Изи-очистка", null)) return;
             Cursor.Current = Cursors.WaitCursor;
             StringBuilder r = new StringBuilder();
             quarErr = "";
@@ -5801,6 +5883,7 @@ namespace RescueScan
         {
             int n = 0; foreach (ListViewItem it in target.Items) if (it.Checked) n++;
             if (n == 0) { MessageBox.Show("Ничего не отмечено."); return; }
+            if (!HiberGuard("Удалить", null)) return;
             if (MessageBox.Show("Удалить отмеченных записей: " + n + " ?\nОперация необратима (без бэкапа; для бэкапа — «Карантин»).\n" +
                 "Winlogon Shell/Userinit, BootExecute и т.п. не удаляются, а возвращаются к дефолту.", "Подтверждение",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;

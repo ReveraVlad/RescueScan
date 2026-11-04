@@ -102,6 +102,7 @@ namespace RescueScan.Tests
                 Run("Launch: exe direct, batch via cmd, everything else as text", LaunchModes);
                 Run("Export: CSV cells quoted, quotes doubled, formulas neutralised", CsvCells);
                 Run("Errors: Russian last-chance message", ErrorTextCases);
+                Run("Hibernation: hiberfil.sys header", HiberCases);
                 Run("Process tree: real Toolhelp snapshot sees this process [win]", ProcSnapshotWin);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
@@ -2519,6 +2520,26 @@ namespace RescueScan.Tests
             True(t.StartsWith("Критическая ошибка") && t.Contains("выгружены"), "fatal, hives unloaded: " + t);
             t = Program.ErrorText(null, true, "RS_SOFT: занято");
             True(t.Contains("неизвестная ошибка") && t.Contains("Не все кусты выгружены: RS_SOFT: занято"), "fatal, unload failed: " + t);
+        }
+        static void HiberCases()
+        {
+            True(Hiber.ActiveSignature(Encoding.ASCII.GetBytes("hibr")) && Hiber.ActiveSignature(Encoding.ASCII.GetBytes("HIBR....")), "hibr/HIBR active");
+            True(Hiber.ActiveSignature(Encoding.ASCII.GetBytes("RSTR")), "resume in progress counts");
+            True(!Hiber.ActiveSignature(Encoding.ASCII.GetBytes("wake")) && !Hiber.ActiveSignature(new byte[4096]), "wake / zeroed header: no image");
+            True(!Hiber.ActiveSignature(null) && !Hiber.ActiveSignature(new byte[] { 0x68, 0x69 }), "short / null");
+            string f = Path.Combine(Path.GetTempPath(), "rs_hiber_" + Id + ".sys");
+            try
+            {
+                True(!Hiber.ActiveFile(f), "missing file: no image");
+                File.WriteAllBytes(f, Encoding.ASCII.GetBytes("HIBR\0\0\0\0"));
+                True(Hiber.ActiveFile(f), "file with HIBR");
+                File.WriteAllBytes(f, new byte[16]);
+                True(!Hiber.ActiveFile(f), "zeroed after resume");
+                File.WriteAllBytes(f, new byte[2]);
+                True(!Hiber.ActiveFile(f), "truncated");
+            }
+            finally { try { File.Delete(f); } catch { } }
+            True(!Hiber.Active("") && !Hiber.Active("C") && !Hiber.Active(null), "bad drive strings");
         }
     }
 }

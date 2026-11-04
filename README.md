@@ -42,6 +42,12 @@ another registry.
   running RescueScan's mounts are never touched (only one instance holds the mount role).
   The target's own `SystemRoot` (e.g. `C:\Windows` although the PE calls the volume `D:`)
   is used for every default it writes.
+  If the target was shut down with **Fast Startup** (the default since Windows 8, i.e. it
+  is really hibernated: `<drive>\hiberfil.sys` starts with `hibr`/`HIBR`/`RSTR`), Windows
+  would resume from that image and lose — or corrupt — everything changed offline. The scan
+  shows a warning and every change on that drive asks for confirmation (once per
+  session). Do a full *Restart* (or `shutdown /s /full /t 0`) in that Windows first;
+  entering WinRE via Shift+Restart is a full restart and is not affected.
 - **Live** (the running OS is the target). `HKLM\SOFTWARE`, `HKLM\SYSTEM` and
   `HKU\<SID>` of logged‑on users are read in place; profiles of other users are mounted.
   Needed for the task manager against the real malware processes, the Winlogon guard and
@@ -175,6 +181,7 @@ look at it). A clean Windows 10/11 should show no SUSPECT rows.
   RescueScan itself and its watchdog are never killed. System, smss, csrss, wininit,
   winlogon, services, lsass (and winpeshl in WinPE) from System32 need a second explicit
   confirmation. Each kill re‑checks that the PID still belongs to the listed process.
+- Offline changes on a hibernated (Fast Startup) target need an explicit confirmation.
 - Reset‑only values (above), backups before every change, hives unloaded on exit and on
   a fatal error, last‑chance error handler with a Russian message and a log entry.
 - CSV export quotes every cell, doubles quotes and neutralises cells starting with
@@ -255,6 +262,8 @@ on real systems:
   PE without NetFx.
 - Offline mount/unload of SOFTWARE/SYSTEM/NTUSER/UsrClass on Windows 10/11, the stale
   mount cleanup after a killed run, and restore of `.reg` backups with odd value types.
+- The hibernation check against a real Fast Startup shutdown (Windows 10/11) and after a
+  full shutdown (no false warning).
 - "Kill tree" against a respawning batch loop; the critical‑process confirmation; the
   start‑time checks with protected processes.
 - Watchdog: kill the GUI, close the relaunched GUI normally (the watchdog must exit),
