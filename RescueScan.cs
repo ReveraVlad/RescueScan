@@ -29,6 +29,9 @@ namespace RescueScan
 
     static class Reg
     {
+        internal const int RegTimeoutMs = 120000;   // reg.exe (load of a big hive from a slow disk still fits)
+        internal const int ToolTimeoutMs = 60000;   // bcdedit.exe / net.exe
+
         public static string Run(string args)
         {
             string outp;
@@ -36,27 +39,108 @@ namespace RescueScan
             return outp;
         }
 
+        // reg.exe <args>. Returns the exit code (-1 = could not start / timed out); outp = stdout (+ stderr on failure).
+        // Every variable part of args must be passed through QuoteArg.
         public static int RunCode(string args, out string outp)
         {
-            ProcessStartInfo psi = new ProcessStartInfo("reg.exe", args);
-            psi.UseShellExecute = false;
-            psi.CreateNoWindow = true;
-            psi.RedirectStandardOutput = true;
-            psi.RedirectStandardError = true;
+            return RunProcess(SysExe("reg.exe"), args, RegTimeoutMs, out outp);
+        }
+
+        // Runs a console tool hidden. stdout and stderr are drained concurrently (no pipe-buffer deadlock); on timeout
+        // the child is killed and -1 is returned. outp = stdout, plus stderr when the exit code is not 0.
+        internal static int RunProcess(string exe, string args, int timeoutMs, out string outp)
+        {
+            Process p = null;
             try
             {
-                Process p = Process.Start(psi);
-                string so = p.StandardOutput.ReadToEnd();
-                p.StandardError.ReadToEnd();
-                p.WaitForExit();
-                outp = so;
-                return p.ExitCode;
+                ProcessStartInfo psi = new ProcessStartInfo(exe, args);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                p = Process.Start(psi);
+                StreamReader so = p.StandardOutput, se = p.StandardError;
+                string[] text = new string[2];
+                Thread to = new Thread(delegate() { try { text[0] = so.ReadToEnd(); } catch { } });
+                Thread te = new Thread(delegate() { try { text[1] = se.ReadToEnd(); } catch { } });
+                to.IsBackground = true; te.IsBackground = true;
+                to.Start(); te.Start();
+                if (!p.WaitForExit(timeoutMs))
+                {
+                    try { p.Kill(); } catch { }
+                    try { p.WaitForExit(5000); } catch { }
+                    to.Join(2000); te.Join(2000);
+                    outp = "Превышено время ожидания (" + ((timeoutMs + 999) / 1000) + " с): " + Path.GetFileName(exe) + " " + args;
+                    return -1;
+                }
+                // exit code is known; a grandchild that inherited the pipes must not hang us forever
+                to.Join(10000); te.Join(10000);
+                int code = p.ExitCode;
+                string o1 = text[0] ?? "", o2 = text[1] ?? "";
+                outp = (code != 0 && o2.Trim().Length > 0) ? o1 + (o1.Length > 0 ? "\r\n" : "") + o2 : o1;
+                return code;
             }
             catch (Exception ex)
             {
                 outp = ex.Message;
                 return -1;
             }
+            finally
+            {
+                if (p != null) try { p.Dispose(); } catch { }
+            }
+        }
+
+        // Full path of a Windows console tool. Never a planted copy next to RescueScan.exe (CreateProcess searches the
+        // application directory first); a 32-bit build on 64-bit Windows gets the 64-bit tool via Sysnative.
+        internal static string SysExe(string name)
+        {
+            if (!name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) name += ".exe";
+            try
+            {
+                string sys = Environment.SystemDirectory;   // GetSystemDirectory, not a (spoofable) environment variable
+                if (!string.IsNullOrEmpty(sys))
+                {
+                    if (Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess)
+                    {
+                        string nat = Path.Combine(Path.Combine(Path.GetDirectoryName(sys), "Sysnative"), name);
+                        if (File.Exists(nat)) return nat;
+                    }
+                    string full = Path.Combine(sys, name);
+                    if (File.Exists(full)) return full;
+                }
+            }
+            catch { }
+            return name;
+        }
+
+        // Quotes ONE argument for the MSVCRT / CommandLineToArgvW parser used by reg.exe, bcdedit.exe, net.exe:
+        // always wrapped in quotes; backslashes are doubled only before a quote or the closing quote; quotes -> \".
+        internal static string QuoteArg(string s)
+        {
+            if (s == null) s = "";
+            StringBuilder sb = new StringBuilder(s.Length + 8);
+            sb.Append('"');
+            int bs = 0;
+            foreach (char c in s)
+            {
+                if (c == '\\') { bs++; continue; }
+                if (c == '"') { sb.Append('\\', bs * 2 + 1); sb.Append('"'); bs = 0; continue; }
+                if (bs > 0) { sb.Append('\\', bs); bs = 0; }
+                sb.Append(c);
+            }
+            sb.Append('\\', bs * 2);
+            sb.Append('"');
+            return sb.ToString();
+        }
+
+        // reg export KEY FILE /y. Success only if reg.exe exited with 0 AND a non-empty file is there.
+        public static bool Export(string key, string file)
+        {
+            string o;
+            int rc = RunCode("export " + QuoteArg(key) + " " + QuoteArg(file) + " /y", out o);
+            try { return rc == 0 && File.Exists(file) && new FileInfo(file).Length > 0; }
+            catch { return false; }
         }
 
         // Returns list of {name,type,data} for a key's values.
@@ -489,7 +573,7 @@ namespace RescueScan
 
         void UnloadAll()
         {
-            foreach (string m in mounted) Reg.Run("unload \"HKLM\\" + m + "\"");
+            foreach (string m in mounted) Reg.Run("unload " + Reg.QuoteArg("HKLM\\" + m));
             mounted.Clear();
         }
 
@@ -694,8 +778,8 @@ namespace RescueScan
 
             UnloadAll();
             int rc; string o;
-            rc = Reg.RunCode("load \"HKLM\\RS_SOFT\" \"" + cfg + "\\SOFTWARE\"", out o); if (rc == 0) mounted.Add("RS_SOFT");
-            rc = Reg.RunCode("load \"HKLM\\RS_SYS\" \"" + cfg + "\\SYSTEM\"", out o); if (rc == 0) mounted.Add("RS_SYS");
+            rc = Reg.RunCode("load " + Reg.QuoteArg("HKLM\\RS_SOFT") + " " + Reg.QuoteArg(cfg + "\\SOFTWARE"), out o); if (rc == 0) mounted.Add("RS_SOFT");
+            rc = Reg.RunCode("load " + Reg.QuoteArg("HKLM\\RS_SYS") + " " + Reg.QuoteArg(cfg + "\\SYSTEM"), out o); if (rc == 0) mounted.Add("RS_SYS");
 
             List<Finding> f = new List<Finding>();
             string SOFT = "HKLM\\RS_SOFT";
@@ -786,7 +870,7 @@ namespace RescueScan
                     if (!File.Exists(nt)) continue;
                     if (name.Equals("Default", StringComparison.OrdinalIgnoreCase) || name.Equals("Public", StringComparison.OrdinalIgnoreCase)) continue;
                     string mp = "RS_U" + ui;
-                    rc = Reg.RunCode("load \"HKLM\\" + mp + "\" \"" + nt + "\"", out o);
+                    rc = Reg.RunCode("load " + Reg.QuoteArg("HKLM\\" + mp) + " " + Reg.QuoteArg(nt), out o);
                     if (rc != 0) continue;
                     mounted.Add(mp);
                     string U = "HKLM\\" + mp;
@@ -1054,12 +1138,10 @@ namespace RescueScan
             lblStatus.Text = "Pre-boot: +" + f.Count + " записей (BCD + ESP найдено: " + esps + "). ESP без буквы — присвой через diskpart.";
         }
 
+        // bcdedit / net: full System32 path, concurrent stdout+stderr, timeout. Variable args -> Reg.QuoteArg.
         static int RunProc(string exe, string args, out string outp)
         {
-            ProcessStartInfo psi = new ProcessStartInfo(exe, args);
-            psi.UseShellExecute = false; psi.CreateNoWindow = true; psi.RedirectStandardOutput = true; psi.RedirectStandardError = true;
-            try { Process p = Process.Start(psi); string so = p.StandardOutput.ReadToEnd(); p.StandardError.ReadToEnd(); p.WaitForExit(); outp = so; return p.ExitCode; }
-            catch (Exception ex) { outp = ex.Message; return -1; }
+            return Reg.RunProcess(Reg.SysExe(exe), args, Reg.ToolTimeoutMs, out outp);
         }
 
         void ParseBcd(List<Finding> f, string txt)
@@ -1210,7 +1292,7 @@ namespace RescueScan
                 string safe = key.Replace("\\", "_").Replace("\"", "");
                 if (safe.Length > 80) safe = safe.Substring(safe.Length - 80);
                 string dst = Path.Combine(quarDir, "reg_" + safe + ".reg");
-                string o; Reg.RunCode("export \"" + key + "\" \"" + dst + "\" /y", out o);
+                if (!Reg.Export(key, dst)) { QLog("REG-FAIL\t" + key + "\treg export failed"); return false; }   // no backup -> no delete
                 QLog("REG\t" + key + "\t=>\t" + dst);
                 return true;
             }
@@ -1327,7 +1409,7 @@ namespace RescueScan
                     }
                     else if (e[0] == "REG")
                     {
-                        string o; r = Reg.RunCode("import \"" + e[2] + "\"", out o) == 0;
+                        string o; r = Reg.RunCode("import " + Reg.QuoteArg(e[2]), out o) == 0;
                     }
                 }
                 catch { r = false; }
@@ -1703,7 +1785,7 @@ namespace RescueScan
             string n = AccName(); if (n == null) return;
             string p = Prompt("Новый пароль для «" + n + "» (пусто = снять пароль)", "");
             if (p == null) return;
-            string o; int rc = RunProc("net", "user \"" + n + "\" \"" + p + "\"", out o);
+            string o; int rc = RunProc("net", "user " + Reg.QuoteArg(n) + " " + Reg.QuoteArg(p), out o);
             MessageBox.Show(rc == 0 ? "Пароль изменён для " + n : "Ошибка:\r\n" + o, "Пароль");
             AccRefresh();
         }
@@ -1711,7 +1793,7 @@ namespace RescueScan
         void AccEnable()
         {
             string n = AccName(); if (n == null) return;
-            string o; int rc = RunProc("net", "user \"" + n + "\" /active:yes", out o);
+            string o; int rc = RunProc("net", "user " + Reg.QuoteArg(n) + " /active:yes", out o);
             MessageBox.Show(rc == 0 ? "Аккаунт включён/разблокирован: " + n : "Ошибка:\r\n" + o, "Включение");
             AccRefresh();
         }
@@ -1721,7 +1803,7 @@ namespace RescueScan
             string n = AccName(); if (n == null) return;
             if (MessageBox.Show("Удалить пользователя «" + n + "»? (профиль на диске останется)", "Удаление",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-            string o; int rc = RunProc("net", "user \"" + n + "\" /delete", out o);
+            string o; int rc = RunProc("net", "user " + Reg.QuoteArg(n) + " /delete", out o);
             MessageBox.Show(rc == 0 ? "Пользователь удалён: " + n : "Ошибка:\r\n" + o, "Удаление");
             AccRefresh();
         }
