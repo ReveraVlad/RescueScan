@@ -48,7 +48,9 @@ namespace RescueScan.Tests
                 Run("KeyExists", KeyExistsCases);
                 Run("NUL in names/paths: never aliased, never acted on", NulNames);
                 Run("Values: a value deleted during the read is not a hidden name", ValuesRace);
-                Run("Live mode: ProfileImagePath -> folders on the TARGET drive", ProfileDirs);
+                Run("Live mode: ProfileImagePath -> folders on the TARGET volume only", ProfileDirs);
+                Run("Detect: WinPE hidden only on X: with MiniNT; live OS labelled", TargetList);
+                Run("WOW64: System32 of the running OS via Sysnative", FsPaths);
                 Run("Live mode: SamePath / WinTarget labels", LiveHelpers);
                 Run("Mounts: RS_* names", MountNames);
                 Run("Mounts: mount / missing file / file in use / unload all", MountBasic);
@@ -630,24 +632,76 @@ namespace RescueScan.Tests
         }
 
         // ------------------------------------------------------------------ live mode / target helpers
-        static string Join(List<string> l) { return string.Join(" | ", l.ToArray()); }
 
+        static string PD(string pip, string winDir, bool live, string orig)
+        {
+            bool other;
+            string d = MainForm.ProfileDir(pip, winDir, live, orig, out other);
+            return other ? "<other volume>" : d;
+        }
+
+        // Offline only the target's own volume: a literal C:\Users\Ivan is D:\Users\Ivan when the target is D:\Windows -
+        // never WinPE's C: (another installation / a USB disk). A profile on another volume of the installation is
+        // reported, not guessed.
         static void ProfileDirs()
         {
-            Eq("D:\\Users\\Ivan", Join(MainForm.ProfileDirCandidates("%SystemDrive%\\Users\\Ivan", "D:\\Windows", false)), "offline %SystemDrive% -> target drive");
-            Eq("D:\\Users\\Ivan", Join(MainForm.ProfileDirCandidates("%systemdrive%\\Users\\Ivan\\", "D:\\Windows", false)), "case-insensitive, trailing backslash");
-            Eq("D:\\Windows\\ServiceProfiles\\X", Join(MainForm.ProfileDirCandidates("%SystemRoot%\\ServiceProfiles\\X", "D:\\Windows", false)), "%SystemRoot% -> target Windows dir");
-            Eq("D:\\Windows\\x", Join(MainForm.ProfileDirCandidates("%windir%\\x", "D:\\Windows", false)), "%windir%");
-            Eq("D:\\Users\\Ivan | C:\\Users\\Ivan", Join(MainForm.ProfileDirCandidates("C:\\Users\\Ivan", "D:\\Windows", false)), "offline literal C: -> target drive first");
-            Eq("D:\\Users\\Ivan", Join(MainForm.ProfileDirCandidates("D:\\Users\\Ivan", "D:\\Windows", false)), "same drive");
-            Eq("C:\\Users\\Ivan", Join(MainForm.ProfileDirCandidates("%SystemDrive%\\Users\\Ivan", "C:\\Windows", true)), "live");
-            Eq("E:\\Profiles\\X", Join(MainForm.ProfileDirCandidates("E:\\Profiles\\X", "C:\\Windows", true)), "live: other drive kept as is");
-            Eq("D:\\Пользователи\\Иван", Join(MainForm.ProfileDirCandidates("%SystemDrive%\\Пользователи\\Иван", "D:\\Windows", false)), "Cyrillic");
-            Eq("", Join(MainForm.ProfileDirCandidates("%USERPROFILE%\\x", "D:\\Windows", false)), "unknown variable rejected");
-            Eq("", Join(MainForm.ProfileDirCandidates("\\\\server\\share\\x", "D:\\Windows", false)), "UNC rejected");
-            Eq("", Join(MainForm.ProfileDirCandidates("Users\\x", "D:\\Windows", false)), "relative rejected");
-            Eq("", Join(MainForm.ProfileDirCandidates("", "D:\\Windows", false)), "empty");
-            Eq("", Join(MainForm.ProfileDirCandidates(null, "D:\\Windows", false)), "null");
+            Eq("D:\\Users\\Ivan", PD("%SystemDrive%\\Users\\Ivan", "D:\\Windows", false, "C:"), "offline %SystemDrive% -> target drive");
+            Eq("D:\\Users\\Ivan", PD("%systemdrive%\\Users\\Ivan\\", "D:\\Windows", false, "C:"), "case-insensitive, trailing backslash");
+            Eq("D:\\Windows\\ServiceProfiles\\X", PD("%SystemRoot%\\ServiceProfiles\\X", "D:\\Windows", false, "C:"), "%SystemRoot% -> target Windows dir");
+            Eq("D:\\Windows\\x", PD("%windir%\\x", "D:\\Windows", false, "C:"), "%windir%");
+            Eq("D:\\Users\\Ivan", PD("C:\\Users\\Ivan", "D:\\Windows", false, "C:"), "offline literal C: -> the target's volume ONLY");
+            Eq("D:\\Users\\Ivan", PD("c:\\Users\\Ivan", "D:\\Windows", false, "C:"), "drive letter case");
+            Eq("D:\\Users\\Ivan", PD("C:\\Users\\Ivan", "D:\\Windows", false, ""), "system drive unknown -> still only the target's volume");
+            Eq("<other volume>", PD("E:\\Profiles\\Ivan", "D:\\Windows", false, "C:"), "offline: profile on another volume of the installation -> reported");
+            Eq("D:\\Users\\Ivan", PD("D:\\Users\\Ivan", "D:\\Windows", false, "D:"), "same letters as before");
+            Eq("C:\\Users\\Ivan", PD("%SystemDrive%\\Users\\Ivan", "C:\\Windows", true, ""), "live");
+            Eq("E:\\Profiles\\X", PD("E:\\Profiles\\X", "C:\\Windows", true, ""), "live: other drive kept as is (letters are real)");
+            Eq("D:\\Пользователи\\Иван", PD("%SystemDrive%\\Пользователи\\Иван", "D:\\Windows", false, "C:"), "Cyrillic");
+            Eq("", PD("%USERPROFILE%\\x", "D:\\Windows", false, "C:"), "unknown variable rejected");
+            Eq("", PD("\\\\server\\share\\x", "D:\\Windows", false, "C:"), "UNC rejected");
+            Eq("", PD("Users\\x", "D:\\Windows", false, "C:"), "relative rejected");
+            Eq("", PD("", "D:\\Windows", false, "C:"), "empty");
+            Eq("", PD(null, "D:\\Windows", false, "C:"), "null");
+        }
+
+        // The running WinPE/WinRE (X: + MiniNT) is never a target; MiniNT alone (malware on an installed Windows) must not
+        // hide the live OS.
+        static void TargetList()
+        {
+            True(MainForm.IsRescueSystem(true, "X:\\Windows"), "WinPE: MiniNT + X:");
+            True(MainForm.IsRescueSystem(true, "x:\\windows"), "case");
+            True(!MainForm.IsRescueSystem(true, "C:\\Windows"), "MiniNT on an installed C:\\Windows is not WinPE");
+            True(!MainForm.IsRescueSystem(false, "X:\\Windows"), "Windows installed on X: without MiniNT");
+            True(!MainForm.IsRescueSystem(true, ""), "unknown");
+            HashSet<string> files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string d in new string[] { "C", "D", "X" }) files.Add(d + ":\\Windows\\System32\\config\\SYSTEM");
+            Predicate<string> fe = delegate(string f) { return files.Contains(f); };
+            Eq("C:\\Windows (офлайн) | D:\\Windows (офлайн)", JoinT(MainForm.ListTargets("X:\\Windows", true, fe)), "in WinPE: the offline installations only");
+            Eq("C:\\Windows (живая — эта ОС; ключ MiniNT!) | D:\\Windows (офлайн) | X:\\Windows (офлайн)", JoinT(MainForm.ListTargets("C:\\Windows", true, fe)),
+               "live OS with a planted MiniNT key: still listed, labelled");
+            Eq("C:\\Windows (живая — эта ОС) | D:\\Windows (офлайн) | X:\\Windows (офлайн)", JoinT(MainForm.ListTargets("C:\\Windows", false, fe)), "live OS");
+            files.Add("E:\\WINNT\\System32\\config\\SYSTEM");
+            Eq("E:\\WINNT (живая — эта ОС) | C:\\Windows (офлайн) | D:\\Windows (офлайн) | X:\\Windows (офлайн)", JoinT(MainForm.ListTargets("E:\\WINNT", false, fe)),
+               "running OS in a non-standard folder is listed too");
+        }
+
+        static string JoinT(List<WinTarget> l)
+        {
+            List<string> s = new List<string>();
+            foreach (WinTarget t in l) s.Add(t.ToString());
+            return string.Join(" | ", s.ToArray());
+        }
+
+        // A 32-bit build on 64-bit Windows: <running windir>\System32 goes through Sysnative; nothing else changes.
+        static void FsPaths()
+        {
+            Eq("C:\\Windows\\Sysnative\\config\\SYSTEM", MainForm.FsPath("C:\\Windows\\System32\\config\\SYSTEM", "C:\\Windows", true), "WOW64: System32 -> Sysnative");
+            Eq("C:\\WINDOWS\\Sysnative\\Tasks", MainForm.FsPath("c:\\windows\\system32\\Tasks", "C:\\WINDOWS", true), "case-insensitive");
+            Eq("C:\\Windows\\Sysnative", MainForm.FsPath("C:\\Windows\\System32", "C:\\Windows", true), "the folder itself");
+            Eq("C:\\Windows\\System32x\\a", MainForm.FsPath("C:\\Windows\\System32x\\a", "C:\\Windows", true), "only the System32 folder");
+            Eq("D:\\Windows\\System32\\drivers", MainForm.FsPath("D:\\Windows\\System32\\drivers", "C:\\Windows", true), "another installation: never redirected");
+            Eq("C:\\Windows\\System32\\drivers", MainForm.FsPath("C:\\Windows\\System32\\drivers", "C:\\Windows", false), "64-bit process: unchanged");
+            Eq("C:\\Windows\\System32\\Tasks", MainForm.FsPath("C:\\Windows\\System32\\Tasks"), "this (64-bit or non-WOW64) test process: unchanged");
         }
 
         static void LiveHelpers()

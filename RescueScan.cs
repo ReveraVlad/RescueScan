@@ -744,8 +744,10 @@ namespace RescueScan
     {
         public readonly string WinDir;   // e.g. D:\Windows
         public readonly bool Live;
-        public WinTarget(string winDir, bool live) { WinDir = winDir; Live = live; }
-        public override string ToString() { return WinDir + (Live ? " (живая — эта ОС)" : " (офлайн)"); }
+        public readonly string Note;     // shown in the list, e.g. a MiniNT key on the running OS
+        public WinTarget(string winDir, bool live) : this(winDir, live, "") { }
+        public WinTarget(string winDir, bool live, string note) { WinDir = winDir; Live = live; Note = note ?? ""; }
+        public override string ToString() { return WinDir + (Live ? " (живая — эта ОС" : " (офлайн") + (Note.Length > 0 ? "; " + Note : "") + ")"; }
     }
 
     // reg.exe-style runner: exit code; outp = stdout (+ stderr on failure). Injectable so tests can simulate reg.exe.
@@ -1287,19 +1289,59 @@ namespace RescueScan
         void Detect()
         {
             cboWin.Items.Clear();
-            string runWin = RunningWinDir();
-            // in WinPE/WinRE (...\Control\MiniNT exists) the running X:\Windows is the rescue system itself: never a target
-            bool inPE = Reg.KeyExists("HKLM\\SYSTEM\\CurrentControlSet\\Control\\MiniNT");
+            bool miniNT = Reg.KeyExists("HKLM\\SYSTEM\\CurrentControlSet\\Control\\MiniNT");
+            foreach (WinTarget t in ListTargets(RunningWinDir(), miniNT, delegate(string f) { return File.Exists(FsPath(f)); }))
+                cboWin.Items.Add(t);
+            if (cboWin.Items.Count > 0) { cboWin.SelectedIndex = 0; lblStatus.Text = "Найдено установок: " + cboWin.Items.Count; }
+            else lblStatus.Text = "Windows не найдена на подключённых дисках.";
+        }
+
+        // The running system is the WinPE/WinRE rescue system (never a target) only when ...\Control\MiniNT exists AND it
+        // runs from X: (the RAM disk). MiniNT alone proves nothing: malware creates it on an installed Windows to stop the
+        // event log (Sigma 919f2ef0-be2d-4a7a-b635-eb2b41fde044 / 1a4bd6af-99ac-4466-b5b2-7b72b4a05462; MITRE ATT&CK
+        // mitigation M1024), and one registry key must not hide the infected live OS from the list. The scan reports it.
+        internal static bool IsRescueSystem(bool miniNT, string runWinDir)
+        {
+            return miniNT && !string.IsNullOrEmpty(runWinDir) && runWinDir.StartsWith("X:", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Installations <C..Z>:\Windows that have a SYSTEM hive file, plus the running OS wherever its Windows dir is.
+        // The running OS is LIVE (labelled; MiniNT on it is shown); the WinPE/WinRE rescue system itself is left out.
+        internal static List<WinTarget> ListTargets(string runWin, bool miniNT, Predicate<string> fileExists)
+        {
+            List<WinTarget> res = new List<WinTarget>();
+            bool rescue = IsRescueSystem(miniNT, runWin), liveListed = false;
             for (char c = 'C'; c <= 'Z'; c++)
             {
                 string wd = c + ":\\Windows";
-                if (!File.Exists(wd + "\\System32\\config\\SYSTEM")) continue;
+                if (!fileExists(wd + "\\System32\\config\\SYSTEM")) continue;
                 bool live = SamePath(wd, runWin);
-                if (live && inPE) continue;
-                cboWin.Items.Add(new WinTarget(wd, live));
+                if (live && rescue) continue;
+                if (live) liveListed = true;
+                res.Add(new WinTarget(wd, live, live && miniNT ? "ключ MiniNT!" : ""));
             }
-            if (cboWin.Items.Count > 0) { cboWin.SelectedIndex = 0; lblStatus.Text = "Найдено установок: " + cboWin.Items.Count; }
-            else lblStatus.Text = "Windows не найдена на подключённых дисках.";
+            if (!rescue && !liveListed && !string.IsNullOrEmpty(runWin) && runWin.Length > 3 && fileExists(runWin + "\\System32\\config\\SYSTEM"))
+                res.Insert(0, new WinTarget(runWin, true, miniNT ? "ключ MiniNT!" : ""));   // e.g. C:\WINNT, D:\Win10
+            return res;
+        }
+
+        // A 32-bit build on 64-bit Windows sees <running windir>\System32 redirected to SysWOW64 (only catroot(2),
+        // driverstore, drivers\etc, logfiles and spool are exempt), so the live OS's hive files, drivers and Tasks would be
+        // the wrong ones or missing: such paths go through Sysnative. Other installations' paths are never redirected.
+        internal static string FsPath(string p)
+        {
+            bool wow = false;
+            try { wow = Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess; } catch { }
+            return FsPath(p, RunningWinDir(), wow);
+        }
+
+        internal static string FsPath(string p, string runWin, bool wow64)
+        {
+            if (!wow64 || string.IsNullOrEmpty(p) || string.IsNullOrEmpty(runWin)) return p;
+            string w = runWin.TrimEnd('\\'), sys = w + "\\System32";
+            if (p.StartsWith(sys, StringComparison.OrdinalIgnoreCase) && (p.Length == sys.Length || p[sys.Length] == '\\'))
+                return w + "\\Sysnative" + p.Substring(sys.Length);
+            return p;
         }
 
         // Windows dir of the running OS (from GetSystemDirectory, not from environment variables a virus could set).
@@ -1335,28 +1377,42 @@ namespace RescueScan
             return s;
         }
 
-        // ProfileImagePath from the TARGET's ProfileList -> candidate profile folders on the target's disk, best first.
-        // %SystemDrive%/%SystemRoot%/%windir% are expanded to the target, never to the running WinPE. Offline, drive
-        // letters differ from the ones the installation used, so another letter is tried on the target's drive first.
-        internal static List<string> ProfileDirCandidates(string pip, string winDir, bool live)
+        // ProfileImagePath from the TARGET's ProfileList -> the profile folder; "" = not usable (UNC, relative, unknown %var%).
+        // %SystemDrive%, %SystemRoot% and %windir% are expanded to the target, never to the running WinPE.
+        // OFFLINE only the target's own volume is trusted: WinPE assigns drive letters anew, so the installation's C: is
+        // e.g. D: now, and WinPE's C: may be a second installation or a USB disk - a profile there must never be mounted,
+        // scanned and "cleaned" as a user of this target. So the letter is replaced by the target's. A profile that was on
+        // ANOTHER volume of the installation (its letter differs from origSysDrive, the installation's own system drive
+        // from its SystemRoot value; "" = unknown) cannot be located safely: "" and otherVolume = true (reported).
+        internal static string ProfileDir(string pip, string winDir, bool live, string origSysDrive, out bool otherVolume)
         {
-            List<string> res = new List<string>();
-            if (string.IsNullOrEmpty(pip) || string.IsNullOrEmpty(winDir) || winDir.Length < 3) return res;
-            string drive = winDir.Substring(0, 2);
-            string p = ReplaceCI(ReplaceCI(ReplaceCI(pip.Trim(), "%SystemDrive%", drive), "%SystemRoot%", winDir), "%windir%", winDir).TrimEnd('\\');
-            if (p.Length < 3 || p[1] != ':' || p[2] != '\\' || p.IndexOf('%') >= 0) return res;   // UNC, relative, unknown %var%
-            if (!live && char.ToUpperInvariant(p[0]) != char.ToUpperInvariant(drive[0])) res.Add(drive + p.Substring(2));
-            res.Add(p);
-            return res;
+            otherVolume = false;
+            if (string.IsNullOrEmpty(pip) || string.IsNullOrEmpty(winDir) || winDir.Length < 3) return "";
+            string drive = winDir.Substring(0, 2), raw = pip.Trim();
+            string p = ReplaceCI(ReplaceCI(ReplaceCI(raw, "%SystemDrive%", drive), "%SystemRoot%", winDir), "%windir%", winDir).TrimEnd('\\');
+            if (p.Length < 3 || p[1] != ':' || p[2] != '\\' || p.IndexOf('%') >= 0) return "";   // UNC, relative, unknown %var%
+            if (live) return p;
+            if (!raw.StartsWith("%") && !string.IsNullOrEmpty(origSysDrive) && char.ToUpperInvariant(raw[0]) != char.ToUpperInvariant(origSysDrive[0]))
+            {
+                otherVolume = true;
+                return "";
+            }
+            return drive + p.Substring(2);
         }
 
         // Profiles of the target: ProfileList (user SIDs -> ProfileImagePath) plus <drive>\Users\*, without duplicates.
-        // {name, profile dir, SID or ""}
-        List<string[]> DiscoverProfiles()
+        // {name, profile dir, SID or ""}. ProfileList entries whose folder is gone (deleted profiles) are skipped.
+        List<string[]> DiscoverProfiles(StringBuilder warn)
         {
             List<string[]> res = new List<string[]>();
             HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (tgtSoft.Length > 0)
+            {
+                string orig = "";   // the installation's own system drive, e.g. C:
+                if (!tgtLive)
+                    foreach (string[] v in Reg.Values(tgtSoft + "\\Microsoft\\Windows NT\\CurrentVersion"))
+                        if (v[0].Equals("SystemRoot", StringComparison.OrdinalIgnoreCase) && v[1].Length >= 3 && v[1][1] == ':' && v[1][2] == '\\') orig = v[1].Substring(0, 2);
+                int other = 0; string otherEx = "";
                 foreach (string sk in Reg.Subkeys(tgtSoft + "\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList"))
                 {
                     string sid = Last(sk);   // user accounts (local/domain, Azure AD) - not SYSTEM/LocalService/NetworkService
@@ -1364,13 +1420,14 @@ namespace RescueScan
                     string pip = "";
                     foreach (string[] v in Reg.Values(sk))
                         if (v[0].Equals("ProfileImagePath", StringComparison.OrdinalIgnoreCase)) pip = v[1];
-                    foreach (string dir in ProfileDirCandidates(pip, tgtWinDir, tgtLive))
-                    {
-                        if (!Directory.Exists(dir)) continue;
-                        if (seen.Add(NormDir(dir))) res.Add(new string[] { Last(dir), dir, sid });
-                        break;
-                    }
+                    bool ov;
+                    string dir = ProfileDir(pip, tgtWinDir, tgtLive, orig, out ov);
+                    if (ov) { other++; if (otherEx.Length == 0) otherEx = pip; continue; }
+                    if (dir.Length == 0 || !Directory.Exists(dir)) continue;
+                    if (seen.Add(NormDir(dir))) res.Add(new string[] { Last(dir), dir, sid });
                 }
+                if (other > 0) warn.Append("профили на других дисках исходной системы не проверены: " + other + " (напр. " + otherEx + "). ");
+            }
             string usersDir = curDrive + "\\Users";
             try
             {
@@ -1416,7 +1473,7 @@ namespace RescueScan
                 else warn.Append("SYSTEM не смонтирован. ");
             }
             int next = 0, failed = 0;
-            foreach (string[] p in DiscoverProfiles())
+            foreach (string[] p in DiscoverProfiles(warn))
             {
                 string root = "", nt = p[1] + "\\NTUSER.DAT";
                 if (tgtLive && p[2].Length > 0 && Reg.KeyExists("HKU\\" + p[2])) root = "HKU\\" + p[2];   // logged on: already loaded
@@ -1689,6 +1746,17 @@ namespace RescueScan
                     int n = 1; try { n = Convert.ToInt32(v[1].Replace("0x", ""), 16); } catch { }
                     ccs = "ControlSet" + n.ToString("D3");
                 }
+            // MiniNT on an installed Windows: after a reboot the event log stops writing (defence evasion; Windows also
+            // behaves as WinPE in places). Info only if the target itself looks like a WinPE (InstallationType).
+            string mnt = SYS + "\\" + ccs + "\\Control\\MiniNT";
+            if (SYS.Length > 0 && Reg.KeyExists(mnt))
+            {
+                bool pe = false;
+                foreach (string[] v in Reg.Values(SOFT + "\\Microsoft\\Windows NT\\CurrentVersion"))
+                    if (v[0].Equals("InstallationType", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Equals("WindowsPE", StringComparison.OrdinalIgnoreCase)) pe = true;
+                if (pe) Add(f, "MiniNT", "MiniNT", "(цель похожа на WinPE: InstallationType = WindowsPE)", mnt, "REVIEW", 3, null, null, null);
+                else Add(f, "MiniNT (журнал событий выкл.)", "MiniNT", "(ключ WinPE на установленной Windows: журнал событий не пишется — трюк вирусов)", mnt, "SUSPECT", 1, mnt, null, null);
+            }
             string sm = SYS + "\\" + ccs + "\\Control\\Session Manager";
             foreach (string[] v in Reg.Values(sm))
                 if (v[0].Equals("BootExecute", StringComparison.OrdinalIgnoreCase))
@@ -1748,7 +1816,7 @@ namespace RescueScan
             ScanDrivers(f, winDir);
 
             // ---- Scheduled tasks (+ anti-checker/watchdog) ----
-            string tasksDir = winDir + "\\System32\\Tasks";
+            string tasksDir = FsPath(winDir + "\\System32\\Tasks");
             if (Directory.Exists(tasksDir))
             {
                 string[] all = Directory.GetFiles(tasksDir, "*", SearchOption.AllDirectories);
@@ -1965,7 +2033,7 @@ namespace RescueScan
         // ---- MODULE: drivers folder (non-.sys files are highly unusual) ----
         void ScanDrivers(List<Finding> f, string winDir)
         {
-            string dir = winDir + "\\System32\\drivers";
+            string dir = FsPath(winDir + "\\System32\\drivers");
             if (!Directory.Exists(dir)) return;
             string[] benign = { ".dat", ".dls", ".wdf", ".txt", ".mui", ".bin", ".din", ".cat", ".inf", ".ini", ".xml", ".json", ".etl" };
             string[] exe = { ".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".scr", ".com", ".pif", ".js", ".hta" };
