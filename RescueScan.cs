@@ -1463,6 +1463,11 @@ namespace RescueScan
             mounts.CleanupStale(warn);   // ALL RS_* left by a crashed / killed earlier run, not only the names reused below
             tgtWinDir = t.WinDir; tgtLive = t.Live;
             curDrive = t.WinDir.Substring(0, 2);   // D:
+            if (guarding && !tgtLive)   // the guard writes the RUNNING OS's Winlogon: only while that is the target
+            {
+                chkGuard.Checked = false; guarding = false;
+                warn.Append("«Стеречь Winlogon» выключен: новая цель — не живая ОС. ");
+            }
             if (tgtLive) { tgtSoft = "HKLM\\SOFTWARE"; tgtSys = "HKLM\\SYSTEM"; }
             else
             {
@@ -1681,6 +1686,10 @@ namespace RescueScan
             if (t == null) { MessageBox.Show("Сначала выбери установку Windows."); return; }
             Cursor.Current = Cursors.WaitCursor;
             lv.Items.Clear();
+            // the PREVIOUS target's findings must not stay actionable (Easy, «Автозапуск (кратко)», «Кто ссылается»)
+            // once PrepareTarget below has switched the target - also not if something fails later in this scan
+            lastFindings = new List<Finding>(); flagged.Clear();
+            if (lvSimple != null) lvSimple.Items.Clear();
             Reg.TakeDenied();                                     // unreadable keys are collected per scan
             string winDir = t.WinDir;                             // e.g. D:\Windows
             // (re)mount the hives of THIS installation (live: read in place); all repair actions then use this target
@@ -1697,17 +1706,7 @@ namespace RescueScan
             AddValues(f, "RunOnce (HKLM WOW64)", SOFT + "\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
 
             // ---- Winlogon ----
-            string wl = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
-            foreach (string[] v in Reg.Values(wl))
-            {
-                string nm = v[0]; string dt = v[1];
-                if (nm.Equals("Shell", StringComparison.OrdinalIgnoreCase))
-                    Add(f, "Winlogon Shell", nm, dt, wl, dt.Trim().ToLower() == "explorer.exe" ? "" : "SUSPECT", 0, wl, nm, null);
-                else if (nm.Equals("Userinit", StringComparison.OrdinalIgnoreCase))
-                    Add(f, "Winlogon Userinit", nm, dt, wl, dt.ToLower().Contains("userinit.exe,") && dt.Split(',').Length <= 2 ? "" : "SUSPECT", 0, wl, nm, null);
-                else if (nm.Equals("Taskman", StringComparison.OrdinalIgnoreCase))
-                    Add(f, "Winlogon Taskman", nm, dt, wl, "SUSPECT", 0, wl, nm, null);
-            }
+            ScanWinlogon(f, SOFT);
 
             // ---- AppInit_DLLs ----
             string winkey = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
@@ -1805,9 +1804,10 @@ namespace RescueScan
 
             // ---- Filesystem: Startup folders ----
             AddStartup(f, curDrive + "\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp", "Startup (все)");
-            if (Directory.Exists(usersDir))
-                foreach (string ud in Directory.GetDirectories(usersDir))
-                    AddStartup(f, ud + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup", "Startup [" + Path.GetFileName(ud) + "]");
+            string[] uds = new string[0];
+            try { if (Directory.Exists(usersDir)) uds = Directory.GetDirectories(usersDir); } catch { }
+            foreach (string ud in uds)
+                AddStartup(f, ud + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup", "Startup [" + Path.GetFileName(ud) + "]");
             foreach (string[] tu in tgtUsers)   // profiles from ProfileList that live outside <drive>\Users
                 if (!SamePath(Path.GetDirectoryName(tu[2]), usersDir))
                     AddStartup(f, tu[2] + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup", "Startup [" + tu[0] + "]");
@@ -1819,7 +1819,11 @@ namespace RescueScan
             string tasksDir = FsPath(winDir + "\\System32\\Tasks");
             if (Directory.Exists(tasksDir))
             {
-                string[] all = Directory.GetFiles(tasksDir, "*", SearchOption.AllDirectories);
+                List<string> all = new List<string>(), deniedDirs = new List<string>();
+                FilesBelow(tasksDir, 0, all, deniedDirs);   // (Directory.GetFiles AllDirectories threw on one locked folder)
+                foreach (string dd in deniedDirs)
+                    Add(f, "Scheduled Task (нет доступа)", dd.Substring(tasksDir.Length).TrimStart('\\'), "(папка задач не читается: права (DACL) изменены? — проверь вручную)",
+                        dd, tgtLive ? "REVIEW" : "SUSPECT", 3, null, null, null);
                 foreach (string tf in all)
                 {
                     string body = "";
@@ -1871,9 +1875,51 @@ namespace RescueScan
             lblStatus.Text = "Записей: " + f.Count + "   подозрительных: " + susp + "   (ControlSet: " + ccs + ")   цель: " + TargetName()
                 + (warn.Length > 0 ? "   ВНИМАНИЕ: " + warn : "");
             if (tgtSoft.Length == 0 || tgtSys.Length == 0)
-                MessageBox.Show("Кусты реестра системы " + tgtWinDir + " смонтированы не все:\r\n" + warn +
-                    "\r\n\r\nСкан реестра НЕПОЛНЫЙ. Ремонт/разблокировка для этой цели будут отменены (на живую ОС программа не переключается).",
-                    "RescueScan", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            {
+                string msg = "Кусты реестра системы " + tgtWinDir + " смонтированы не все:\r\n" + warn + "\r\n\r\nСкан реестра НЕПОЛНЫЙ.\r\n";
+                if (tgtSoft.Length == 0)
+                    msg += "• SOFTWARE не смонтирован: Run, Winlogon, IFEO, политики и т.п. НЕ проверены. «Ремонт», «Снять блокировки», " +
+                        "«Вернуть ассоциации» и Изи-кнопка для этой цели будут отменены (на живую ОС программа не переключается).\r\n";
+                if (tgtSys.Length == 0)
+                    msg += "• SYSTEM не смонтирован: службы, драйверы, BootExecute, LSA и т.п. НЕ проверены." +
+                        (tgtSoft.Length > 0 ? " Ремонт куста SOFTWARE (Winlogon, IFEO, политики, ассоциации) при этом работает." : "") + "\r\n";
+                MessageBox.Show(msg, "RescueScan", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        // Every file below 'dir' without throwing (Directory.GetFiles with AllDirectories aborts the whole scan on one
+        // folder it may not list). Folders that cannot be listed go to 'denied' (a task folder whose DACL locks out
+        // SYSTEM / Administrators hides tasks from tools); junctions and symlinks are not followed (no loops).
+        internal static void FilesBelow(string dir, int depth, List<string> res, List<string> denied)
+        {
+            string[] files, subs;
+            try { files = Directory.GetFiles(dir); subs = Directory.GetDirectories(dir); }
+            catch (UnauthorizedAccessException) { denied.Add(dir); return; }
+            catch (System.Security.SecurityException) { denied.Add(dir); return; }
+            catch { return; }
+            res.AddRange(files);
+            if (depth >= 32) return;
+            foreach (string sd in subs)
+            {
+                try { if ((File.GetAttributes(sd) & FileAttributes.ReparsePoint) != 0) continue; } catch { continue; }
+                FilesBelow(sd, depth + 1, res, denied);
+            }
+        }
+
+        // Winlogon Shell / Userinit / Taskman of the SOFTWARE root. (Shell and Userinit are ResetOnly: never deleted.)
+        internal static void ScanWinlogon(List<Finding> f, string SOFT)
+        {
+            string wl = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
+            foreach (string[] v in Reg.Values(wl))
+            {
+                string nm = v[0]; string dt = v[1];
+                if (nm.Equals("Shell", StringComparison.OrdinalIgnoreCase))
+                    Add(f, "Winlogon Shell", nm, dt, wl, dt.Trim().ToLower() == "explorer.exe" ? "" : "SUSPECT", 0, wl, nm, null);
+                else if (nm.Equals("Userinit", StringComparison.OrdinalIgnoreCase))
+                    Add(f, "Winlogon Userinit", nm, dt, wl, dt.ToLower().Contains("userinit.exe,") && dt.Split(',').Length <= 2 ? "" : "SUSPECT", 0, wl, nm, null);
+                else if (nm.Equals("Taskman", StringComparison.OrdinalIgnoreCase))
+                    Add(f, "Winlogon Taskman", nm, dt, wl, "SUSPECT", 0, wl, nm, null);
+            }
         }
 
         // Value names are exact; only the real unnamed default value ("") is skipped, so names such as "(x)" or
@@ -2034,10 +2080,11 @@ namespace RescueScan
         void ScanDrivers(List<Finding> f, string winDir)
         {
             string dir = FsPath(winDir + "\\System32\\drivers");
-            if (!Directory.Exists(dir)) return;
+            List<string> files = new List<string>(), denied = new List<string>();
+            FilesBelow(dir, 32, files, denied);   // this folder only (depth 32 = no subfolders), never throws
             string[] benign = { ".dat", ".dls", ".wdf", ".txt", ".mui", ".bin", ".din", ".cat", ".inf", ".ini", ".xml", ".json", ".etl" };
             string[] exe = { ".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".scr", ".com", ".pif", ".js", ".hta" };
-            foreach (string fp in Directory.GetFiles(dir))
+            foreach (string fp in files)
             {
                 string ext = Path.GetExtension(fp).ToLower();
                 string nm = Path.GetFileName(fp);
@@ -2132,8 +2179,9 @@ namespace RescueScan
 
         void AddStartup(List<Finding> f, string dir, string cat)
         {
-            if (!Directory.Exists(dir)) return;
-            foreach (string fp in Directory.GetFiles(dir))
+            List<string> files = new List<string>(), denied = new List<string>();
+            FilesBelow(dir, 32, files, denied);   // this folder only, never throws
+            foreach (string fp in files)
             {
                 string nm = Path.GetFileName(fp);
                 if (nm.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase)) continue;
@@ -2257,12 +2305,13 @@ namespace RescueScan
             if (MessageBox.Show("Карантин отмеченных (" + n + ")? Файлы будут перенесены, ветки реестра — забэкаплены в .reg и удалены.\nПапка карантина создастся рядом с программой.", "Карантин",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             List<ListViewItem> done = new List<ListViewItem>();
-            int ok = 0, fail = 0, skip = 0;
+            int ok = 0, fail = 0, skip = 0, keep = 0;
             quarErr = "";
             foreach (ListViewItem it in target.Items)
             {
                 if (!it.Checked) continue;
                 Finding x = (Finding)it.Tag;
+                if (ResetOnly(x)) { keep++; continue; }
                 bool r = false;
                 if (x.Kind == 2) r = QuarFile(x.DelPath);
                 else if (x.Kind == 0) { if (QuarReg(x.DelKey)) r = Reg.DeleteValue(x.DelKey, x.DelName); }
@@ -2272,7 +2321,7 @@ namespace RescueScan
             }
             foreach (ListViewItem it in done) target.Items.Remove(it);
             lblStatus.Text = "Карантин: " + ok + "   ошибок: " + fail + "   пропущено: " + skip + "   -> " + quarDir
-                + (fail > 0 && quarErr.Length > 0 ? "   причина: " + quarErr : "");
+                + (fail > 0 && quarErr.Length > 0 ? "   причина: " + quarErr : "") + KeepNote(keep);
         }
 
         void QuarantineSelectedFiles()
@@ -2595,6 +2644,20 @@ namespace RescueScan
             return j > 0 ? k.Substring(0, j) : k;
         }
 
+        // Winlogon Shell / Userinit must be RESET to the default, never deleted: a deleted Userinit gives a logon/logoff
+        // loop (research windows-semantics Q1: "treat it as critical"). Delete, quarantine and the Easy quarantine skip
+        // them; «Обезвредить», the «Ремонт» tab and the Easy Winlogon step reset them instead. (Live mode made this
+        // reachable on the running OS: Easy used to reset Userinit and then delete it.)
+        internal static bool ResetOnly(Finding x)
+        {
+            return x != null && x.Kind == 0 && (x.Category == "Winlogon Shell" || x.Category == "Winlogon Userinit");
+        }
+
+        static string KeepNote(int keep)
+        {
+            return keep > 0 ? "   Winlogon Shell/Userinit не удаляются (" + keep + "): сброс — «Обезвредить» или вкладка «Ремонт»" : "";
+        }
+
         bool DefuseOne(Finding x)
         {
             if (x == null) return false;
@@ -2714,12 +2777,14 @@ namespace RescueScan
             return n;
         }
 
-        void QuarantineSuspectAll(out int ok, out int fail)
+        // kept = Winlogon Shell/Userinit findings left alone (reset by the Winlogon / defuse steps, never deleted)
+        void QuarantineSuspectAll(out int ok, out int fail, out int kept)
         {
-            ok = 0; fail = 0; quarErr = "";
+            ok = 0; fail = 0; kept = 0; quarErr = "";
             foreach (Finding x in new List<Finding>(lastFindings))
             {
                 if (x.Risk != "SUSPECT") continue;
+                if (ResetOnly(x)) { kept++; continue; }
                 bool r = false;
                 if (x.Kind == 2) r = QuarFile(x.DelPath);
                 else if (x.Kind == 0) { if (QuarReg(x.DelKey)) r = Reg.DeleteValue(x.DelKey, x.DelName); }
@@ -2745,7 +2810,12 @@ namespace RescueScan
             if (soft && oRestrict.Checked) { int i = RestoreRestrictions(); r.AppendLine("Снято ограничений политик: " + i); }
             if (soft && oAssoc.Checked) { int i = RestoreAssoc(); r.AppendLine("Ассоциации/иконки восстановлены (" + i + ")"); }
             if (oDefuse.Checked) { int d = 0; foreach (Finding x in lastFindings) if (x.Risk == "SUSPECT" && DefuseOne(x)) d++; r.AppendLine("Обезврежено якорей: " + d); }
-            if (oQuar.Checked) { int ok, fail; QuarantineSuspectAll(out ok, out fail); r.AppendLine("В карантин: " + ok + "  (ошибок " + fail + ")  -> " + quarDir + (fail > 0 && quarErr.Length > 0 ? "\r\n   причина: " + quarErr : "")); }
+            if (oQuar.Checked)
+            {
+                int ok, fail, kept; QuarantineSuspectAll(out ok, out fail, out kept);
+                r.AppendLine("В карантин: " + ok + "  (ошибок " + fail + ")  -> " + quarDir + (fail > 0 && quarErr.Length > 0 ? "\r\n   причина: " + quarErr : ""));
+                if (kept > 0) r.AppendLine("Winlogon Shell/Userinit не удалены (" + kept + "): их только возвращают в дефолт" + (oWinlogon.Checked || oDefuse.Checked ? "" : " — включи «Вернуть Winlogon» или «Обезвредить»"));
+            }
             if (oWatch.Checked) { chkWatch.Checked = true; r.AppendLine("Watchdog включён"); }
             if (oScan.Checked) { Scan(); } // пересканировать, чтобы список отражал результат
             QuarAutoFind();
@@ -2841,12 +2911,13 @@ namespace RescueScan
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
 
             List<ListViewItem> done = new List<ListViewItem>();
-            int ok = 0, fail = 0, skip = 0;
+            int ok = 0, fail = 0, skip = 0, keep = 0;
             foreach (ListViewItem it in target.Items)
             {
                 if (!it.Checked) continue;
                 Finding x = (Finding)it.Tag;
                 if (x.Kind == 3) { skip++; continue; }   // info-only (BCD/LSA/class hijack): чинить вручную, не удалять
+                if (ResetOnly(x)) { keep++; continue; }
                 bool r = false;
                 try
                 {
@@ -2858,7 +2929,7 @@ namespace RescueScan
                 if (r) { ok++; done.Add(it); } else fail++;
             }
             foreach (ListViewItem it in done) target.Items.Remove(it);
-            lblStatus.Text = "Удалено: " + ok + "   ошибок: " + fail + "   пропущено (info): " + skip;
+            lblStatus.Text = "Удалено: " + ok + "   ошибок: " + fail + "   пропущено (info): " + skip + KeepNote(keep);
         }
 
         void Export()

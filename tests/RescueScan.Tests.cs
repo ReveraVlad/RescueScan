@@ -42,6 +42,8 @@ namespace RescueScan.Tests
                 Run("Scan filter: AddValues keeps (x)/REG_x/trail /q\"uote, skips default", ScanFilterAddValues);
                 Run("Scan filter: AddValuesRisk keeps (x)/REG_x", ScanFilterAddValuesRisk);
                 Run("Scan filter: class hijack looks only at the default value", ScanFilterClassHijack);
+                Run("Winlogon Shell/Userinit are reset-only (never deleted)", ResetOnlyWinlogon);
+                Run("Scan: file walk never throws, no symlink/junction loops", FilesWalk);
                 Run("SetString/SetDword: create key, exact names, kinds", SetHelpers);
                 Run("DeleteValue: exact names, missing => false", DeleteValueExact);
                 Run("DeleteKey: whole tree, refusals, missing => false", DeleteKeyTree);
@@ -127,6 +129,7 @@ namespace RescueScan.Tests
         {
             try { if (Reg.KeyExists(Root)) Reg.DeleteKey(Root); } catch { }   // link-safe on Windows
             foreach (string f in tempFiles) try { File.Delete(f); } catch { }
+            foreach (string d in tempDirs) try { DeleteDir(d); } catch { }
             using (RegistryKey b = HKCU())
             {
                 try { b.DeleteSubKeyTree(Sub, false); } catch { }
@@ -497,6 +500,28 @@ namespace RescueScan.Tests
             Eq("C:\\evil.exe \"%1\" %*", h.Value, "hijack data");
         }
 
+        // Winlogon Shell / Userinit found by the scan are reset-only: Delete, Quarantine and Easy never delete them (a
+        // deleted Userinit = logon/logoff loop). Other Winlogon values stay deletable.
+        static void ResetOnlyWinlogon()
+        {
+            using (RegistryKey k = Make("wl\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"))
+            {
+                k.SetValue("Shell", "explorer.exe, C:\\evil.exe");
+                k.SetValue("Userinit", "C:\\Windows\\system32\\userinit.exe,C:\\x\\evil.exe,");
+                k.SetValue("Taskman", "C:\\evil2.exe");
+            }
+            List<Finding> f = new List<Finding>();
+            MainForm.ScanWinlogon(f, Root + "\\wl");
+            Eq(3, f.Count, "three Winlogon findings");
+            True(MainForm.ResetOnly(FindName(f, "Shell")), "Shell: reset only");
+            True(MainForm.ResetOnly(FindName(f, "Userinit")), "Userinit: reset only");
+            Eq("SUSPECT", FindName(f, "Userinit").Risk, "the evil Userinit is still flagged");
+            True(!MainForm.ResetOnly(FindName(f, "Taskman")), "Taskman can be deleted");
+            Finding vm = new Finding(); vm.Category = "Winlogon VmApplet"; vm.Kind = 0;
+            True(!MainForm.ResetOnly(vm), "other Winlogon values: unchanged behaviour");
+            True(!MainForm.ResetOnly(null), "null");
+        }
+
         // ------------------------------------------------------------------ registry writes
         static void SetHelpers()
         {
@@ -720,6 +745,33 @@ namespace RescueScan.Tests
             }
         }
 
+        // The task / Startup / drivers walk never throws, does not follow junctions or symlinks (loops) and still finds
+        // every file below.
+        static void FilesWalk()
+        {
+            string d = Path.Combine(Path.GetTempPath(), "rs_walk_" + Id);
+            tempDirs.Add(d);
+            Directory.CreateDirectory(Path.Combine(d, "a" + Path.DirectorySeparatorChar + "b"));
+            File.WriteAllText(Path.Combine(d, "t0"), "x");
+            File.WriteAllText(Path.Combine(d, "a" + Path.DirectorySeparatorChar + "t1"), "x");
+            File.WriteAllText(Path.Combine(d, "a" + Path.DirectorySeparatorChar + "b" + Path.DirectorySeparatorChar + "t2"), "x");
+            if (!OnWindows)   // a symlink loop a/b/loop -> a (Windows: creating one needs a privilege)
+            {
+                string o;
+                Eq(0, Reg.RunProcess("/bin/ln", "-s " + Path.Combine(d, "a") + " " + Path.Combine(d, "a/b/loop"), 10000, out o), "test setup: symlink loop");
+            }
+            List<string> files = new List<string>(), denied = new List<string>();
+            MainForm.FilesBelow(d, 0, files, denied);
+            Eq(3, files.Count, "every file once, the loop not followed: " + string.Join(" | ", files.ToArray()));
+            Eq(0, denied.Count, "nothing denied");
+            files.Clear();
+            MainForm.FilesBelow(d, 32, files, denied);
+            Eq(1, files.Count, "depth 32 = this folder only");
+            files.Clear();
+            MainForm.FilesBelow(Path.Combine(d, "missing"), 0, files, denied);
+            Eq(0, files.Count + denied.Count, "missing folder: nothing, no exception");
+        }
+
         // ------------------------------------------------------------------ hive mount bookkeeping (simulated reg.exe)
         // A fake HKLM with mount points, hive files, mounts that refuse to unload (regedit has them open) and hive
         // files that cannot be loaded (in use); reg.exe "load"/"unload" are parsed with the reference argv parser.
@@ -890,6 +942,19 @@ namespace RescueScan.Tests
 
         // ------------------------------------------------------------------ processes
         static List<string> tempFiles = new List<string>();
+        static List<string> tempDirs = new List<string>();
+
+        // Deletes a temp tree without following symlinks / junctions (they are removed as links).
+        static void DeleteDir(string d)
+        {
+            foreach (string sd in Directory.GetDirectories(d))
+            {
+                if ((File.GetAttributes(sd) & FileAttributes.ReparsePoint) != 0) { try { Directory.Delete(sd); } catch { File.Delete(sd); } continue; }
+                DeleteDir(sd);
+            }
+            foreach (string f in Directory.GetFiles(d)) File.Delete(f);
+            Directory.Delete(d);
+        }
 
         static string TempScript(string unixBody, string winBody)
         {
