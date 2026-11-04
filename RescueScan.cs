@@ -1459,10 +1459,10 @@ namespace RescueScan
             }
             Cursor.Current = Cursors.Default;
             int susp = 0; foreach (Finding x in f) if (x.Risk == "SUSPECT") susp++;
+            RepairRefresh();
+            SimpleRefresh();   // (sets "Нажми «Сканировать»" when nothing was found: the status below must come after it)
             lblStatus.Text = "Записей: " + f.Count + "   подозрительных: " + susp + "   (ControlSet: " + ccs + ")   цель: " + TargetName()
                 + (warn.Length > 0 ? "   ВНИМАНИЕ: " + warn : "");
-            RepairRefresh();
-            SimpleRefresh();
             if (tgtSoft.Length == 0 || tgtSys.Length == 0)
                 MessageBox.Show("Кусты реестра системы " + tgtWinDir + " смонтированы не все:\r\n" + warn +
                     "\r\n\r\nСкан реестра НЕПОЛНЫЙ. Ремонт/разблокировка для этой цели будут отменены (на живую ОС программа не переключается).",
