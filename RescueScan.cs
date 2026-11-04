@@ -76,6 +76,8 @@ namespace RescueScan
             foreach (string r in new string[] { softRoot, softRoot + "\\Wow6432Node" })
             {
                 string k = r + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\" + name;
+                using (RegistryKey t = OpenKey(k, false))   // an IFEO key for the tool that we may not read cannot be checked
+                    if (t == null && KeyExists(k)) return k + " (ключ есть, но не читается — проверить нельзя)";
                 string hit = IfeoHit(k);
                 if (hit.Length > 0) return hit;
                 bool filter = false; long gflag = 0;
@@ -802,7 +804,7 @@ namespace RescueScan
         // " (reg.exe's message)" for a warning; a reason already in the warning is not repeated for every hive.
         static string Why(int rc, string o, StringBuilder warn)
         {
-            string m = Reg.OneLine((o ?? "").Replace(Reg.RegToolsHint, ""), 200);
+            string m = Reg.OneLine((o ?? "").Replace(Reg.RegToolsHint, ""), 400);
             if ((o ?? "").Contains(Reg.RegToolsHint) && warn.ToString().IndexOf(Reg.RegToolsHint, StringComparison.Ordinal) < 0)
                 warn.Append(Reg.RegToolsHint + " ");
             if (m.Length == 0) return rc != 0 ? " (код " + rc + ")" : "";
@@ -888,17 +890,19 @@ namespace RescueScan
             if (Mounted.Count == 0) return "";
             GC.Collect(); GC.WaitForPendingFinalizers();   // a leaked RegistryKey handle into a hive would block the unload
             List<string> still = new List<string>();
-            StringBuilder why = new StringBuilder();
+            StringBuilder notes = new StringBuilder();   // e.g. the DisableRegistryTools hint, once
+            string first = "";
             foreach (string m in Mounted)
             {
-                string w = Unload(m, why);
+                string w = Unload(m, notes);
                 if (w == null) continue;
                 still.Add(m);
-                if (why.Length == 0) why.Append(w);
+                if (first.Length == 0) first = w;
             }
             Mounted.Clear(); Mounted.AddRange(still);
             if (still.Count == 0) return "";
-            return "не выгружено: HKLM\\" + string.Join(", HKLM\\", still.ToArray()) + why + " (закрой regedit и повтори)";
+            return "не выгружено: HKLM\\" + string.Join(", HKLM\\", still.ToArray()) + first + " (закрой regedit и повтори)"
+                + (notes.Length > 0 ? ". " + notes.ToString().Trim() : "");
         }
     }
 

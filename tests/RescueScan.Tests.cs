@@ -61,6 +61,7 @@ namespace RescueScan.Tests
                 Run("Mounts: old mount at the same name replaced, or the mount fails", MountSameName);
                 Run("Mounts: another instance's hives are never touched", MountOtherInstance);
                 Run("Mounts: user mount names used up -> counted as not mounted", MountUserCap);
+                Run("Mounts: reg.exe blocked by DisableRegistryTools -> reason + hint once", MountBlocked);
                 Run("RunProcess: big stderr does not deadlock", ProcBigStderr);
                 Run("RunProcess: exit code + stderr on failure", ProcFailure);
                 Run("RunProcess: timeout kills the child", ProcTimeout);
@@ -812,11 +813,13 @@ namespace RescueScan.Tests
             public readonly HashSet<string> InUse = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // load fails
             public readonly Dictionary<string, string> Loaded = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             public readonly List<string> Calls = new List<string>();
-            public bool Other;   // another instance holds the mount role
+            public bool Other;     // another instance holds the mount role
+            public bool Blocked;   // HKCU DisableRegistryTools: reg.exe refuses everything (RunCode appends the hint)
 
             public int Run(string args, out string outp)
             {
                 Calls.Add(args);
+                if (Blocked) { outp = "ERROR: Registry editing has been disabled by your administrator.\r\n" + Reg.RegToolsHint; return 1; }
                 List<string> a = ParseArgs(args);
                 if (a.Count == 3 && a[0] == "load")
                 {
@@ -953,6 +956,30 @@ namespace RescueScan.Tests
             True(msg.Contains(HiveMounts.OtherInstanceMsg), "explained: " + msg);
             Eq("", m.UnloadAll(), "nothing of ours to unload");
             Eq(2, r.Keys.Count, "...and nothing unloaded");
+        }
+
+        // reg.exe blocked by DisableRegistryTools: every failure says why, the hint appears once, nothing is pretended.
+        static void MountBlocked()
+        {
+            FakeReg r = new FakeReg();
+            string a = "D:\\Users\\a\\NTUSER.DAT", b = "D:\\Users\\b\\NTUSER.DAT", c = "D:\\Users\\c\\NTUSER.DAT";
+            r.Files.Add(a); r.Files.Add(b); r.Files.Add(c);
+            HiveMounts m = r.Make();
+            StringBuilder w = new StringBuilder();
+            int next = 0, failed = 0;
+            Eq("HKLM\\RS_U0", m.MountUser(a, w, ref next, ref failed), "mounted before the policy was set");
+            r.Blocked = true;
+            Eq("", m.MountUser(b, w, ref next, ref failed), "blocked");
+            Eq("", m.MountUser(c, w, ref next, ref failed), "blocked");
+            Eq(2, failed, "both counted");
+            string msg = w.ToString();
+            True(msg.Contains("не смонтирован " + b + " (ERROR: Registry editing has been disabled by your administrator.)"), "reason: " + msg);
+            True(msg.Contains("не смонтирован " + c + " (та же причина)"), "same reason not repeated: " + msg);
+            Eq(msg.IndexOf(Reg.RegToolsHint), msg.LastIndexOf(Reg.RegToolsHint), "hint once");
+            True(msg.Contains(Reg.RegToolsHint), "hint shown");
+            string left = m.UnloadAll();
+            True(left.StartsWith("не выгружено: HKLM\\RS_U0 (ERROR: Registry editing has been disabled") && left.EndsWith(Reg.RegToolsHint), "unload: reason + hint: " + left);
+            Eq("RS_U0", string.Join(",", m.Mounted.ToArray()), "kept for a retry");
         }
 
         // Every user mount name used up: the rest is counted as not mounted (was: silently left unscanned after 100).
@@ -1270,20 +1297,31 @@ namespace RescueScan.Tests
             }
         }
 
-        // A key whose DACL denies reading: Values/Pairs see nothing (like reg.exe did), but the key is noted for the scan.
+        // Adds (deny = true) or removes a "deny QueryValues + EnumerateSubKeys to me" rule on HKCU\<Sub>\<rel>. The owner
+        // may always change the DACL, so the rule can be undone for the cleanup.
+        static void DenyRead(string rel, bool deny)
+        {
+            RegistryAccessRule rule = new RegistryAccessRule(WindowsIdentity.GetCurrent().User,
+                RegistryRights.QueryValues | RegistryRights.EnumerateSubKeys, AccessControlType.Deny);
+            using (RegistryKey b = HKCU())
+            using (RegistryKey k = b.OpenSubKey(Sub + "\\" + rel, RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.ReadPermissions | RegistryRights.ChangePermissions))
+            {
+                RegistrySecurity sec = k.GetAccessControl();
+                if (deny) sec.AddAccessRule(rule); else sec.RemoveAccessRule(rule);
+                k.SetAccessControl(sec);
+            }
+        }
+
+        // A key whose DACL denies reading: Values/Pairs see nothing (like reg.exe did), but the key is noted for the scan;
+        // an unreadable IFEO\<tool> key blocks the tool (a hijack there could not be ruled out).
         static void DeniedWin()
         {
             WindowsOnly();
             using (RegistryKey k = Make("deny\\locked")) k.SetValue("ImagePath", "C:\\Windows\\Temp\\x.exe");
-            SecurityIdentifier me = WindowsIdentity.GetCurrent().User;
-            RegistryAccessRule rule = new RegistryAccessRule(me, RegistryRights.QueryValues | RegistryRights.EnumerateSubKeys, AccessControlType.Deny);
-            using (RegistryKey b = HKCU())
-            using (RegistryKey k = b.OpenSubKey(Sub + "\\deny\\locked", RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.ReadPermissions | RegistryRights.ChangePermissions))
-            {
-                RegistrySecurity s = k.GetAccessControl();
-                s.AddAccessRule(rule);
-                k.SetAccessControl(s);
-            }
+            string ifeo = "hjd\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\x.exe";
+            using (RegistryKey k = Make(ifeo)) k.SetValue("Debugger", "C:\\evil.exe");
+            DenyRead("deny\\locked", true);
+            DenyRead(ifeo, true);
             try
             {
                 Reg.TakeDenied();
@@ -1293,16 +1331,13 @@ namespace RescueScan.Tests
                 List<string> d = Reg.TakeDenied();
                 True(d.Contains(Root + "\\deny\\locked"), "noted as denied: " + string.Join(" | ", d.ToArray()));
                 Eq(0, Reg.TakeDenied().Count, "TakeDenied starts a new list");
+                string h = Reg.ToolHijack(Root + "\\hjd", "x.exe");
+                True(h.Contains("не читается"), "unreadable IFEO key blocks the tool: " + h);
             }
             finally
             {
-                using (RegistryKey b = HKCU())   // the owner may always change the DACL: undo, so the cleanup can delete it
-                using (RegistryKey k = b.OpenSubKey(Sub + "\\deny\\locked", RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.ReadPermissions | RegistryRights.ChangePermissions))
-                {
-                    RegistrySecurity s = k.GetAccessControl();
-                    s.RemoveAccessRule(rule);
-                    k.SetAccessControl(s);
-                }
+                DenyRead("deny\\locked", false);
+                DenyRead(ifeo, false);
             }
         }
 
