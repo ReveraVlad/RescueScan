@@ -11,6 +11,8 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 
 namespace RescueScan
 {
@@ -143,67 +145,268 @@ namespace RescueScan
             catch { return false; }
         }
 
-        // Returns list of {name,type,data} for a key's values.
+        // ================= registry access via Microsoft.Win32 (no "reg query" text parsing) =================
+        // Paths are "<ROOT>\sub\key", ROOT = HKLM | HKEY_LOCAL_MACHINE | HKCU | HKEY_CURRENT_USER | HKU | HKEY_USERS |
+        // HKCR | HKEY_CLASSES_ROOT; always the 64-bit view on 64-bit Windows (also from a 32-bit build).
+        // Missing key / access denied => empty result (or false), never an exception to the UI.
+        internal const int PairsMaxDepth = 64;      // Pairs: levels below the start key
+        internal const int PairsMaxKeys = 250000;   // Pairs: keys visited per call
+
+        internal static RegistryView View
+        {
+            get { return Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Default; }
+        }
+
+        internal static bool SplitRoot(string path, out RegistryHive hive, out string sub)
+        {
+            hive = RegistryHive.LocalMachine; sub = "";
+            if (path == null) return false;
+            int i = path.IndexOf('\\');
+            string root = (i < 0 ? path : path.Substring(0, i)).ToUpperInvariant();
+            sub = i < 0 ? "" : path.Substring(i + 1);
+            switch (root)
+            {
+                case "HKLM": case "HKEY_LOCAL_MACHINE": hive = RegistryHive.LocalMachine; return true;
+                case "HKCU": case "HKEY_CURRENT_USER": hive = RegistryHive.CurrentUser; return true;
+                case "HKU": case "HKEY_USERS": hive = RegistryHive.Users; return true;
+                case "HKCR": case "HKEY_CLASSES_ROOT": hive = RegistryHive.ClassesRoot; return true;
+            }
+            return false;
+        }
+
+        // Opens a key by full path; the caller disposes it. null if missing / access denied / unknown root.
+        internal static RegistryKey OpenKey(string path, bool writable)
+        {
+            RegistryHive hive; string sub;
+            if (!SplitRoot(path, out hive, out sub)) return null;
+            try
+            {
+                RegistryKey b = RegistryKey.OpenBaseKey(hive, View);
+                if (sub.Trim('\\').Length == 0) return b;
+                using (b) return b.OpenSubKey(sub, writable);
+            }
+            catch { return null; }
+        }
+
+        // {name, data, type} for every value of a key. Names are exact (the unnamed default value is ""); data is the
+        // text reg.exe printed: REG_SZ/REG_EXPAND_SZ raw (NOT expanded, up to the first NUL), REG_MULTI_SZ items joined
+        // with the two characters \0, REG_DWORD/REG_QWORD "0x" + lowercase hex, anything else uppercase hex.
         public static List<string[]> Values(string key)
         {
             List<string[]> res = new List<string[]>();
-            string outp = Run("query \"" + key + "\"");
-            string[] lines = outp.Replace("\r", "").Split('\n');
-            foreach (string line in lines)
+            using (RegistryKey k = OpenKey(key, false))
             {
-                if (line.Length < 6) continue;
-                if (!line.StartsWith("    ")) continue;      // values are indented
-                string t = line.Substring(4);
-                int rt = t.IndexOf("REG_");
-                if (rt < 1) continue;
-                string name = t.Substring(0, rt).Trim();
-                string rest = t.Substring(rt);
-                string data = "";
-                int sp = rest.IndexOf("    ");
-                if (sp >= 0) data = rest.Substring(sp).Trim();
-                res.Add(new string[] { name, data });
-            }
-            return res;
-        }
-
-        // Full paths of immediate subkeys.
-        public static List<string> Subkeys(string key)
-        {
-            List<string> res = new List<string>();
-            string outp = Run("query \"" + key + "\"");
-            string[] lines = outp.Replace("\r", "").Split('\n');
-            foreach (string line in lines)
-            {
-                string l = line.Trim();
-                if (l.StartsWith("HKEY_")) res.Add(l);
-            }
-            return res;
-        }
-
-        // Recursive /v: returns {subkeyFullPath, data} pairs for a single value name.
-        public static List<string[]> Pairs(string key, string valName)
-        {
-            List<string[]> res = new List<string[]>();
-            string outp = Run("query \"" + key + "\" /s /v " + valName);
-            string[] lines = outp.Replace("\r", "").Split('\n');
-            string last = null;
-            foreach (string line in lines)
-            {
-                string l = line.Trim();
-                if (l.StartsWith("HKEY_")) { last = l; continue; }
-                if (line.StartsWith("    "))
+                if (k == null) return res;
+                foreach (string n in Names(k, false))
                 {
-                    string t = line.Substring(4);
-                    int rt = t.IndexOf("REG_");
-                    if (rt < 0) continue;
-                    string rest = t.Substring(rt);
-                    string data = "";
-                    int sp = rest.IndexOf("    ");
-                    if (sp >= 0) data = rest.Substring(sp).Trim();
-                    if (last != null) res.Add(new string[] { last, data });
+                    string data, type;
+                    if (!TryGetValue(k, n, out data, out type)) { data = ""; type = ""; }
+                    res.Add(new string[] { n, data, type });
                 }
             }
             return res;
+        }
+
+        // Full paths of the immediate subkeys, with the same root spelling/prefix as 'key' (can be passed on as is).
+        public static List<string> Subkeys(string key)
+        {
+            List<string> res = new List<string>();
+            using (RegistryKey k = OpenKey(key, false))
+            {
+                if (k == null) return res;
+                string bas = key.TrimEnd('\\');
+                foreach (string s in Names(k, true)) res.Add(bas + "\\" + s);
+            }
+            return res;
+        }
+
+        // Like "reg query KEY /s /v NAME", but only for keys BELOW 'key' (a value planted on Services or IFEO itself
+        // must not turn into a "delete the whole Services key" finding): {subkeyFullPath, data, type} for every
+        // descendant key that has a value named valName. Registry symbolic links are not followed; depth and the
+        // number of visited keys are bounded.
+        public static List<string[]> Pairs(string key, string valName)
+        {
+            List<string[]> res = new List<string[]>();
+            using (RegistryKey k = OpenKey(key, false))
+            {
+                if (k == null) return res;
+                int budget = PairsMaxKeys;
+                PairsRec(k, key.TrimEnd('\\'), valName, 1, ref budget, res);
+            }
+            return res;
+        }
+
+        static void PairsRec(RegistryKey k, string path, string valName, int depth, ref int budget, List<string[]> res)
+        {
+            if (depth > PairsMaxDepth || IsLink(k)) return;
+            foreach (string s in Names(k, true))
+            {
+                if (--budget < 0) return;
+                using (RegistryKey c = OpenChild(k, s, false))
+                {
+                    if (c == null) continue;
+                    string cp = path + "\\" + s, data, type;
+                    if (TryGetValue(c, valName, out data, out type)) res.Add(new string[] { cp, data, type });
+                    PairsRec(c, cp, valName, depth + 1, ref budget, res);
+                }
+            }
+        }
+
+        // true if the key exists (also when it exists but cannot be read).
+        public static bool KeyExists(string key)
+        {
+            RegistryHive hive; string sub;
+            if (!SplitRoot(key, out hive, out sub)) return false;
+            try
+            {
+                using (RegistryKey b = RegistryKey.OpenBaseKey(hive, View))
+                {
+                    if (sub.Trim('\\').Length == 0) return true;
+                    using (RegistryKey k = b.OpenSubKey(sub, false)) return k != null;
+                }
+            }
+            catch (System.Security.SecurityException) { return true; }
+            catch (UnauthorizedAccessException) { return true; }
+            catch { return false; }
+        }
+
+        // RegistryKey.GetValue(..., DoNotExpandEnvironmentNames) result -> the text reg.exe printed for it.
+        internal static string FormatData(object o)
+        {
+            if (o == null) return "";
+            string s = o as string;
+            if (s != null) { int z = s.IndexOf('\0'); return z >= 0 ? s.Substring(0, z) : s; }
+            string[] m = o as string[];
+            if (m != null) return string.Join("\\0", m);
+            if (o is int) return "0x" + ((uint)(int)o).ToString("x");
+            if (o is long) return "0x" + ((ulong)(long)o).ToString("x");
+            byte[] b = o as byte[];
+            if (b != null) return Hex(b);
+            return Convert.ToString(o, System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        internal static string Hex(byte[] b)
+        {
+            if (b == null) return "";
+            StringBuilder sb = new StringBuilder(b.Length * 2);
+            foreach (byte x in b) sb.Append(x.ToString("X2"));
+            return sb.ToString();
+        }
+
+        static string KindName(RegistryValueKind k)
+        {
+            switch (k)
+            {
+                case RegistryValueKind.String: return "REG_SZ";
+                case RegistryValueKind.ExpandString: return "REG_EXPAND_SZ";
+                case RegistryValueKind.MultiString: return "REG_MULTI_SZ";
+                case RegistryValueKind.DWord: return "REG_DWORD";
+                case RegistryValueKind.QWord: return "REG_QWORD";
+                case RegistryValueKind.Binary: return "REG_BINARY";
+                case RegistryValueKind.None: return "REG_NONE";
+            }
+            return "REG_UNKNOWN";
+        }
+
+        static string TypeName(int t)
+        {
+            string[] n = { "REG_NONE", "REG_SZ", "REG_EXPAND_SZ", "REG_BINARY", "REG_DWORD", "REG_DWORD_BIG_ENDIAN", "REG_LINK",
+                           "REG_MULTI_SZ", "REG_RESOURCE_LIST", "REG_FULL_RESOURCE_DESCRIPTOR", "REG_RESOURCE_REQUIREMENTS_LIST", "REG_QWORD" };
+            return t >= 0 && t < n.Length ? n[t] : "REG_UNKNOWN_0x" + t.ToString("x");
+        }
+
+        // One value as reg.exe printed it. false = there is no such value.
+        static bool TryGetValue(RegistryKey k, string name, out string data, out string type)
+        {
+            data = ""; type = "";
+            RegistryValueKind kind;
+            object o = null;
+            try { kind = k.GetValueKind(name); } catch { return false; }   // .NET: IOException for a missing value
+            try { o = k.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames); } catch { }
+            if (kind == RegistryValueKind.Unknown || o == null)
+            {
+                // REG_LINK, REG_RESOURCE_LIST, REG_DWORD_BIG_ENDIAN, custom types: .NET knows no kind / returns no data
+                int rt; byte[] raw;
+                if (RawValue(k, name, out rt, out raw)) { type = TypeName(rt); data = o != null ? FormatData(o) : Hex(raw); return true; }
+                if (o == null && kind == RegistryValueKind.Unknown) return false;   // Mono reports a missing value as Unknown
+            }
+            type = KindName(kind);
+            data = FormatData(o);
+            return true;
+        }
+
+        // Value or subkey names; retried because enumeration throws when the key changes meanwhile.
+        static string[] Names(RegistryKey k, bool subkeys)
+        {
+            for (int i = 0; ; i++)
+            {
+                try { return subkeys ? k.GetSubKeyNames() : k.GetValueNames(); }
+                catch { if (i >= 4) return new string[0]; }
+            }
+        }
+
+        // ---- Windows-only native helpers: recursion and deletion never follow registry symbolic links ----
+        // (a link stored in an OFFLINE hive points into the registry of the running WinPE; a link loop would make the
+        // recursion endless; RegistryKey.DeleteSubKeyTree follows links and would delete the link TARGET's subtree).
+        const int REG_OPTION_OPEN_LINK = 0x8, KEY_READ = 0x20019, KEY_DELETE = 0x10000, KEY_WOW64_64KEY = 0x100;
+        const int REG_LINK = 6, ERROR_MORE_DATA = 234;
+        static volatile bool nativeBroken;   // P/Invoke failed unexpectedly: reads fall back to the managed API
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegOpenKeyExW")]
+        static extern int NRegOpenKeyEx(SafeRegistryHandle key, string subKey, int options, int sam, out IntPtr result);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegQueryValueExW")]
+        static extern int NRegQueryValueEx(SafeRegistryHandle key, string name, IntPtr reserved, out int type, [Out] byte[] data, ref int size);
+        [DllImport("ntdll.dll")]
+        static extern int NtDeleteKey(SafeRegistryHandle key);
+
+        static bool IsWindows { get { return Environment.OSVersion.Platform == PlatformID.Win32NT; } }
+        static bool UseNative { get { return !nativeBroken && IsWindows; } }
+
+        // Opens child 'name' of 'parent' WITHOUT following it when it is a symbolic link (REG_OPTION_OPEN_LINK).
+        // forDelete adds DELETE access and never falls back to the link-following managed API on Windows.
+        static RegistryKey OpenChild(RegistryKey parent, string name, bool forDelete)
+        {
+            if (UseNative)
+            {
+                try
+                {
+                    IntPtr h;
+                    int sam = KEY_READ | (forDelete ? KEY_DELETE : 0) | (View == RegistryView.Registry64 ? KEY_WOW64_64KEY : 0);
+                    if (NRegOpenKeyEx(parent.Handle, name, REG_OPTION_OPEN_LINK, sam, out h) != 0 || h == IntPtr.Zero) return null;
+                    SafeRegistryHandle sh = new SafeRegistryHandle(h, true);
+                    try { return RegistryKey.FromHandle(sh, View); }
+                    catch { sh.Dispose(); throw; }
+                }
+                catch (Exception) { nativeBroken = true; if (forDelete) return null; }
+            }
+            else if (forDelete && IsWindows) return null;
+            try { return parent.OpenSubKey(name, forDelete); } catch { return null; }
+        }
+
+        static bool IsLink(RegistryKey k)
+        {
+            int t; byte[] d;
+            return UseNative && RawValue(k, "SymbolicLinkValue", out t, out d) && t == REG_LINK;
+        }
+
+        // Raw type and bytes of a value (Windows only).
+        static bool RawValue(RegistryKey k, string name, out int type, out byte[] data)
+        {
+            type = 0; data = null;
+            if (!UseNative) return false;
+            try
+            {
+                int size = 0;
+                int rc = NRegQueryValueEx(k.Handle, name, IntPtr.Zero, out type, null, ref size);
+                if (rc != 0 && rc != ERROR_MORE_DATA) return false;
+                byte[] buf = new byte[size];
+                rc = NRegQueryValueEx(k.Handle, name, IntPtr.Zero, out type, buf, ref size);
+                if (rc != 0) return false;
+                if (size < buf.Length) Array.Resize(ref buf, size);
+                data = buf;
+                return true;
+            }
+            catch { return false; }
         }
     }
 
@@ -947,20 +1150,22 @@ namespace RescueScan
             SimpleRefresh();
         }
 
-        void AddValues(List<Finding> f, string cat, string key)
+        // Value names are exact; only the real unnamed default value ("") is skipped, so names such as "(x)" or
+        // "REG_x" are scanned too. internal static: called by tests.
+        internal static void AddValues(List<Finding> f, string cat, string key)
         {
             foreach (string[] v in Reg.Values(key))
             {
-                if (v[0].StartsWith("(") ) continue; // (Default)
+                if (v[0].Length == 0) continue; // (Default)
                 Add(f, cat, v[0], v[1], key, Risk(v[1]), 0, key, v[0], null);
             }
         }
 
-        void AddValuesRisk(List<Finding> f, string cat, string key, string forceRisk)
+        internal static void AddValuesRisk(List<Finding> f, string cat, string key, string forceRisk)
         {
             foreach (string[] v in Reg.Values(key))
             {
-                if (v[0].StartsWith("(")) continue;
+                if (v[0].Length == 0) continue; // (Default)
                 string r = Risk(v[1]); if (r == "") r = forceRisk;
                 Add(f, cat, v[0], v[1], key, r, 0, key, v[0], null);
             }
@@ -977,8 +1182,8 @@ namespace RescueScan
 
         static string Last(string path) { int i = path.LastIndexOf('\\'); return i < 0 ? path : path.Substring(i + 1); }
 
-        // ---- MODULE: extra SOFTWARE-hive persistence ----
-        void ScanExtraSoftware(List<Finding> f, string SOFT)
+        // ---- MODULE: extra SOFTWARE-hive persistence ----  (internal static: called by tests)
+        internal static void ScanExtraSoftware(List<Finding> f, string SOFT)
         {
             string[] roots = { SOFT, SOFT + "\\Wow6432Node" };
             foreach (string R in roots)
@@ -1011,7 +1216,7 @@ namespace RescueScan
             {
                 string k = SOFT + "\\Classes\\" + cl + "\\shell\\open\\command";
                 foreach (string[] v in Reg.Values(k))
-                    if (v[0].StartsWith("("))
+                    if (v[0].Length == 0)   // the unnamed (Default) value
                     {
                         string d = v[1].Trim();
                         bool ok = d.StartsWith("\"%1\"") || d.StartsWith("%1");
@@ -1196,7 +1401,7 @@ namespace RescueScan
             }
         }
 
-        void Add(List<Finding> f, string cat, string name, string val, string loc, string risk, int kind, string dkey, string dname, string dpath)
+        static void Add(List<Finding> f, string cat, string name, string val, string loc, string risk, int kind, string dkey, string dname, string dpath)
         {
             Finding x = new Finding();
             x.Category = cat; x.Name = name; x.Value = val; x.Location = loc; x.Risk = risk;
