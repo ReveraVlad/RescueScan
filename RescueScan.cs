@@ -1445,6 +1445,43 @@ namespace RescueScan
             return false;
         }
 
+        // Microsoft's own Active Setup components (Windows 7-11, Edge): GUID -> program -> a marker the StubPath must
+        // contain. Themes Setup / Desktop Update use "regsvr32 /i:", the icon-cache one "cmd /D /C start ie4uinit".
+        static readonly string[] ActiveSetupMs = {
+            "{2c7339cf-2b09-4501-b3f3-f3508c9228ed}", "regsvr32.exe", "themeui.dll",
+            "{89820200-ecbd-11cf-8b85-00aa005b4340}", "regsvr32.exe", "shell32.dll",
+            "{2d46b6dc-2207-486b-b523-a557e6d54b47}", "cmd.exe", "ie4uinit.exe",
+            "{26923b43-4d38-484f-9b9e-de460746276c}", "ie4uinit.exe", "ie4uinit.exe",
+            "{89b4c1cd-b018-4511-b0a1-5476dbf70820}", "rundll32.exe", "mscories.dll",
+            "{6bf52a52-394a-11d3-b153-00c04f79faa6}", "unregmp2.exe", "unregmp2.exe",
+            "{22d6f312-b0f6-11d0-94ab-0080c74c7e95}", "unregmp2.exe", "unregmp2.exe",
+            "{a509b1a7-37ef-4b3f-8cfc-4f3a74704073}", "rundll32.exe", "iesetup.dll",
+            "{a509b1a8-37ef-4b3f-8cfc-4f3a74704073}", "rundll32.exe", "iesetup.dll",
+            "{44bba840-cc51-11cf-aafa-00aa00b6015c}", "winmail.exe", "winmail.exe",
+            "{9459c573-b17a-45ae-9f64-1857b5d58cee}", "setup.exe", "\\microsoft\\edge\\application\\",
+        };
+
+        // A built-in Active Setup StubPath (not even REVIEW): known GUID (a leading '<' / '>' ordering mark is
+        // ignored), the expected program from System32 / SysWOW64 / Program Files (or a bare name), the expected DLL /
+        // tool, nothing chained (& |) and nothing Risk() calls SUSPECT.
+        internal static bool ActiveSetupClean(string guid, string stub)
+        {
+            string g = (guid ?? "").Trim().TrimStart('<', '>').ToLowerInvariant();
+            string st = stub ?? "";
+            if (st.IndexOf('&') >= 0 || st.IndexOf('|') >= 0 || st.IndexOf('>') >= 0) return false;
+            if (Heur.Risk(st, true) == "SUSPECT") return false;
+            string p = Heur.NormPath(st);
+            List<string> t = Heur.Tokens(p);
+            if (t.Count == 0) return false;
+            string first = t[0];
+            string nod = (first.Length >= 2 && first[1] == ':' ? first.Substring(2) : first).TrimStart('\\');
+            bool dirOk = first.IndexOf('\\') < 0 || Heur.SysDir(first) || nod.StartsWith("program files\\") || nod.StartsWith("program files (x86)\\");
+            for (int i = 0; i < ActiveSetupMs.Length; i += 3)
+                if (g == ActiveSetupMs[i])
+                    return dirOk && ImageName(st) == ActiveSetupMs[i + 1] && p.Contains(ActiveSetupMs[i + 2]);
+            return false;
+        }
+
         // file name (lower case) of the program a command line starts: "C:\x y\a.exe" -b  ->  a.exe
         internal static string ImageName(string cmd)
         {
@@ -3062,7 +3099,6 @@ namespace RescueScan
             string SOFT = tgtSoft;                                // "" = hive not mounted: nothing is read from it
             string SYS = tgtSys;
 
-            bool cutWalk;
             List<string> cut = new List<string>();   // registry walks that hit a bound: told to the user
             string ccs = "ControlSet001";
             try   // a module that throws (a hostile folder / key) must not discard everything found so far
@@ -3120,17 +3156,8 @@ namespace RescueScan
                 foreach (string[] v in Reg.Values(sb))
                     if (v[0].Equals("AlternateShell", StringComparison.OrdinalIgnoreCase))
                         AddReset(f, "SafeBoot AlternateShell", sb, v[0], v[1], Defaults.AlternateShellClean(v[1]) ? "" : "SUSPECT", Defaults.AlternateShell, RegistryValueKind.String);
-            // suspicious services/drivers only
-            foreach (string[] pr in Reg.Pairs(SYS + "\\" + ccs + "\\Services", "ImagePath", out cutWalk))
-            {
-                string img = pr[1];
-                if (Risk(img) == "SUSPECT")
-                {
-                    string svc = pr[0].Substring(pr[0].LastIndexOf('\\') + 1);
-                    Add(f, "Service/Driver", svc, img, pr[0], "SUSPECT", 1, pr[0], null, null);
-                }
-            }
-            if (cutWalk) cut.Add("Services");
+            // services / drivers / svchost ServiceDll: SUSPECT and REVIEW ones are listed
+            ScanServices(f, SYS + "\\" + ccs, cut);
             // svchost-hosted ServiceDll, LSA packages, Print Monitors, SessionMgr extras
             ScanExtraSystem(f, SYS + "\\" + ccs, cut);
 
@@ -3587,7 +3614,7 @@ namespace RescueScan
                 foreach (string sk in Reg.Subkeys(asroot))
                     foreach (string[] v in Reg.Values(sk))
                         if (v[0].Equals("StubPath", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
-                            Add(f, "Active Setup", Last(sk), v[1], sk, Risk(v[1]) == "SUSPECT" ? "SUSPECT" : "REVIEW", 0, sk, v[0], null);
+                            Add(f, "Active Setup", Last(sk), v[1], sk, Defaults.ActiveSetupClean(Last(sk), v[1]) ? "" : Risk(v[1]) == "SUSPECT" ? "SUSPECT" : "REVIEW", 0, sk, v[0], null);
             }
             // Winlogon Notify DllName (legacy hook)
             string notify = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Notify";
@@ -3637,20 +3664,76 @@ namespace RescueScan
                     Add(f, "BHO", Last(sk), "(CLSID)", sk, "REVIEW", 1, sk, null, null);
         }
 
+        // ---- MODULE: services, drivers, svchost ServiceDll ----  Every ImagePath / ServiceDll whose risk is not clean is
+        // listed (REVIEW ones too: a coin-miner in ProgramData, a driver outside System32); a script host, cmd or a
+        // script as the service program is SUSPECT (the batch-malware "sc create ... binPath= cmd /c" pattern).
+        internal static void ScanServices(List<Finding> f, string CCS, List<string> cut)
+        {
+            bool cutWalk;
+            foreach (string[] pr in Reg.Pairs(CCS + "\\Services", "ImagePath", out cutWalk))
+            {
+                string r = ServiceRisk(pr[1]);
+                if (r == "") continue;
+                Add(f, "Service/Driver", ServiceName(pr[0]), pr[1], pr[0], r, 1, pr[0], null, null);
+            }
+            if (cutWalk && cut != null) cut.Add("Services");
+            // svchost-hosted ServiceDll (classic hiding spot inside a shared svchost group): only the value is deleted
+            foreach (string[] pr in Reg.Pairs(CCS + "\\Services", "ServiceDll", out cutWalk))
+            {
+                string r = Risk(pr[1]);
+                if (r == "") continue;
+                Add(f, "svchost ServiceDll", ServiceName(pr[0]), pr[1], pr[0], r, 0, pr[0], "ServiceDll", null);
+            }
+            if (cutWalk && cut != null) cut.Add("ServiceDll");
+        }
+
+        static string ServiceName(string p)
+        {
+            string nm = p;
+            int i = p.IndexOf("\\Services\\", StringComparison.OrdinalIgnoreCase);
+            if (i >= 0) { nm = p.Substring(i + 10); int j = nm.IndexOf('\\'); if (j > 0) nm = nm.Substring(0, j); }
+            return nm;
+        }
+
+        // Risk of a service ImagePath: Risk() plus interpreters / scripts as the program and images in the Windows
+        // root (no Windows service lives there). Microsoft Defender's platform binaries and its MpKsl driver in
+        // ProgramData are not REVIEW (they live there on every updated Windows 10/11).
+        internal static string ServiceRisk(string img)
+        {
+            if (string.IsNullOrEmpty(img) || img.Trim().Length == 0) return "";
+            string r = Risk(img);
+            string p = Heur.NormPath(img).Trim();
+            string image = Defaults.ImageName(img);
+            if (image.EndsWith(".exe")) image = image.Substring(0, image.Length - 4);
+            List<string> t = Heur.Tokens(p);
+            string first = t.Count > 0 ? t[0] : "";
+            int sys = p.IndexOf(".sys", StringComparison.Ordinal), exe = p.IndexOf(".exe", StringComparison.Ordinal);
+            int cut = sys >= 0 && (exe < 0 || sys < exe) ? sys : exe;   // unquoted path with spaces: up to the extension
+            if (cut > 0 && p.IndexOf('"') < 0)
+            {
+                first = p.Substring(0, cut + 4).Trim();
+                image = first.Substring(first.LastIndexOf('\\') + 1);
+                if (image.EndsWith(".exe")) image = image.Substring(0, image.Length - 4);
+            }
+            foreach (string b in new string[] { "cmd", "%comspec%", "powershell", "pwsh", "wscript", "cscript", "mshta", "conhost" })
+                if (image == b) return "SUSPECT";
+            foreach (string e in new string[] { ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta", ".ps1" })
+                if (image.EndsWith(e)) return "SUSPECT";
+            if (first.Length >= 2 && first[1] == ':') first = first.Substring(2);
+            if (first.StartsWith("\\windows\\") && first.IndexOf('\\', 9) < 0) return "SUSPECT";   // C:\Windows\<x>.exe
+            if (image == "rundll32") r = Heur.Max(r, "REVIEW");
+            if (r == "REVIEW" && first.IndexOf("..") < 0)
+            {
+                if (first.StartsWith("\\programdata\\microsoft\\windows defender\\platform\\")
+                    && (image == "msmpeng" || image == "nissrv" || image == "mpdefendercoreservice")) return "";
+                if (first.StartsWith("\\programdata\\microsoft\\windows defender\\definition updates\\") && image.StartsWith("mpksl") && image.EndsWith(".sys")) return "";
+            }
+            return r;
+        }
+
         // ---- MODULE: extra SYSTEM-hive persistence (services & co.) ----
         void ScanExtraSystem(List<Finding> f, string CCS, List<string> cut)
         {
-            // svchost-hosted ServiceDll (classic hiding spot inside a shared svchost group)
-            bool cutWalk;
-            foreach (string[] pr in Reg.Pairs(CCS + "\\Services", "ServiceDll", out cutWalk))
-                if (Risk(pr[1]) == "SUSPECT")
-                {
-                    string p = pr[0]; string nm = p;
-                    int i = p.IndexOf("\\Services\\");
-                    if (i >= 0) { nm = p.Substring(i + 10); int j = nm.IndexOf('\\'); if (j > 0) nm = nm.Substring(0, j); }
-                    Add(f, "svchost ServiceDll", nm, pr[1], pr[0], "SUSPECT", 0, pr[0], "ServiceDll", null);
-                }
-            if (cutWalk) cut.Add("ServiceDll");
             // LSA authentication/security/notification packages (DLLs loaded by lsass)
             string lsa = CCS + "\\Control\\Lsa";
             string[] lsaVals = { "Authentication Packages", "Security Packages", "Notification Packages" };
