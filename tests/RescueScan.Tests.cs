@@ -101,6 +101,7 @@ namespace RescueScan.Tests
                 Run("Watchdog: event names, command lines, back-off, relaunch cap", WatchdogArgsCases);
                 Run("Launch: exe direct, batch via cmd, everything else as text", LaunchModes);
                 Run("Export: CSV cells quoted, quotes doubled, formulas neutralised", CsvCells);
+                Run("Errors: Russian last-chance message", ErrorTextCases);
                 Run("Process tree: real Toolhelp snapshot sees this process [win]", ProcSnapshotWin);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
@@ -2508,6 +2509,16 @@ namespace RescueScan.Tests
                 True(MainForm.CsvCell(p + "SUM(1)").StartsWith("\"'" + p), "prefix " + Show(p) + " neutralised");
             Eq("\"a=b\"", MainForm.CsvCell("a=b"), "= inside is fine");
             Eq("\"line1\nline2\"", MainForm.CsvCell("line1\nline2"), "newline kept inside the quoted cell");
+        }
+        static void ErrorTextCases()
+        {
+            string t = Program.ErrorText(new InvalidOperationException("boom\r\nline2"), false, "");
+            True(t.StartsWith("Внутренняя ошибка") && t.Contains("InvalidOperationException: boom line2") && t.Contains(Watchdog.LogPath), "non-fatal: " + t);
+            True(!t.Contains("кусты"), "non-fatal says nothing about hives");
+            t = Program.ErrorText(new FileNotFoundException("System.Management"), true, "");
+            True(t.StartsWith("Критическая ошибка") && t.Contains("выгружены"), "fatal, hives unloaded: " + t);
+            t = Program.ErrorText(null, true, "RS_SOFT: занято");
+            True(t.Contains("неизвестная ошибка") && t.Contains("Не все кусты выгружены: RS_SOFT: занято"), "fatal, unload failed: " + t);
         }
     }
 }

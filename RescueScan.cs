@@ -2426,8 +2426,17 @@ namespace RescueScan
         CheckBox oScan, oWinlogon, oIFEO, oRestrict, oAssoc, oDefuse, oQuar, oWatch, oShell, oBoot;
         Label lblEasy;
 
+        internal static MainForm Current;   // for the last-chance exception handler (unload our hives)
+
+        // Fatal path only: unload the hives this instance mounted. Best effort, never throws.
+        internal string EmergencyUnload()
+        {
+            try { stopping = true; guarding = false; return mounts.UnloadAll(); } catch (Exception ex) { return ex.Message; }
+        }
+
         public MainForm()
         {
+            Current = this;
             OtherInstanceAlive();   // take the instance marker (UI thread) as early as possible
             Text = "RescueScan  -  scanner + task manager + explorer (WinRE)";
             Width = 1080; Height = 660; StartPosition = FormStartPosition.CenterScreen;
@@ -2650,7 +2659,12 @@ namespace RescueScan
                         "RescueScan", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             };
             this.Load += delegate { AdoptWatchdog(); StartupPick(); RestoreGuardAfterRelaunch(); };
-            this.Shown += delegate { RefreshProcs(); ShowDrives(); RepairRefresh(); QuarAutoFind(); AccRefresh(); };
+            // each start-up step on its own: one failing (unreadable manifest, WMI...) must not skip the others
+            this.Shown += delegate
+            {
+                foreach (Action step in new Action[] { RefreshProcs, ShowDrives, RepairRefresh, QuarAutoFind, AccRefresh })
+                    try { step(); } catch (Exception ex) { Watchdog.Log("старт: " + step.Method.Name + ": " + ex.Message); }
+            };
         }
 
         // ================= STARTUP DISK PICKER =================
@@ -3396,11 +3410,16 @@ namespace RescueScan
             string tag = (string)lvFiles.SelectedItems[0].Tag;
             if (!tag.StartsWith("F|") && !tag.StartsWith("D|")) return;
             string p = tag.Substring(2);
+            string parent = null;
+            try { parent = Path.GetDirectoryName(p.TrimEnd('\\')); } catch { }
+            if (string.IsNullOrEmpty(parent)) { MessageBox.Show("Диск нельзя переименовать здесь."); return; }
             string old = Path.GetFileName(p.TrimEnd('\\'));
             string nn = Prompt("Новое имя для «" + old + "»", old);
             if (nn == null) return; nn = nn.Trim();
             if (nn.Length == 0 || nn == old) return;
-            string dst = Path.Combine(Path.GetDirectoryName(p.TrimEnd('\\')), nn);
+            if (nn.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || nn.IndexOfAny(new char[] { '\\', '/', ':' }) >= 0 || nn == "." || nn == "..")
+            { MessageBox.Show("Недопустимое имя: только имя, без пути и символов \\ / : * ? \" < > |"); return; }
+            string dst = Path.Combine(parent, nn);
             try { if (tag.StartsWith("F|")) File.Move(p, dst); else Directory.Move(p, dst); }
             catch (Exception ex) { MessageBox.Show(ex.Message); }
             Nav(curPath);
@@ -5561,24 +5580,42 @@ namespace RescueScan
             string why;
             if (!AccAllowed(out why)) { UpdateAccState(); return; }
             foreach (Button b in accBtns) b.Enabled = true;
-            try
+            List<string[]> rows;
+            try { rows = WmiLocalUsers(); }   // a missing System.Management.dll fails HERE (when WmiLocalUsers is JIT-compiled)
+            catch (Exception ex)
             {
-                System.Management.ManagementObjectSearcher s = new System.Management.ManagementObjectSearcher(
-                    "SELECT Name,Disabled,Lockout,PasswordRequired,SID FROM Win32_UserAccount WHERE LocalAccount=True");
+                bool noAsm = ex is FileNotFoundException || ex is FileLoadException || ex is TypeLoadException || ex is BadImageFormatException;
+                lblAcc.Text = noAsm ? "WMI недоступен: в этой системе нет System.Management (.NET без WMI; в WinPE нужен WinPE-WMI)."
+                                    : "WMI недоступен (служба выключена?): " + ex.Message;
+                return;
+            }
+            foreach (string[] r in rows)
+            {
+                ListViewItem it = new ListViewItem(r);
+                if (r[1] == "да" || r[2] == "да") it.BackColor = Color.FromArgb(255, 245, 205);
+                lvAcc.Items.Add(it);
+            }
+            lblAcc.Text = "Локальных аккаунтов: " + lvAcc.Items.Count + " (живая ОС " + RunningWinDir() + ").";
+        }
+
+        // The ONLY method that touches System.Management types. NoInlining keeps them out of the callers' JIT: if the
+        // assembly cannot be loaded (trimmed .NET / WinPE without WinPE-WMI) the exception surfaces at the call site in
+        // AccRefresh's try instead of before it (where it became an unhandled-exception dialog at every start).
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        static List<string[]> WmiLocalUsers()
+        {
+            List<string[]> rows = new List<string[]>();
+            using (System.Management.ManagementObjectSearcher s = new System.Management.ManagementObjectSearcher(
+                "SELECT Name,Disabled,Lockout,PasswordRequired,SID FROM Win32_UserAccount WHERE LocalAccount=True"))
                 foreach (System.Management.ManagementObject u in s.Get())
                 {
                     string name = "" + u["Name"];
                     string dis = (u["Disabled"] != null && (bool)u["Disabled"]) ? "да" : "нет";
                     string lo = (u["Lockout"] != null && (bool)u["Lockout"]) ? "да" : "нет";
                     string pw = (u["PasswordRequired"] != null && (bool)u["PasswordRequired"]) ? "да" : "нет";
-                    string sid = "" + u["SID"];
-                    ListViewItem it = new ListViewItem(new string[] { name, dis, lo, pw, sid });
-                    if (dis == "да" || lo == "да") it.BackColor = Color.FromArgb(255, 245, 205);
-                    lvAcc.Items.Add(it);
+                    rows.Add(new string[] { name, dis, lo, pw, "" + u["SID"] });
                 }
-                lblAcc.Text = "Локальных аккаунтов: " + lvAcc.Items.Count + " (живая ОС " + RunningWinDir() + ").";
-            }
-            catch (Exception ex) { lblAcc.Text = "WMI недоступен (служба выключена?): " + ex.Message; }
+            return rows;
         }
 
         string AccName()
@@ -6092,6 +6129,27 @@ namespace RescueScan
 
     static class Program
     {
+        static int shown = 0;
+
+        // Message text for an unexpected exception (pure: unit-tested).
+        internal static string ErrorText(Exception ex, bool fatal, string unload)
+        {
+            string what = ex == null ? "неизвестная ошибка" : ex.GetType().Name + ": " + Reg.OneLine(ex.Message, 300);
+            return (fatal ? "Критическая ошибка — RescueScan будет закрыт.\r\n" : "Внутренняя ошибка RescueScan (работа продолжается).\r\n") +
+                what + "\r\n" +
+                (fatal ? (unload.Length > 0 ? "Не все кусты выгружены: " + unload + " (reg unload вручную или перезагрузка).\r\n" : "Смонтированные кусты реестра выгружены.\r\n") : "") +
+                "Подробности в логе: " + Watchdog.LogPath;
+        }
+
+        static void OnError(Exception ex, bool fatal)
+        {
+            try { Watchdog.Log((fatal ? "FATAL: " : "ошибка: ") + (ex == null ? "?" : ex.ToString())); } catch { }
+            string unload = "";
+            if (fatal && MainForm.Current != null) unload = MainForm.Current.EmergencyUnload();
+            if (Interlocked.Increment(ref shown) > 3 && !fatal) return;   // a handler failing in a loop: log only
+            try { MessageBox.Show(ErrorText(ex, fatal, unload), "RescueScan", MessageBoxButtons.OK, fatal ? MessageBoxIcon.Error : MessageBoxIcon.Warning); } catch { }
+        }
+
         [STAThread]
         static void Main(string[] args)
         {
@@ -6099,9 +6157,15 @@ namespace RescueScan
             int wdPid; string evt; bool guard;
             if (Watchdog.ParseRelaunched(args, out wdPid, out evt, out guard))
             { MainForm.RelaunchWatchdogPid = wdPid; MainForm.RelaunchEvent = evt; MainForm.RelaunchGuard = guard; }
+            // Last-chance handlers: a Russian message + log instead of the English .NET dialog; on a fatal error the
+            // mounted RS_* hives are unloaded first (they would otherwise stay loaded until reboot).
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object s, ThreadExceptionEventArgs e) { OnError(e.Exception, false); };
+            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e) { OnError(e.ExceptionObject as Exception, true); };
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new MainForm());
+            try { Application.Run(new MainForm()); }
+            catch (Exception ex) { OnError(ex, true); }
         }
     }
 }
