@@ -1873,6 +1873,62 @@ namespace RescueScan
             string s = NormPath(((cmd ?? "") + " " + (args ?? "")).Replace("\"", ""));
             return Regex.Replace(s, @"\s+", " ").Trim();
         }
+
+        // ---- hosts ----
+        // Active lines of a hosts file as {address, name}: comments (#...) removed, one entry per name; the loopback
+        // localhost lines are not returned.
+        internal static List<string[]> HostsEntries(string text)
+        {
+            List<string[]> res = new List<string[]>();
+            if (text == null) return res;
+            foreach (string raw in text.Replace("\r", "\n").Split('\n'))
+            {
+                string line = raw;
+                int h = line.IndexOf('#'); if (h >= 0) line = line.Substring(0, h);
+                string[] p = line.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                if (p.Length < 2) continue;
+                for (int i = 1; i < p.Length; i++)
+                {
+                    string n = p[i].ToLowerInvariant();
+                    if ((n == "localhost" || n == "localhost.localdomain") && Loopback(p[0])) continue;
+                    res.Add(new string[] { p[0], p[i] });
+                }
+            }
+            return res;
+        }
+
+        static bool Loopback(string ip)
+        {
+            string a = ip.Trim().ToLowerInvariant();
+            return a.StartsWith("127.") || a == "::1" || a == "0.0.0.0" || a == "::" || a == "0:0:0:0:0:0:0:1";
+        }
+
+        static readonly string[] Security = { "microsoft", "windowsupdate", "windows.com", "msftncsi", "live.com", "bing.com", "kaspersky", "drweb",
+            "eset", "avast", "avg.com", "avira", "bitdefender", "malwarebytes", "norton", "symantec", "mcafee", "sophos", "virustotal",
+            "trendmicro", "f-secure", "comodo", "360totalsecurity", "zillya", "adaware", "emsisoft", "hitmanpro", "safezone", "virusinfo",
+            "cureit", "anti-malware", "antivirus", "kaspersky-labs", "esetnod32", "nod32" };
+        static readonly string[] Popular = { "google.", "yandex.", "vk.com", "ok.ru", "mail.ru", "facebook.", "instagram.", "sberbank", "paypal.",
+            "tinkoff.", "steamcommunity.", "steampowered.", "youtube.", "twitter.", "x.com", "telegram.", "whatsapp.", "gosuslugi.", "rambler." };
+
+        // 'part' starts a DNS label of 'name' ("www.eset.com", "eset.ru"; not "preset.io")
+        static bool AtLabel(string name, string part)
+        {
+            int i = 0;
+            while ((i = name.IndexOf(part, i, StringComparison.Ordinal)) >= 0)
+            {
+                if (i == 0 || name[i - 1] == '.' || name[i - 1] == '-') return true;
+                i++;
+            }
+            return false;
+        }
+
+        internal static string HostsRisk(string ip, string name)
+        {
+            string n = (name ?? "").ToLowerInvariant();
+            foreach (string s in Security) if (AtLabel(n, s)) return "SUSPECT";              // AV / Windows Update blocked or redirected
+            if (!Loopback(ip)) foreach (string s in Popular) if (n.StartsWith(s) || n.Contains("." + s)) return "SUSPECT";   // pharming
+            return "REVIEW";
+        }
     }
 
     // One line of a quarantine manifest (format 2). FILE: a moved file. REG: a registry value (V) or key (K) backed
@@ -3131,6 +3187,7 @@ namespace RescueScan
 
             // ---- extra SOFTWARE persistence (Active Setup, Notify, Policies, SilentProcessExit, class hijack) ----
             ScanExtraSoftware(f, SOFT);
+            ScanMachineExtras(f, SOFT);   // RunOnceEx, AeDebug, hidden users, Defender exclusions
 
             // ---- SYSTEM: control set, BootExecute, Services ----
             // the set the NEXT boot uses is Select\Default (Current only records the last boot): a mismatch is shown
@@ -3150,6 +3207,8 @@ namespace RescueScan
             }
             string sm = SYS + "\\" + ccs + "\\Control\\Session Manager";
             if (SYS.Length > 0) ScanBootExecute(f, sm);
+            ScanSetupKey(f, SYS);                                 // SYSTEM\Setup CmdLine (hive root, not the control set)
+            if (SYS.Length > 0) ScanDataBasePath(f, SYS + "\\" + ccs);
             // Safe Mode with Command Prompt runs AlternateShell instead of Explorer (default cmd.exe): reset, never delete
             string sb = SYS + "\\" + ccs + "\\Control\\SafeBoot";
             if (SYS.Length > 0)
@@ -3183,6 +3242,7 @@ namespace RescueScan
 
             // ---- Drivers folder (нестандартные файлы) ----
             ScanDrivers(f, winDir);
+            ScanHosts(f, FsPath(winDir + "\\System32\\drivers\\etc\\hosts"), tgtLive);
 
             // ---- Scheduled tasks: XML files + registry TaskCache (+ anti-checker/watchdog) ----
             ScanTasks(f, FsPath(winDir + "\\System32\\Tasks"), SOFT, tgtLive, cut);
@@ -3539,6 +3599,13 @@ namespace RescueScan
                 }
                 if (cutWalk && cut != null) cut.Add(wow ? "IFEO WOW64" : "IFEO");
             }
+            // Application Verifier DLLs (GlobalFlag 0x100): loaded early into the program; never set on a clean Windows.
+            // (category not "IFEO ...": «Обезвредить» of an IFEO row removes Debugger)
+            string vi = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+            bool cutV;
+            foreach (string[] pr in Reg.Pairs(vi, "VerifierDlls", out cutV))
+                if (pr[1].Trim().Length > 0)
+                    Add(f, "Verifier DLL (IFEO)", pr[0].Substring(vi.Length + 1), pr[1], pr[0], "SUSPECT", 0, pr[0], "VerifierDlls", null);
         }
 
         // One user hive (NTUSER.DAT mounted at U). Per-user shell / logon hooks that are absent on a clean profile
@@ -3564,6 +3631,7 @@ namespace RescueScan
             foreach (string[] v in Reg.Values(dk))
                 if (v[0].Equals("Wallpaper", StringComparison.OrdinalIgnoreCase) && v[1].Trim().Length > 0)
                     Add(f, "Обои [" + name + "]", v[0], v[1], dk, "REVIEW", 0, dk, v[0], null);
+            ScanRunOnceEx(f, U + "\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx", "RunOnceEx [" + name + "]");
             string uwl = U + "\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
             foreach (string[] v in Reg.Values(uwl))
                 if ((v[0].Equals("Shell", StringComparison.OrdinalIgnoreCase) || v[0].Equals("Userinit", StringComparison.OrdinalIgnoreCase)
@@ -3836,6 +3904,152 @@ namespace RescueScan
                 if (v[1].Trim().Length == 0) continue;
                 Add(f, "AppCertDlls", v[0].Length > 0 ? v[0] : "(по умолчанию)", v[1], ac, "SUSPECT", 0, ac, v[0], null);
             }
+        }
+
+        // ---- MODULE: machine locations that are absent / empty on a clean Windows (research coverage-gaps #5, #13,
+        // #16, #17; R051) ----
+        internal static void ScanMachineExtras(List<Finding> f, string SOFT)
+        {
+            if (string.IsNullOrEmpty(SOFT)) return;
+            foreach (string R in new string[] { SOFT, SOFT + "\\Wow6432Node" })
+            {
+                bool wow = R != SOFT;
+                // RunOnceEx: not created by default on Vista+; every <NNN> subkey runs (its Depend DLLs load)
+                ScanRunOnceEx(f, R + "\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx", wow ? "RunOnceEx (HKLM WOW64)" : "RunOnceEx (HKLM)");
+                // AeDebug: the crash debugger Windows starts by itself when Auto = 1 (default: no Debugger)
+                string ae = R + "\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug";
+                string dbg = null, auto = "";
+                foreach (string[] v in Reg.Values(ae))
+                    if (v[0].Equals("Debugger", StringComparison.OrdinalIgnoreCase)) dbg = v[1];
+                    else if (v[0].Equals("Auto", StringComparison.OrdinalIgnoreCase)) auto = v[1].Trim();
+                if (dbg != null && dbg.Trim().Length > 0)
+                    Add(f, wow ? "AeDebug (WOW64)" : "AeDebug", "Debugger", dbg + "   (Auto = " + (auto.Length > 0 ? auto : "нет") + ")", ae,
+                        AeDebugRisk(dbg, auto), 0, ae, "Debugger", null);
+            }
+            // hidden local accounts (DWORD 0 = not shown on the logon screen): REVIEW, deleting the value unhides
+            string ul = SOFT + "\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\SpecialAccounts\\UserList";
+            foreach (string[] v in Reg.Values(ul))
+                if (v[0].Length > 0 && v[2] == "REG_DWORD" && v[1] == "0x0" && !HiddenName(f, "Скрытый пользователь", ul, v[0]))
+                    Add(f, "Скрытый пользователь", v[0], "(не показывается на экране входа — учётку проверь во вкладке «Учётки»)", ul, "REVIEW", 0, ul, v[0], null);
+            // Microsoft Defender exclusions (value name = excluded item) and their policy copy
+            foreach (string ex in new string[] { SOFT + "\\Microsoft\\Windows Defender\\Exclusions", SOFT + "\\Policies\\Microsoft\\Windows Defender\\Exclusions" })
+                foreach (string kind in new string[] { "Paths", "Extensions", "Processes", "TemporaryPaths", "IpAddresses" })
+                {
+                    string k = ex + "\\" + kind;
+                    foreach (string[] v in Reg.Values(k))
+                    {
+                        if (v[0].Length == 0 || HiddenName(f, "Defender исключение", k, v[0])) continue;
+                        Add(f, "Defender исключение (" + kind + ")", v[0], "(Защитник не проверяет это)", k, DefenderExclusionRisk(kind, v[0]), 0, k, v[0], null);
+                    }
+                }
+        }
+
+        static void ScanRunOnceEx(List<Finding> f, string key, string cat)
+        {
+            foreach (string sk in Reg.Subkeys(key))
+            {
+                List<string> parts = new List<string>();
+                foreach (string[] v in Reg.Values(sk)) parts.Add((v[0].Length > 0 ? v[0] : "(по умолчанию)") + " = " + v[1]);
+                foreach (string dk in Reg.Subkeys(sk)) foreach (string[] v in Reg.Values(dk)) parts.Add(Last(dk) + "\\" + v[0] + " = " + v[1]);
+                Add(f, cat, Last(sk), string.Join("  |  ", parts.ToArray()), sk, "SUSPECT", 1, sk, null, null);
+            }
+        }
+
+        // AeDebug Debugger: known debuggers (Visual Studio, WinDbg, cdb/ntsd, ProcDump) or Auto != 1 (asks first) = REVIEW
+        internal static string AeDebugRisk(string dbg, string auto)
+        {
+            if (Risk(dbg) == "SUSPECT") return "SUSPECT";
+            string img = Defaults.ImageName(dbg);
+            string[] known = { "vsjitdebugger.exe", "windbg.exe", "windbgx.exe", "cdb.exe", "ntsd.exe", "procdump.exe", "procdump64.exe", "procdump64a.exe", "drwtsn32.exe" };
+            if (Array.IndexOf(known, img) >= 0) return "REVIEW";
+            string a = (auto ?? "").Trim().ToLowerInvariant();
+            return a == "1" || a == "0x1" ? "SUSPECT" : "REVIEW";
+        }
+
+        // An exclusion of a whole drive / Windows / the profiles / ProgramData, of a script or program extension, or
+        // of a path Risk() calls SUSPECT is SUSPECT (WhisperGate-style "C:\"); anything else REVIEW.
+        internal static string DefenderExclusionRisk(string kind, string item)
+        {
+            string x = Heur.NormPath(item).Trim().TrimEnd('\\');
+            if (x.Length == 0 || x == "*") return "SUSPECT";
+            if (kind == "Extensions")
+            {
+                string e = x.TrimStart('*').TrimStart('.');
+                string[] bad = { "exe", "dll", "scr", "bat", "cmd", "ps1", "vbs", "vbe", "js", "jse", "wsf", "hta", "com", "pif", "lnk", "msi", "sys", "cpl" };
+                return Array.IndexOf(bad, e) >= 0 ? "SUSPECT" : "REVIEW";
+            }
+            if (kind == "Paths" || kind == "TemporaryPaths")
+            {
+                string nod = x.Length >= 2 && x[1] == ':' ? x.Substring(2) : x;
+                string[] broad = { "", "\\windows", "\\windows\\system32", "\\windows\\syswow64", "\\users", "\\programdata", "\\program files", "\\program files (x86)", "\\windows\\temp", "\\temp" };
+                if (Array.IndexOf(broad, nod) >= 0 || nod.EndsWith("\\appdata") || nod.EndsWith("\\appdata\\roaming") || nod.EndsWith("\\appdata\\local")) return "SUSPECT";
+            }
+            return Risk(item) == "SUSPECT" ? "SUSPECT" : "REVIEW";
+        }
+
+        // SYSTEM\Setup (hive root): with SetupType != 0 winlogon runs CmdLine as SYSTEM before logon (the "utilman /
+        // password reset" trick). Windows' own setup / OOBE (windeploy, $WINDOWS.~BT) is REVIEW info; anything else
+        // SUSPECT with two resets (CmdLine = "", SetupType = 0), never a delete.
+        internal static void ScanSetupKey(List<Finding> f, string SYS)
+        {
+            if (string.IsNullOrEmpty(SYS)) return;
+            string st = SYS + "\\Setup";
+            string cmdline = null; int type = 0;
+            foreach (string[] v in Reg.Values(st))
+                if (v[0].Equals("CmdLine", StringComparison.OrdinalIgnoreCase)) cmdline = v[1];
+                else if (v[0].Equals("SetupType", StringComparison.OrdinalIgnoreCase) && v[2] == "REG_DWORD")
+                    try { type = Convert.ToInt32(v[1].Substring(2), 16); } catch { }
+            if (type == 0 || cmdline == null || cmdline.Trim().Length == 0) return;
+            string shown = cmdline + "   (SetupType = " + type + ")";
+            string l = Heur.NormPath(cmdline);
+            if (l.Contains("\\oobe\\windeploy") || l.StartsWith("oobe\\windeploy") || l.Contains("$windows.~bt") || l.Contains("$windows.~ws") || l.Contains("\\sysprep\\"))
+            {
+                Add(f, "Setup CmdLine", "CmdLine", shown + "   (идёт установка/обновление Windows — не трогать)", st, "REVIEW", 3, null, null, null);
+                return;
+            }
+            AddReset(f, "Setup CmdLine", st, "CmdLine", shown, "SUSPECT", "", RegistryValueKind.String);
+            AddReset(f, "Setup SetupType", st, "SetupType", shown, "SUSPECT", 0, RegistryValueKind.DWord);
+        }
+
+        // Tcpip DataBasePath: where Windows reads the hosts file; must stay %SystemRoot%\System32\drivers\etc (reset).
+        internal const string HostsDbPath = "%SystemRoot%\\System32\\drivers\\etc";
+        internal static void ScanDataBasePath(List<Finding> f, string CCS)
+        {
+            if (string.IsNullOrEmpty(CCS)) return;
+            string k = CCS + "\\Services\\Tcpip\\Parameters";
+            foreach (string[] v in Reg.Values(k))
+                if (v[0].Equals("DataBasePath", StringComparison.OrdinalIgnoreCase))
+                {
+                    string d = Heur.NormPath(v[1]).Trim().TrimEnd('\\');
+                    if (d.Length >= 2 && d[1] == ':') d = d.Substring(2);
+                    bool ok = d == "\\windows\\system32\\drivers\\etc";
+                    if (!ok) AddReset(f, "Tcpip DataBasePath (hosts)", k, v[0], v[1], "SUSPECT", HostsDbPath, RegistryValueKind.ExpandString);
+                }
+        }
+
+        // hosts file: every active (non-comment) line other than localhost is listed as info (fixed by hand: users and
+        // ad blockers keep their own lines); security / update sites blocked, or popular sites sent to a public IP,
+        // are SUSPECT.
+        internal static void ScanHosts(List<Finding> f, string file, bool live)
+        {
+            string text;
+            try
+            {
+                if (!File.Exists(file)) return;
+                if (new FileInfo(file).Length > 8 * 1024 * 1024) { Add(f, "hosts", "(файл)", "(больше 8 МБ — проверь вручную)", file, "REVIEW", 3, null, null, null); return; }
+                text = File.ReadAllText(file, Encoding.Default);
+            }
+            catch (Exception ex) { Add(f, "hosts", "(не читается)", Reg.OneLine(ex.Message, 160), file, live ? "REVIEW" : "SUSPECT", 3, null, null, null); return; }
+            List<string[]> act = Heur.HostsEntries(text);
+            int shown = 0, rest = 0;
+            foreach (string[] e in act)
+            {
+                string r = Heur.HostsRisk(e[0], e[1]);
+                if (r == "REVIEW" && shown >= 30) { rest++; continue; }
+                Add(f, "hosts", e[1], e[0] + " " + e[1], file, r, 3, null, null, null);
+                shown++;
+            }
+            if (rest > 0) Add(f, "hosts", "…", "(и ещё строк: " + rest + " — похоже на блок-лист рекламы; проверь вручную)", file, "REVIEW", 3, null, null, null);
         }
 
         // ---- MODULE: drivers folder (non-.sys files are highly unusual) ----

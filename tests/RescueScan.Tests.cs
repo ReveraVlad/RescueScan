@@ -92,6 +92,8 @@ namespace RescueScan.Tests
                 Run("Session Manager extras + AppCertDlls key; Policies Run once", SessionMgrExtraCases);
                 Run("Services/ServiceDll listing + Active Setup built-ins", ServiceAndActiveSetupCases);
                 Run("User hive: per-user shell, cmd AutoRun, logon script, screensaver", UserHiveCases);
+                Run("RunOnceEx/AeDebug/UserList/Defender exclusions/Setup/DataBasePath/VerifierDlls", MachineExtrasCases);
+                Run("hosts: default clean, AV blocks / pharming SUSPECT, lists capped", HostsCases);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
                 Run("Pairs/DeleteKey: registry symbolic links are not followed [win]", LinksWin);
@@ -2183,6 +2185,106 @@ namespace RescueScan.Tests
             Eq("SUSPECT", MainForm.ScreensaverRisk("C:\\Users\\V\\AppData\\Roaming\\x.scr"), "profile .scr");
             Eq("", MainForm.ScreensaverRisk("scrnsave.scr"), "bare name");
             Eq(4 + 2, f.Count, "no other rows (TEMP, DisableTaskMgr not listed here)");
+        }
+
+        // B7 additions: clean defaults give no SUSPECT; planted entries are found with the documented risk / kind
+        static void MachineExtrasCases()
+        {
+            // clean: AeDebug with Auto=1 + AutoExclusionList and no Debugger, empty exclusion keys, empty RunOnceEx
+            using (RegistryKey k = Make("mx\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug")) { k.SetValue("Auto", "1"); k.SetValue("UserDebuggerHotKey", 0); }
+            using (RegistryKey k = Make("mx\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug\\AutoExclusionList")) k.SetValue("DWM.exe", 1);
+            using (RegistryKey k = Make("mx\\Microsoft\\Windows Defender\\Exclusions\\Paths")) { }
+            using (RegistryKey k = Make("mx\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx")) k.SetValue("Flags", 0);
+            List<Finding> f = new List<Finding>();
+            MainForm.ScanMachineExtras(f, Root + "\\mx");
+            Eq(0, f.Count, "clean defaults: no rows");
+            using (RegistryKey k = Make("mx\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug")) k.SetValue("Debugger", "C:\\ProgramData\\x\\dbg.exe -p %ld");
+            using (RegistryKey k = Make("mx\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug")) { k.SetValue("Debugger", "\"C:\\WINDOWS\\system32\\vsjitdebugger.exe\" -p %ld -e %ld"); k.SetValue("Auto", "1"); }
+            using (RegistryKey k = Make("mx\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx\\0001")) k.SetValue("1", "C:\\x.exe");
+            using (RegistryKey k = Make("mx\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx\\0001\\Depend")) k.SetValue("1", "C:\\x.dll");
+            using (RegistryKey k = Make("mx\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\SpecialAccounts\\UserList")) { k.SetValue("hacker", 0); k.SetValue("shown", 1); }
+            using (RegistryKey k = Make("mx\\Microsoft\\Windows Defender\\Exclusions\\Paths")) { k.SetValue("C:\\", 0); k.SetValue("D:\\Projects\\build", 0); }
+            using (RegistryKey k = Make("mx\\Policies\\Microsoft\\Windows Defender\\Exclusions\\Extensions")) k.SetValue("exe", 0);
+            f.Clear();
+            MainForm.ScanMachineExtras(f, Root + "\\mx");
+            Finding ae = null, aew = null, roe = null, hid = null;
+            foreach (Finding x in f)
+            {
+                if (x.Category == "AeDebug") ae = x;
+                if (x.Category == "AeDebug (WOW64)") aew = x;
+                if (x.Category.StartsWith("RunOnceEx")) roe = x;
+                if (x.Name == "hacker") hid = x;
+            }
+            Eq("SUSPECT", ae.Risk, "unknown AeDebug debugger with Auto=1");
+            Eq("Debugger", ae.DelName, "only the Debugger value is removed");
+            Eq("REVIEW", aew.Risk, "Visual Studio JIT debugger");
+            Eq("SUSPECT", roe.Risk, "RunOnceEx entry"); Eq(1, roe.Kind, "RunOnceEx subkey deleted");
+            True(roe.Value.Contains("x.dll"), "Depend DLL shown");
+            Eq("REVIEW", hid.Risk, "hidden user REVIEW"); True(FindName(f, "shown") == null, "visible user not listed");
+            Eq("SUSPECT", FindName(f, "C:\\").Risk, "drive-root exclusion");
+            Eq("REVIEW", FindName(f, "D:\\Projects\\build").Risk, "project folder exclusion");
+            Eq("SUSPECT", FindName(f, "exe").Risk, ".exe excluded by policy");
+            Eq("REVIEW", MainForm.AeDebugRisk("C:\\x\\dbg.exe", "0"), "Auto=0 asks first");
+            Eq("SUSPECT", MainForm.DefenderExclusionRisk("Paths", "%TEMP%"), "temp excluded");
+            Eq("SUSPECT", MainForm.DefenderExclusionRisk("Paths", "C:\\Users\\V\\AppData\\Roaming"), "AppData excluded");
+            // SYSTEM\Setup
+            using (RegistryKey k = Make("sys1\\Setup")) { k.SetValue("CmdLine", ""); k.SetValue("SetupType", 0); k.SetValue("SystemSetupInProgress", 0); }
+            f.Clear(); MainForm.ScanSetupKey(f, Root + "\\sys1"); Eq(0, f.Count, "clean Setup");
+            using (RegistryKey k = Make("sys1\\Setup")) { k.SetValue("CmdLine", "oobe\\windeploy.exe"); k.SetValue("SetupType", 2); }
+            f.Clear(); MainForm.ScanSetupKey(f, Root + "\\sys1"); Eq(1, f.Count, "OOBE in progress: one info row"); Eq("REVIEW", f[0].Risk, "REVIEW"); Eq(3, f[0].Kind, "not touched");
+            using (RegistryKey k = Make("sys1\\Setup")) { k.SetValue("CmdLine", "cmd.exe"); k.SetValue("SetupType", 2); }
+            f.Clear(); MainForm.ScanSetupKey(f, Root + "\\sys1");
+            Eq(2, f.Count, "CmdLine + SetupType resets");
+            Eq(4, f[0].Kind, "reset"); Eq("", (string)f[0].ResetData, "CmdLine -> empty");
+            Eq(0, (int)f[1].ResetData, "SetupType -> 0"); Eq(RegistryValueKind.DWord, f[1].ResetType, "DWORD");
+            // DataBasePath
+            using (RegistryKey k = Make("ccs1\\Services\\Tcpip\\Parameters")) k.SetValue("DataBasePath", "%SystemRoot%\\System32\\drivers\\etc", RegistryValueKind.ExpandString);
+            f.Clear(); MainForm.ScanDataBasePath(f, Root + "\\ccs1"); Eq(0, f.Count, "default DataBasePath");
+            using (RegistryKey k = Make("ccs1\\Services\\Tcpip\\Parameters")) k.SetValue("DataBasePath", "C:\\ProgramData\\etc", RegistryValueKind.ExpandString);
+            f.Clear(); MainForm.ScanDataBasePath(f, Root + "\\ccs1");
+            Eq(1, f.Count, "moved DataBasePath"); Eq(4, f[0].Kind, "reset, never deleted"); Eq(RegistryValueKind.ExpandString, f[0].ResetType, "REG_EXPAND_SZ");
+            // IFEO VerifierDlls
+            using (RegistryKey k = Make("vf\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\lsass.exe")) { k.SetValue("VerifierDlls", "evil.dll"); k.SetValue("GlobalFlag", 0x100); }
+            f.Clear(); MainForm.ScanIfeo(f, Root + "\\vf", new List<string>());
+            Eq(1, f.Count, "VerifierDlls row"); Eq("VerifierDlls", f[0].DelName, "deletes VerifierDlls only");
+            True(!f[0].Category.StartsWith("IFEO"), "not an IFEO-Debugger category (Defuse would remove Debugger)");
+        }
+
+        // hosts: Microsoft's default file (comments only) and localhost lines are clean; AV / update blocks and
+        // pharming are SUSPECT; other lines REVIEW
+        static void HostsCases()
+        {
+            string def = "# Copyright (c) 1993-2009 Microsoft Corp.\r\n#\r\n# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.\r\n#\r\n" +
+                "#      102.54.94.97     rhino.acme.com          # source server\r\n#       38.25.63.10     x.acme.com              # x client host\r\n\r\n" +
+                "# localhost name resolution is handled within DNS itself.\r\n#\t127.0.0.1       localhost\r\n#\t::1             localhost\r\n";
+            Eq(0, Heur.HostsEntries(def).Count, "Microsoft default hosts");
+            Eq(0, Heur.HostsEntries("127.0.0.1 localhost\n::1 localhost # x\n").Count, "explicit localhost lines");
+            List<string[]> e = Heur.HostsEntries("127.0.0.1 localhost kaspersky.com www.drweb.ru\n0.0.0.0 ads.example.net\n93.184.216.34 www.google.com\n10.0.0.5 nas.local\n");
+            Eq(5, e.Count, "one entry per name, localhost dropped");
+            Eq("SUSPECT", Heur.HostsRisk(e[0][0], e[0][1]), "AV site blocked");
+            Eq("SUSPECT", Heur.HostsRisk(e[1][0], e[1][1]), "AV site blocked (2)");
+            Eq("REVIEW", Heur.HostsRisk(e[2][0], e[2][1]), "ad block line");
+            Eq("SUSPECT", Heur.HostsRisk(e[3][0], e[3][1]), "pharming");
+            Eq("REVIEW", Heur.HostsRisk(e[4][0], e[4][1]), "LAN name");
+            Eq("REVIEW", Heur.HostsRisk("127.0.0.1", "www.google.com"), "a popular site blocked to loopback is only REVIEW");
+            Eq("REVIEW", Heur.HostsRisk("0.0.0.0", "preset.example.io"), "'eset' inside a word is not ESET");
+            string dir = Path.Combine(Path.GetTempPath(), "rs hosts " + Id);
+            Directory.CreateDirectory(dir);
+            try
+            {
+                string h = Path.Combine(dir, "hosts");
+                StringBuilder sb = new StringBuilder(def);
+                for (int i = 0; i < 40; i++) sb.Append("0.0.0.0 ad" + i + ".example.net\n");
+                sb.Append("127.0.0.1 update.microsoft.com\n");
+                File.WriteAllText(h, sb.ToString());
+                List<Finding> f = new List<Finding>();
+                MainForm.ScanHosts(f, h, false);
+                Eq(32, f.Count, "30 REVIEW + 1 SUSPECT + summary");
+                int sus = 0; foreach (Finding x in f) { Eq(3, x.Kind, "hosts rows are info"); if (x.Risk == "SUSPECT") sus++; }
+                Eq(1, sus, "Windows Update block");
+                f.Clear(); File.WriteAllText(h, def); MainForm.ScanHosts(f, h, false); Eq(0, f.Count, "default file: nothing");
+            }
+            finally { try { Directory.Delete(dir, true); } catch { } }
         }
     }
 }
