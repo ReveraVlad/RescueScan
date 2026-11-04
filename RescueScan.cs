@@ -868,7 +868,7 @@ namespace RescueScan
         [DllImport("ntdll.dll")]
         static extern int NtDeleteKey(SafeRegistryHandle key);
 
-        static bool IsWindows { get { return Environment.OSVersion.Platform == PlatformID.Win32NT; } }
+        internal static bool IsWindows { get { return Environment.OSVersion.Platform == PlatformID.Win32NT; } }
         static bool UseNative { get { return !nativeBroken && IsWindows; } }
 
         // Opens child 'name' of 'parent' WITHOUT following it when it is a symbolic link (REG_OPTION_OPEN_LINK).
@@ -2502,7 +2502,7 @@ namespace RescueScan
             bpk.Click += delegate { KillProc(false); };
             bpt.Click += delegate { KillProc(true); };
             chkTop.CheckedChanged += delegate { this.TopMost = chkTop.Checked; };
-            chkWatch.CheckedChanged += delegate { if (chkWatch.Checked) StartWatchdog(); else StopWatchdog(); };
+            chkWatch.CheckedChanged += delegate { if (adopting) return; if (chkWatch.Checked) StartWatchdog(); else StopWatchdog(); };
 
             // ---- TAB 3: explorer (shows hidden + system by default, red = suspicious) ----
             Panel ebar = new Panel(); ebar.Dock = DockStyle.Top; ebar.Height = 36;
@@ -2649,7 +2649,7 @@ namespace RescueScan
                     MessageBox.Show("Не все кусты реестра выгружены: " + uf + "\r\nОни останутся смонтированными до перезагрузки (или выгрузи вручную: reg unload).",
                         "RescueScan", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             };
-            this.Load += delegate { StartupPick(); };
+            this.Load += delegate { AdoptWatchdog(); StartupPick(); RestoreGuardAfterRelaunch(); };
             this.Shown += delegate { RefreshProcs(); ShowDrives(); RepairRefresh(); QuarAutoFind(); AccRefresh(); };
         }
 
@@ -2732,54 +2732,121 @@ namespace RescueScan
         }
 
         // ================= WATCHDOG control (user-mode) =================
+        // Set by Program.Main for "--relaunched <watchdog pid> <event> <guard>": this GUI was restarted by its watchdog.
+        internal static int RelaunchWatchdogPid; internal static string RelaunchEvent; internal static bool RelaunchGuard;
+        string stopEvtName = "";
+        EventWaitHandle guardEvt;    // "<stop event>_guard": set while the Winlogon guard is on (restored after a relaunch)
+        bool adopting = false;       // chkWatch is being ticked by AdoptWatchdog: do not arm a second watchdog
+
         void StartWatchdog()
         {
+            if (adopting) return;
             if (watchdogProc != null && !SafeExited(watchdogProc)) return;
             stopping = false;
-            try
+            string name = Watchdog.NewEventName();
+            EventWaitHandle ev = Watchdog.CreateEvent(name);
+            if (ev == null)
             {
-                stopEvt = new EventWaitHandle(false, EventResetMode.ManualReset, Watchdog.StopEvtName);
-                stopEvt.Reset();
+                Watchdog.Log("GUI: стоп-событие не создано — watchdog не запущен");
+                lblProc.Text = "Watchdog не запущен: не удалось создать стоп-событие.";
+                chkWatch.Checked = false;
+                return;
             }
-            catch { }
+            stopEvt = ev; stopEvtName = name;
+            guardEvt = Watchdog.CreateEvent(name + "_guard");
+            SyncGuardFlag();
             SpawnWatchdog();
             Thread mt = new Thread(WatchdogMonitor); mt.IsBackground = true; mt.Start();
             lblProc.Text = "Watchdog вооружён. Лог: " + Watchdog.LogPath;
+        }
+
+        // A GUI relaunched by the watchdog takes it over: same stop event, monitor thread, guard state. Without this the
+        // normal close of the relaunched GUI looked like a kill and the watchdog relaunched it again, forever.
+        void AdoptWatchdog()
+        {
+            if (RelaunchEvent == null) return;
+            EventWaitHandle ev = Watchdog.OpenEvent(RelaunchEvent);
+            Process wd = null;
+            try
+            {
+                wd = Process.GetProcessById(RelaunchWatchdogPid);
+                string me = Process.GetCurrentProcess().ProcessName;
+                if (!string.Equals(wd.ProcessName, me, StringComparison.OrdinalIgnoreCase)) wd = null;   // not our watchdog
+            }
+            catch { wd = null; }
+            if (ev == null || wd == null)
+            {
+                Watchdog.Log("GUI: перезапущен watchdog'ом, но его нет (pid " + RelaunchWatchdogPid + ") — работаю без него");
+                if (ev != null) try { ev.Set(); ev.Close(); } catch { }   // tell a watchdog we could not identify to stop
+                return;
+            }
+            stopEvt = ev; stopEvtName = RelaunchEvent; watchdogProc = wd; stopping = false;
+            guardEvt = Watchdog.OpenEvent(RelaunchEvent + "_guard");
+            adopting = true;
+            try { chkWatch.Checked = true; } finally { adopting = false; }
+            Thread mt = new Thread(WatchdogMonitor); mt.IsBackground = true; mt.Start();
+            Watchdog.Log("GUI: перезапущен watchdog'ом (pid " + wd.Id + "), watchdog снова под контролем");
+            lblProc.Text = "Перезапущено watchdog'ом после закрытия/убийства. Watchdog вооружён. Лог: " + Watchdog.LogPath;
+        }
+
+        // After the startup picker: restore «Стеречь Winlogon» if it was on when the previous GUI died (live target only).
+        void RestoreGuardAfterRelaunch()
+        {
+            if (RelaunchEvent == null || !RelaunchGuard) return;
+            WinTarget t = cboWin.SelectedItem as WinTarget;
+            if (t != null && t.Live) chkGuard.Checked = true;
+            else Watchdog.Log("GUI: страж Winlogon не восстановлен — выбрана не живая ОС");
+        }
+
+        void SyncGuardFlag()
+        {
+            try { if (guardEvt != null) { if (guarding) guardEvt.Set(); else guardEvt.Reset(); } } catch { }
         }
 
         void SpawnWatchdog()
         {
             try
             {
-                string args = "--watchdog " + Process.GetCurrentProcess().Id + " \"" + Application.ExecutablePath + "\"";
-                ProcessStartInfo psi = new ProcessStartInfo(Application.ExecutablePath, args);
+                string exe = Application.ExecutablePath;
+                ProcessStartInfo psi = new ProcessStartInfo(exe, Watchdog.WatchdogArgs(Process.GetCurrentProcess().Id, stopEvtName, exe));
                 psi.UseShellExecute = false; psi.CreateNoWindow = true; psi.WindowStyle = ProcessWindowStyle.Hidden;
+                try { psi.WorkingDirectory = Path.GetDirectoryName(exe); } catch { }
                 watchdogProc = Process.Start(psi);
                 Watchdog.Log("GUI: watchdog запущен (pid " + (watchdogProc != null ? watchdogProc.Id : 0) + ")");
             }
             catch (Exception ex) { Watchdog.Log("GUI: не смог запустить watchdog: " + ex.Message); }
         }
 
-        // GUI is watchdog for its watchdog: respawn it if the virus kills it.
+        // GUI is watchdog for its watchdog: respawn it if the virus kills it (bounded: no endless 1-second loop when the
+        // exe can no longer be started).
         void WatchdogMonitor()
         {
+            List<DateTime> spawns = new List<DateTime>();
+            int fails = 0;
             while (!stopping)
             {
-                try { if (watchdogProc != null) watchdogProc.WaitForExit(); else Thread.Sleep(500); }
+                try { if (watchdogProc != null) { while (!watchdogProc.WaitForExit(300)) if (stopping) return; } else Thread.Sleep(500); }
                 catch { Thread.Sleep(500); }
                 if (stopping) return;
                 Watchdog.Log("GUI: watchdog УМЕР без команды -> вирус мог убить его. Перезапуск watchdog.");
+                if (Watchdog.TooManyRelaunches(spawns, DateTime.Now)) { Watchdog.Log("GUI: watchdog убивают снова и снова — больше не перезапускаю."); return; }
+                Process before = watchdogProc;
                 SpawnWatchdog();
-                Thread.Sleep(400);
+                if (watchdogProc == null || watchdogProc == before) { watchdogProc = null; fails++; if (fails >= 8) return; Thread.Sleep(Watchdog.BackoffMs(fails)); }
+                else { fails = 0; spawns.Add(DateTime.Now); }
             }
         }
 
         void StopWatchdog()
         {
+            bool had = stopEvt != null || (watchdogProc != null && !SafeExited(watchdogProc));
             stopping = true;
             try { if (stopEvt != null) stopEvt.Set(); } catch { }
             try { if (watchdogProc != null && !SafeExited(watchdogProc)) watchdogProc.Kill(); } catch { }
-            Watchdog.Log("GUI: watchdog остановлен по команде.");
+            stopEvt = null; watchdogProc = null;
+            try { if (guardEvt != null) guardEvt.Close(); } catch { }
+            guardEvt = null;
+            if (had) Watchdog.Log("GUI: watchdog остановлен по команде.");
         }
 
         static bool SafeExited(Process p) { try { return p.HasExited; } catch { return true; } }
@@ -3011,7 +3078,9 @@ namespace RescueScan
                 string risk = Heur.Risk(path, false);
                 if (risk == "" && ProcNameRisk(name)) risk = "REVIEW";
                 ListViewItem it = new ListViewItem(new string[] { p.Id.ToString(), name, path, mem, risk });
-                it.Tag = p.Id;
+                ProcRow row = new ProcRow(); row.Pid = p.Id; row.Name = name; row.Path = path;
+                try { row.Start = p.StartTime; } catch { }
+                it.Tag = row;
                 if (risk == "SUSPECT") { it.BackColor = Color.FromArgb(255, 205, 205); sus++; }
                 else if (risk == "REVIEW") it.BackColor = Color.FromArgb(255, 245, 205);
                 lvProc.Items.Add(it);
@@ -3027,28 +3096,149 @@ namespace RescueScan
             return false;
         }
 
+        // A row of the task list: the PID AND its start time, so a PID reused since the last refresh is never killed.
+        class ProcRow { public int Pid; public DateTime? Start; public string Name = "", Path = ""; }
+
+        static DateTime? ProcStart(int pid)
+        {
+            try { using (Process p = Process.GetProcessById(pid)) return p.StartTime; } catch { return null; }
+        }
+
+        static string ProcPath(int pid)
+        {
+            try { using (Process p = Process.GetProcessById(pid)) return p.MainModule.FileName; } catch { return ""; }
+        }
+
+        // Kill pid only if it is still the process we listed (same start time; same image name when the start time was
+        // unreadable). "" = killed, else the reason.
+        static string KillChecked(int pid, DateTime? start, string name)
+        {
+            try
+            {
+                using (Process p = Process.GetProcessById(pid))
+                {
+                    if (start.HasValue)
+                    {
+                        DateTime now;
+                        try { now = p.StartTime; } catch { now = start.Value; }   // cannot read: trust the name check below
+                        if (now != start.Value) return "PID " + pid + " уже другой процесс";
+                    }
+                    else if (!string.IsNullOrEmpty(name))
+                    {
+                        string want = name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name.Substring(0, name.Length - 4) : name;
+                        string have = ""; try { have = p.ProcessName; } catch { }
+                        if (!string.Equals(want, have, StringComparison.OrdinalIgnoreCase)) return "PID " + pid + " уже другой процесс";
+                    }
+                    p.Kill();
+                    return "";
+                }
+            }
+            catch (ArgumentException) { return "PID " + pid + " уже завершён"; }
+            catch (Exception ex) { return "PID " + pid + ": " + ex.Message; }
+        }
+
         void KillProc(bool tree)
         {
             if (lvProc.SelectedItems.Count == 0) { MessageBox.Show("Выбери процесс."); return; }
-            int ok = 0, fail = 0;
-            Dictionary<int, List<int>> map = tree ? Native.ChildMap() : null;
+            int self = Process.GetCurrentProcess().Id;
+            int wd = 0; try { if (watchdogProc != null && !SafeExited(watchdogProc)) wd = watchdogProc.Id; } catch { }
+            HashSet<int> never = ProcTree.Never(self, wd);
+            string sysDir = ""; try { sysDir = Environment.SystemDirectory; } catch { }
+            // ---- plan: the selected processes (and, for a tree, their descendants from a fresh snapshot) ----
+            Dictionary<int, DateTime> members = new Dictionary<int, DateTime>();
+            Dictionary<int, string> names = new Dictionary<int, string>();
+            List<int> order = new List<int>();
+            List<string> refused = new List<string>();
+            string treeErr = ""; bool snapOk = false;
             foreach (ListViewItem it in lvProc.SelectedItems)
             {
-                int pid = (int)it.Tag;
-                if (tree) { int k = KillRec(pid, map); ok += k; }
-                else { try { Process.GetProcessById(pid).Kill(); ok++; } catch { fail++; } }
+                ProcRow r = it.Tag as ProcRow;
+                if (r == null) continue;
+                if (never.Contains(r.Pid)) { refused.Add(r.Pid + " " + r.Name + (r.Pid == self ? " (это RescueScan)" : r.Pid == wd ? " (watchdog RescueScan)" : " (системный)")); continue; }
+                if (order.Contains(r.Pid)) continue;
+                order.Add(r.Pid); names[r.Pid] = r.Name;
+                if (r.Start.HasValue) members[r.Pid] = r.Start.Value;
+                else if (tree) treeErr = "время старта " + r.Pid + " " + r.Name + " не читается — его потомки не ищутся";
             }
-            lblProc.Text = (tree ? "Дерево завершено: " : "Завершено: ") + ok + "   ошибок: " + fail;
+            Dictionary<int, DateTime?> startCache = new Dictionary<int, DateTime?>();
+            Func<int, DateTime?> startOf = delegate(int pid)
+            {
+                DateTime? v; if (!startCache.TryGetValue(pid, out v)) { v = ProcStart(pid); startCache[pid] = v; }
+                return v;
+            };
+            if (tree)
+            {
+                Dictionary<int, int> par = new Dictionary<int, int>(); Dictionary<int, string> snapNames = new Dictionary<int, string>();
+                int err;
+                if (!Native.Snapshot(par, snapNames, out err)) treeErr = "дерево процессов не прочитано (ошибка " + err + ") — завершаются только выбранные";
+                else
+                {
+                    snapOk = true;
+                    foreach (int c in ProcTree.Grow(par, startOf, members, never))
+                    {
+                        if (order.Contains(c)) continue;
+                        order.Add(c); string nm; names[c] = snapNames.TryGetValue(c, out nm) ? nm : "";
+                    }
+                }
+            }
+            if (order.Count == 0) { MessageBox.Show("Нечего завершать: " + string.Join(", ", refused.ToArray()), "Диспетчер задач"); return; }
+            // ---- confirmation: the full list; critical Windows processes need a second, explicit «Да» ----
+            List<string> crit = new List<string>();
+            StringBuilder list = new StringBuilder();
+            for (int i = 0; i < order.Count; i++)
+            {
+                int pid = order[i];
+                string path = ProcPath(pid);
+                bool c = ProcTree.IsCritical(names[pid], path, sysDir);
+                if (c) crit.Add(pid + " " + names[pid]);
+                if (i < 25) list.AppendLine((c ? "!! " : "   ") + pid + "  " + names[pid] + (path.Length > 0 ? "  " + path : ""));
+            }
+            if (order.Count > 25) list.AppendLine("   … и ещё " + (order.Count - 25));
+            if (MessageBox.Show((tree ? "Завершить дерево (сначала родитель, потом потомки):" : "Завершить:") + "\r\n" + list +
+                    (refused.Count > 0 ? "\r\nНе трогаю: " + string.Join(", ", refused.ToArray()) + "\r\n" : "") +
+                    (treeErr.Length > 0 ? "\r\n" + treeErr + "\r\n" : ""),
+                    "Диспетчер задач", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            HashSet<int> skipCrit = new HashSet<int>();
+            if (crit.Count > 0 && MessageBox.Show("КРИТИЧЕСКИЕ процессы Windows:\r\n" + string.Join("\r\n", crit.ToArray()) +
+                    "\r\n\r\nИх завершение = синий экран CRITICAL_PROCESS_DIED (в WinPE — перезагрузка, всё несохранённое пропадёт).\r\n" +
+                    "Завершить и их тоже? «Нет» — завершить всё остальное, а их пропустить.",
+                    "ВНИМАНИЕ", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                foreach (int pid in order) if (ProcTree.IsCritical(names[pid], ProcPath(pid), sysDir)) skipCrit.Add(pid);
+            // ---- kill: root first (a respawning parent dies before it can restart its children) ----
+            int ok = 0, skipped = 0; List<string> fails = new List<string>();
+            foreach (int pid in order)
+            {
+                if (skipCrit.Contains(pid)) { skipped++; continue; }
+                DateTime st; DateTime? s = members.TryGetValue(pid, out st) ? (DateTime?)st : null;
+                string e = KillChecked(pid, s, names[pid]);
+                if (e.Length == 0) ok++; else fails.Add(e);
+            }
+            // ---- then descendants started meanwhile: fresh snapshots, a bounded number of rounds ----
+            if (tree && snapOk)
+            {
+                for (int round = 0; round < 5; round++)
+                {
+                    Dictionary<int, int> par = new Dictionary<int, int>(); Dictionary<int, string> snapNames = new Dictionary<int, string>();
+                    int err;
+                    if (!Native.Snapshot(par, snapNames, out err)) break;
+                    startCache.Clear();
+                    List<int> more = ProcTree.Grow(par, startOf, members, never);
+                    if (more.Count == 0) break;
+                    foreach (int pid in more)
+                    {
+                        string nm; snapNames.TryGetValue(pid, out nm);
+                        if (ProcTree.IsCritical(nm, ProcPath(pid), sysDir)) { skipped++; continue; }   // never without the explicit «Да» above
+                        string e = KillChecked(pid, members[pid], nm);
+                        if (e.Length == 0) ok++; else fails.Add(e);
+                    }
+                    Thread.Sleep(150);
+                }
+            }
+            lblProc.Text = (tree ? "Дерево: завершено " : "Завершено: ") + ok + "   ошибок: " + fails.Count +
+                (skipped > 0 ? "   пропущено критических: " + skipped : "") +
+                (treeErr.Length > 0 ? "   " + treeErr : "") +
+                (fails.Count > 0 ? "   (" + string.Join("; ", fails.GetRange(0, Math.Min(3, fails.Count)).ToArray()) + ")" : "");
             RefreshProcs();
-        }
-
-        static int KillRec(int pid, Dictionary<int, List<int>> map)
-        {
-            int n = 0;
-            if (map != null && map.ContainsKey(pid))
-                foreach (int c in map[pid]) n += KillRec(c, map);   // детей — первыми
-            try { Process.GetProcessById(pid).Kill(); n++; } catch { }
-            return n;
         }
 
         // ================= EXPLORER =================
@@ -5034,12 +5224,12 @@ namespace RescueScan
                     chkGuard.Checked = false;
                     return;
                 }
-                guarding = true;
+                guarding = true; SyncGuardFlag();
                 guardThread = new Thread(GuardLoop); guardThread.IsBackground = true; guardThread.Start();
                 Watchdog.Log("guard: слежение за Winlogon (live) включено");
                 lblStatus.Text = "Guard включён — Winlogon Shell/Userinit возвращаются к дефолту при подмене. Лог: " + Watchdog.LogPath;
             }
-            else if (guarding) { guarding = false; Watchdog.Log("guard: слежение выключено"); }
+            else if (guarding) { guarding = false; SyncGuardFlag(); Watchdog.Log("guard: слежение выключено"); }
         }
 
         void GuardLoop()
@@ -5069,15 +5259,47 @@ namespace RescueScan
             return c;
         }
 
+        // What «Запустить» does with a file: "exe" = start it directly (CreateProcess, no ShellExecute: a hijacked
+        // HKCU\Software\Classes\exefile would otherwise run malware with our admin token), "cmd" = a batch file through
+        // System32\cmd.exe /k, "text" = never executed, only opened in System32\notepad.exe.
+        internal static string LaunchMode(string path)
+        {
+            string e = "";
+            try { e = (Path.GetExtension(path) ?? "").ToLowerInvariant(); } catch { }
+            if (e == ".exe" || e == ".com") return "exe";
+            if (e == ".bat" || e == ".cmd") return "cmd";
+            return "text";
+        }
+
         void LaunchSelected()
         {
             if (lvFiles.SelectedItems.Count != 1) { MessageBox.Show("Выбери один файл."); return; }
             string tag = (string)lvFiles.SelectedItems[0].Tag;
             if (!tag.StartsWith("F|")) { MessageBox.Show("Это папка — выбери файл (напр. cmd.exe, regedit.exe)."); return; }
             string p = tag.Substring(2);
-            if (MessageBox.Show("Запустить файл?\r\n" + p + "\r\n\r\nЗапускай только доверенные программы (cmd, regedit, свои тулзы).", "Запуск",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-            try { Process.Start(p); lblFiles.Text = "Запущено: " + Path.GetFileName(p); }
+            string mode = LaunchMode(p);
+            string exe = p, args = "";
+            if (mode == "cmd") { exe = Reg.SysExe("cmd.exe"); args = "/k " + Reg.QuoteArg(p); }
+            else if (mode == "text") { exe = Reg.SysExe("notepad.exe"); args = Reg.QuoteArg(p); }
+            string hijack = Reg.IsWindows ? Reg.ToolHijack("HKLM\\SOFTWARE", Path.GetFileName(exe)) : "";
+            if (hijack.Length > 0)
+            {
+                MessageBox.Show("Запуск отменён: " + Path.GetFileName(exe) + " перехвачен через Image File Execution Options — " + hijack +
+                    "\r\nВместо него запустилась бы чужая программа с правами администратора. Сними перехват («Снять блокировки» на вкладке «Ремонт»).", "Запуск");
+                return;
+            }
+            string what = mode == "exe" ? "Запустить программу?\r\n" + p + "\r\n\r\nЗапускай только доверенные программы (cmd, regedit, свои тулзы)."
+                : mode == "cmd" ? "Это пакетный файл (скрипт). Запустить его в cmd.exe?\r\n" + p + "\r\n\r\nСкрипт выполнится с правами администратора — только если знаешь, что внутри."
+                : "Это не программа — файл НЕ будет выполнен, а откроется как текст в Блокноте:\r\n" + p;
+            if (MessageBox.Show(what, "Запуск", MessageBoxButtons.YesNo, mode == "text" ? MessageBoxIcon.Information : MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(exe, args);
+                psi.UseShellExecute = false;   // never ShellExecute: no file-association lookup
+                try { psi.WorkingDirectory = Path.GetDirectoryName(p); } catch { }
+                Process.Start(psi);
+                lblFiles.Text = (mode == "text" ? "Открыто в Блокноте: " : "Запущено: ") + Path.GetFileName(p);
+            }
             catch (Exception ex) { MessageBox.Show(ex.Message); }
         }
 
@@ -5552,6 +5774,7 @@ namespace RescueScan
             SaveFileDialog sd = new SaveFileDialog();
             sd.Filter = "CSV|*.csv|Text|*.txt";
             sd.FileName = "RescueScan_report.csv";
+            sd.RestoreDirectory = true;   // keep the current directory: never the (possibly infected) folder of the report
             if (sd.ShowDialog() != DialogResult.OK) return;
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("Category;Name;Value;Location;Risk");
@@ -5568,72 +5791,294 @@ namespace RescueScan
     }
 
     // ================= WATCHDOG (user-mode self-heal) =================
+    // GUI and watchdog guard each other. Every arming uses a fresh random stop-event name (passed on the command line,
+    // created with an Administrators/SYSTEM-only DACL; a pre-existing object of that name is refused). A GUI relaunched by
+    // the watchdog gets "--relaunched <watchdog pid> <event> <guard>" and ADOPTS the watchdog, so a normal close stops it
+    // instead of being "relaunched forever". Limit: a user-mode pair dies to `taskkill /f /im RescueScan.exe` (both
+    // processes share the image name) - that is documented, not solved.
     static class Watchdog
     {
         public static string LogPath = Path.Combine(Path.GetTempPath(), "rescuescan.log");
-        public const string StopEvtName = "RescueScanStopEvt";
+        const string EvtPrefix = "RescueScanStop_";
+        static readonly object logLock = new object();
 
+        // Serialised in-process (lock) and shared across processes (FileShare.ReadWrite + short retries): the GUI, its
+        // monitor/guard threads and the watchdog process all append to the same file.
         public static void Log(string msg)
         {
-            try { File.AppendAllText(LogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg + "\r\n"); }
-            catch { }
+            byte[] line = Encoding.UTF8.GetBytes(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg + "\r\n");
+            lock (logLock)
+            {
+                for (int i = 0; i < 5; i++)
+                {
+                    try
+                    {
+                        using (FileStream fs = new FileStream(LogPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+                            fs.Write(line, 0, line.Length);
+                        return;
+                    }
+                    catch (IOException) { Thread.Sleep(20); }
+                    catch { return; }
+                }
+            }
         }
 
-        // Runs headless: watches the GUI pid, relaunches it if it dies unexpectedly.
-        public static void Run(string[] args)
+        internal static string NewEventName() { return EvtPrefix + Guid.NewGuid().ToString("N"); }
+
+        internal static bool ValidEventName(string n)
         {
-            int pid = 0; try { pid = int.Parse(args[1]); } catch { }
-            string exe = args.Length > 2 ? args[2].Trim('"') : Application.ExecutablePath;
-            EventWaitHandle stop = null;
-            try { stop = EventWaitHandle.OpenExisting(StopEvtName); }
-            catch { try { stop = new EventWaitHandle(false, EventResetMode.ManualReset, StopEvtName); } catch { } }
-            Log("watchdog: старт, слежу за pid " + pid);
+            return n != null && Regex.IsMatch(n, "^" + EvtPrefix + "[0-9a-f]{32}(_guard)?$");
+        }
+
+        // The stop event (and its "_guard" companion: set while «Стеречь Winlogon» is on, so a relaunched GUI restores the
+        // guard). null when the name is already taken (squatted) or cannot be created.
+        internal static EventWaitHandle CreateEvent(string name)
+        {
+            if (!ValidEventName(name)) return null;
+            EventWaitHandle h = null; bool created = false;
+            try
+            {
+                System.Security.AccessControl.EventWaitHandleSecurity sec = new System.Security.AccessControl.EventWaitHandleSecurity();
+                foreach (System.Security.Principal.WellKnownSidType t in new System.Security.Principal.WellKnownSidType[] {
+                    System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, System.Security.Principal.WellKnownSidType.LocalSystemSid })
+                    sec.AddAccessRule(new System.Security.AccessControl.EventWaitHandleAccessRule(
+                        new System.Security.Principal.SecurityIdentifier(t, null),
+                        System.Security.AccessControl.EventWaitHandleRights.FullControl, System.Security.AccessControl.AccessControlType.Allow));
+                h = new EventWaitHandle(false, EventResetMode.ManualReset, name, out created, sec);
+            }
+            catch { h = null; }
+            if (h == null)
+                try { h = new EventWaitHandle(false, EventResetMode.ManualReset, name, out created); } catch { h = null; }
+            if (h != null && !created) { try { h.Close(); } catch { } return null; }
+            return h;
+        }
+
+        internal static EventWaitHandle OpenEvent(string name)
+        {
+            if (!ValidEventName(name)) return null;
+            try { return EventWaitHandle.OpenExisting(name); } catch { return null; }
+        }
+
+        // --watchdog <gui pid> <event> <exe>
+        internal static string WatchdogArgs(int guiPid, string evt, string exe)
+        {
+            return "--watchdog " + guiPid + " " + evt + " " + Reg.QuoteArg(exe);
+        }
+
+        // --relaunched <watchdog pid> <event> <guard 0|1>
+        internal static string RelaunchArgs(int watchdogPid, string evt, bool guard)
+        {
+            return "--relaunched " + watchdogPid + " " + evt + " " + (guard ? "1" : "0");
+        }
+
+        // args as Main receives them; null = not this form / invalid (an invalid command line never arms anything)
+        internal static bool ParseWatchdog(string[] a, out int guiPid, out string evt, out string exe)
+        {
+            guiPid = 0; evt = null; exe = null;
+            if (a == null || a.Length != 4 || a[0] != "--watchdog") return false;
+            if (!int.TryParse(a[1], out guiPid) || guiPid <= 4 || !ValidEventName(a[2]) || a[2].EndsWith("_guard")) return false;
+            if (!Regex.IsMatch(a[3], @"^([A-Za-z]:\\|\\\\)[^""]+$")) return false;   // absolute Windows path only
+            evt = a[2]; exe = a[3];
+            return true;
+        }
+
+        internal static bool ParseRelaunched(string[] a, out int watchdogPid, out string evt, out bool guard)
+        {
+            watchdogPid = 0; evt = null; guard = false;
+            if (a == null || a.Length != 4 || a[0] != "--relaunched") return false;
+            if (!int.TryParse(a[1], out watchdogPid) || watchdogPid <= 4 || !ValidEventName(a[2]) || a[2].EndsWith("_guard")) return false;
+            if (a[3] != "0" && a[3] != "1") return false;
+            evt = a[2]; guard = a[3] == "1";
+            return true;
+        }
+
+        // Back-off after the n-th failed relaunch in a row: 0.5 s, 1 s, 2 s ... capped at 30 s.
+        internal static int BackoffMs(int failures)
+        {
+            if (failures <= 0) return 0;
+            return failures >= 7 ? 30000 : Math.Min(30000, 500 << (failures - 1));
+        }
+
+        // Too many relaunches in a short time = something kills the GUI as soon as it starts (or it crashes at start):
+        // stop instead of spinning forever. launches = start times of the earlier relaunches.
+        internal static bool TooManyRelaunches(List<DateTime> launches, DateTime now)
+        {
+            int n = 0;
+            foreach (DateTime t in launches) if ((now - t).TotalSeconds < 120) n++;
+            return n >= 6;
+        }
+
+        // True when the process ended; false when `stop` was signalled first. Waits on both (polling the process).
+        static bool WaitExitOrStop(Process p, WaitHandle stop)
+        {
             while (true)
             {
-                try { Process.GetProcessById(pid).WaitForExit(); }
-                catch { Thread.Sleep(400); }
-                if (stop != null && stop.WaitOne(0)) { Log("watchdog: получен стоп-сигнал, выходим."); return; }
+                try { if (p == null || p.WaitForExit(300)) return true; } catch { return true; }
+                if (stop.WaitOne(0)) return false;
+            }
+        }
+
+        // Runs headless: watches the GUI, relaunches it (directly, never through ShellExecute/associations) if it dies
+        // without the stop signal.
+        public static void Run(string[] args)
+        {
+            int pid; string evt, exe;
+            if (!ParseWatchdog(args, out pid, out evt, out exe)) { Log("watchdog: неверные аргументы — не запускаюсь"); return; }
+            EventWaitHandle stop = OpenEvent(evt);
+            if (stop == null) { Log("watchdog: нет стоп-события " + evt + " — не запускаюсь"); return; }
+            Process gui = null;
+            try { gui = Process.GetProcessById(pid); } catch { }
+            Log("watchdog: старт, слежу за pid " + pid);
+            List<DateTime> launches = new List<DateTime>();
+            int fails = 0;
+            while (true)
+            {
+                if (!WaitExitOrStop(gui, stop) || stop.WaitOne(250)) { Log("watchdog: получен стоп-сигнал, выходим."); return; }
                 Log("watchdog: ГЛАВНЫЙ процесс (pid " + pid + ") исчез без стоп-сигнала -> ВИРУС мог его убить. Перезапуск.");
-                try { Process np = Process.Start(exe); pid = np.Id; Log("watchdog: перезапущено, новый pid " + pid); }
-                catch (Exception ex) { Log("watchdog: не смог перезапустить: " + ex.Message); Thread.Sleep(1000); }
+                if (TooManyRelaunches(launches, DateTime.Now)) { Log("watchdog: слишком много перезапусков подряд — останавливаюсь."); return; }
+                bool guard = false;
+                EventWaitHandle g = OpenEvent(evt + "_guard");
+                if (g != null) { try { guard = g.WaitOne(0); } catch { } g.Close(); }
+                try
+                {
+                    ProcessStartInfo psi = new ProcessStartInfo(exe, RelaunchArgs(Process.GetCurrentProcess().Id, evt, guard));
+                    psi.UseShellExecute = false;
+                    try { psi.WorkingDirectory = Path.GetDirectoryName(exe); } catch { }
+                    gui = Process.Start(psi);
+                    pid = gui.Id; fails = 0; launches.Add(DateTime.Now);
+                    Log("watchdog: перезапущено, новый pid " + pid + (guard ? " (страж Winlogon будет восстановлен)" : ""));
+                }
+                catch (Exception ex)
+                {
+                    gui = null; fails++;
+                    Log("watchdog: не смог перезапустить (" + fails + "): " + ex.Message);
+                    if (fails >= 8) { Log("watchdog: сдаюсь после " + fails + " неудач."); return; }
+                    if (stop.WaitOne(BackoffMs(fails))) { Log("watchdog: получен стоп-сигнал, выходим."); return; }
+                }
             }
         }
     }
 
-    // ================= Native (Toolhelp for process tree) =================
+    // ================= Native (Toolhelp for the process tree) =================
+    // Unicode PROCESSENTRY32W with the W exports. The old struct had no CharSet (= ANSI, 304/296 bytes) while CharSet.Auto
+    // bound Process32FirstW, which then failed with ERROR_BAD_LENGTH: «Завершить дерево» silently killed one process.
     static class Native
     {
-        [StructLayout(LayoutKind.Sequential)]
-        public struct PROCESSENTRY32
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct PROCESSENTRY32W
         {
             public uint dwSize; public uint cntUsage; public uint th32ProcessID;
             public IntPtr th32DefaultHeapID; public uint th32ModuleID; public uint cntThreads;
             public uint th32ParentProcessID; public int pcPriClassBase; public uint dwFlags;
             [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
         }
-        [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto)] public static extern bool Process32First(IntPtr snap, ref PROCESSENTRY32 pe);
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto)] public static extern bool Process32Next(IntPtr snap, ref PROCESSENTRY32 pe);
-        [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        static extern bool Process32FirstW(IntPtr snap, ref PROCESSENTRY32W pe);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        static extern bool Process32NextW(IntPtr snap, ref PROCESSENTRY32W pe);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
 
-        public static Dictionary<int, List<int>> ChildMap()
+        // 568 bytes on x64, 556 on x86 (sizeof(PROCESSENTRY32W)); Process32FirstW refuses anything smaller.
+        internal static int EntrySize { get { return Marshal.SizeOf(typeof(PROCESSENTRY32W)); } }
+
+        // One Toolhelp snapshot: pid -> parent pid, pid -> image name. error = Win32 error (or -1 when the API is
+        // missing) - the caller must SHOW it and never report a tree as killed when the walk failed.
+        public static bool Snapshot(Dictionary<int, int> parentOf, Dictionary<int, string> names, out int error)
         {
-            Dictionary<int, List<int>> map = new Dictionary<int, List<int>>();
-            IntPtr snap = CreateToolhelp32Snapshot(0x2 /*TH32CS_SNAPPROCESS*/, 0);
-            if (snap == (IntPtr)(-1)) return map;
+            error = 0;
+            IntPtr snap;
+            try { snap = CreateToolhelp32Snapshot(0x2 /*TH32CS_SNAPPROCESS*/, 0); }
+            catch (Exception) { error = -1; return false; }   // DllNotFound / EntryPointNotFound (not Windows)
+            if (snap == (IntPtr)(-1)) { error = Marshal.GetLastWin32Error(); return false; }
             try
             {
-                PROCESSENTRY32 pe = new PROCESSENTRY32(); pe.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
-                if (Process32First(snap, ref pe))
-                    do
-                    {
-                        int p = (int)pe.th32ParentProcessID, c = (int)pe.th32ProcessID;
-                        if (!map.ContainsKey(p)) map[p] = new List<int>();
-                        map[p].Add(c);
-                    } while (Process32Next(snap, ref pe));
+                PROCESSENTRY32W pe = new PROCESSENTRY32W();
+                pe.dwSize = (uint)EntrySize;
+                if (!Process32FirstW(snap, ref pe)) { error = Marshal.GetLastWin32Error(); return false; }
+                do
+                {
+                    int c = (int)pe.th32ProcessID;
+                    parentOf[c] = (int)pe.th32ParentProcessID;
+                    names[c] = pe.szExeFile ?? "";
+                    pe.dwSize = (uint)EntrySize;
+                } while (Process32NextW(snap, ref pe));
+                return true;
             }
             finally { CloseHandle(snap); }
-            return map;
+        }
+    }
+
+    // Pure process-tree logic (unit-tested): which PIDs belong to a tree, which processes are critical.
+    static class ProcTree
+    {
+        // Killing one of these = CRITICAL_PROCESS_DIED bugcheck (or, in WinPE, winpeshl = reboot of the rescue system).
+        internal static readonly string[] CriticalNames = { "system", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "winpeshl" };
+
+        // name: image name with or without .exe; path: full image path ("" / "(нет доступа)" = unknown);
+        // sysDir: the RUNNING system's System32. A look-alike csrss.exe outside System32 is NOT critical (it is malware);
+        // an unknown path counts as critical (the real ones are exactly the processes whose path we cannot read).
+        internal static bool IsCritical(string name, string path, string sysDir)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string n = name.Trim().ToLowerInvariant();
+            if (n.EndsWith(".exe")) n = n.Substring(0, n.Length - 4);
+            if (Array.IndexOf(CriticalNames, n) < 0) return false;
+            if (n == "system") return string.IsNullOrEmpty(path) || !path.Contains("\\");   // the kernel process has no image path
+            if (string.IsNullOrEmpty(path) || path.IndexOf('\\') < 0) return true;
+            string dir = path.Substring(0, path.LastIndexOf('\\'));   // Windows path: no Path.* (tests run on Mono/Linux too)
+            if (string.IsNullOrEmpty(sysDir)) return true;
+            return string.Equals(dir.TrimEnd('\\'), sysDir.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+        }
+
+        // PIDs that are never killed and never walked into: Idle (0), System (4), RescueScan itself, its watchdog.
+        internal static HashSet<int> Never(int self, int watchdog)
+        {
+            HashSet<int> n = new HashSet<int>(); n.Add(0); n.Add(4); n.Add(self);
+            if (watchdog > 0) n.Add(watchdog);
+            return n;
+        }
+
+        // Grows the tree `members` (pid -> start time recorded when the process joined) from one snapshot and returns
+        // the PIDs added, parents before children. parentOf: pid -> parent pid of the snapshot; startOf: current start
+        // time of a pid (null = gone / unknown). A process joins only when
+        //  - its parent pid is a member and it started no earlier than that member (a parent pid is never updated and
+        //    PIDs are reused: an older process "below" a member is a stale edge - e.g. winlogon under a reused smss pid),
+        //  - and, if the member's pid now belongs to a NEWER process (the member died and the pid was reused), it was
+        //    started before that newer process;
+        //  - it is not in `never` and its start time is known (we cannot prove it is a child otherwise).
+        // Iterative with a visited set: cycles (pid reuse, 0 -> 0) cannot loop or overflow the stack.
+        internal static List<int> Grow(Dictionary<int, int> parentOf, Func<int, DateTime?> startOf,
+            Dictionary<int, DateTime> members, ICollection<int> never)
+        {
+            Dictionary<int, List<int>> kids = new Dictionary<int, List<int>>();
+            foreach (KeyValuePair<int, int> kv in parentOf)
+            {
+                int c = kv.Key, p = kv.Value;
+                if (c == p || c == 0 || c == 4 || p == 0) continue;
+                List<int> l; if (!kids.TryGetValue(p, out l)) { l = new List<int>(); kids[p] = l; }
+                l.Add(c);
+            }
+            List<int> added = new List<int>();
+            Queue<int> q = new Queue<int>(members.Keys);
+            HashSet<int> visited = new HashSet<int>(members.Keys);
+            while (q.Count > 0)
+            {
+                int p = q.Dequeue();
+                List<int> l; if (!kids.TryGetValue(p, out l)) continue;
+                DateTime pStart = members[p];
+                DateTime? cur = startOf(p);
+                bool reused = cur.HasValue && cur.Value != pStart;
+                foreach (int c in l)
+                {
+                    if (visited.Contains(c) || never.Contains(c)) continue;
+                    DateTime? cs = startOf(c);
+                    if (!cs.HasValue || cs.Value < pStart) continue;
+                    if (reused && cs.Value >= cur.Value) continue;
+                    visited.Add(c); members[c] = cs.Value; added.Add(c); q.Enqueue(c);
+                }
+            }
+            return added;
         }
     }
 
@@ -5643,6 +6088,9 @@ namespace RescueScan
         static void Main(string[] args)
         {
             if (args.Length >= 1 && args[0] == "--watchdog") { Watchdog.Run(args); return; }
+            int wdPid; string evt; bool guard;
+            if (Watchdog.ParseRelaunched(args, out wdPid, out evt, out guard))
+            { MainForm.RelaunchWatchdogPid = wdPid; MainForm.RelaunchEvent = evt; MainForm.RelaunchGuard = guard; }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());

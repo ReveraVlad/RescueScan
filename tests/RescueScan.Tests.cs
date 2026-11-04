@@ -95,6 +95,12 @@ namespace RescueScan.Tests
                 Run("RunOnceEx/AeDebug/UserList/Defender exclusions/Setup/DataBasePath/VerifierDlls", MachineExtrasCases);
                 Run("hosts: default clean, AV blocks / pharming SUSPECT, lists capped", HostsCases);
                 Run("Startup: .lnk targets, dropped programs, checker content; payload path", StartupAndPayloadCases);
+                Run("Process tree: PROCESSENTRY32W size and layout (x86 + x64)", ProcEntryLayout);
+                Run("Process tree: root first, visited set, stale/reused parents, never-kill set", ProcTreeGrow);
+                Run("Process tree: critical processes", ProcCritical);
+                Run("Watchdog: event names, command lines, back-off, relaunch cap", WatchdogArgsCases);
+                Run("Launch: exe direct, batch via cmd, everything else as text", LaunchModes);
+                Run("Process tree: real Toolhelp snapshot sees this process [win]", ProcSnapshotWin);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
                 Run("Pairs/DeleteKey: registry symbolic links are not followed [win]", LinksWin);
@@ -2333,6 +2339,162 @@ namespace RescueScan.Tests
                 Eq("REVIEW", MainForm.StartupRisk(t2, out shown), "plain other file REVIEW");
             }
             finally { try { Directory.Delete(dir, true); } catch { } }
+        }
+        // ------------------------------------------------------------------ package C: processes / watchdog / launch
+        // The 32-bit layout of PROCESSENTRY32W (th32DefaultHeapID is a 4-byte ULONG_PTR there), to check the x86 size
+        // on a 64-bit test run.
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct PROCESSENTRY32W_X86
+        {
+            public uint dwSize; public uint cntUsage; public uint th32ProcessID;
+            public uint th32DefaultHeapID; public uint th32ModuleID; public uint cntThreads;
+            public uint th32ParentProcessID; public int pcPriClassBase; public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+        }
+
+        static void ProcEntryLayout()
+        {
+            // sizeof(PROCESSENTRY32W): 568 (x64) / 556 (x86); the old ANSI struct was 304 / 296 and Process32FirstW failed
+            Eq(IntPtr.Size == 8 ? 568 : 556, Native.EntrySize, "PROCESSENTRY32W size for this bitness");
+            Eq(IntPtr.Size == 8 ? 44 : 36, (int)Marshal.OffsetOf(typeof(Native.PROCESSENTRY32W), "szExeFile"), "szExeFile offset");
+            Eq(IntPtr.Size == 8 ? 32 : 24, (int)Marshal.OffsetOf(typeof(Native.PROCESSENTRY32W), "th32ParentProcessID"), "parent pid offset");
+            Eq(556, Marshal.SizeOf(typeof(PROCESSENTRY32W_X86)), "x86 layout size");
+            Eq(36, (int)Marshal.OffsetOf(typeof(PROCESSENTRY32W_X86), "szExeFile"), "x86 szExeFile offset");
+        }
+
+        static Func<int, DateTime?> Starts(Dictionary<int, int> minutes)
+        {
+            DateTime b = new DateTime(2026, 1, 1);
+            return delegate(int pid) { int m; return minutes.TryGetValue(pid, out m) ? (DateTime?)b.AddMinutes(m) : null; };
+        }
+
+        static Dictionary<int, int> Map(params int[] pidParent)
+        {
+            Dictionary<int, int> d = new Dictionary<int, int>();
+            for (int i = 0; i + 1 < pidParent.Length; i += 2) d[pidParent[i]] = pidParent[i + 1];
+            return d;
+        }
+
+        static string Ids(List<int> l) { return string.Join(",", l.ConvertAll(delegate(int x) { return x.ToString(); }).ToArray()); }
+
+        static Dictionary<int, DateTime> TreeRoot(int pid, Func<int, DateTime?> st)
+        {
+            Dictionary<int, DateTime> m = new Dictionary<int, DateTime>(); m[pid] = st(pid).Value; return m;
+        }
+
+        static void ProcTreeGrow()
+        {
+            HashSet<int> never = ProcTree.Never(500, 501);
+            True(never.Contains(0) && never.Contains(4) && never.Contains(500) && never.Contains(501), "never: idle, System, self, watchdog");
+            // cmd (100) -> miner (200) -> conhost (300); cmd -> timeout (210). Breadth first: parents before children.
+            Dictionary<int, int> par = Map(100, 50, 200, 100, 210, 100, 300, 200, 0, 0, 4, 0);
+            Dictionary<int, int> min = new Dictionary<int, int>(); min[50] = 0; min[100] = 10; min[200] = 11; min[210] = 12; min[300] = 13; min[0] = 0; min[4] = 0;
+            Func<int, DateTime?> st = Starts(min);
+            Dictionary<int, DateTime> m = TreeRoot(100, st);
+            Eq("200,210,300", Ids(ProcTree.Grow(par, st, m, never)), "descendants in order");
+            Eq(0, ProcTree.Grow(par, st, m, never).Count, "second walk adds nothing");
+            // Idle 0 -> 0 and System 4 -> 0 never loop or join
+            m = TreeRoot(0, st);
+            Eq(0, ProcTree.Grow(par, st, m, never).Count, "pid 0 self-parent: no children, no loop");
+            // a cycle created by PID reuse (1 -> 2 -> 1) terminates
+            Dictionary<int, int> cyc = Map(1, 2, 2, 1);
+            Dictionary<int, int> cm = new Dictionary<int, int>(); cm[1] = 10; cm[2] = 20;
+            st = Starts(cm); m = TreeRoot(1, st);
+            Eq("2", Ids(ProcTree.Grow(cyc, st, m, never)), "cycle terminates");
+            // stale parent pid: winlogon (612, started at boot) has parent 548 = an exited smss; 548 is now malware
+            Dictionary<int, int> stale = Map(612, 548, 548, 900, 700, 548);
+            Dictionary<int, int> sm = new Dictionary<int, int>(); sm[612] = 1; sm[548] = 300; sm[700] = 301;
+            st = Starts(sm); m = TreeRoot(548, st);
+            Eq("700", Ids(ProcTree.Grow(stale, st, m, never)), "older process under a reused pid is not a child");
+            // never: RescueScan (500) started by the tree root is skipped together with its own children (watchdog 501)
+            Dictionary<int, int> self = Map(500, 100, 501, 500, 600, 100);
+            Dictionary<int, int> selfm = new Dictionary<int, int>(); selfm[100] = 1; selfm[500] = 2; selfm[501] = 3; selfm[600] = 4;
+            st = Starts(selfm); m = TreeRoot(100, st);
+            Eq("600", Ids(ProcTree.Grow(self, st, m, never)), "self and watchdog never in the tree");
+            // member 100 (started 10) was killed; its pid now belongs to a newer process (started 50)
+            Dictionary<int, int> reuse = Map(100, 1, 101, 100, 102, 100);
+            Dictionary<int, int> rm = new Dictionary<int, int>(); rm[100] = 50; rm[101] = 60; rm[102] = 30;
+            st = Starts(rm);
+            m = new Dictionary<int, DateTime>(); m[100] = new DateTime(2026, 1, 1).AddMinutes(10);
+            Eq("102", Ids(ProcTree.Grow(reuse, st, m, never)), "child of the newer pid owner excluded, orphan of the old one kept");
+            // a child whose start time cannot be read is not provably a child
+            Dictionary<int, int> unk = Map(200, 100);
+            Dictionary<int, int> um = new Dictionary<int, int>(); um[100] = 1;
+            st = Starts(um); m = TreeRoot(100, st);
+            Eq(0, ProcTree.Grow(unk, st, m, never).Count, "unknown start time: not added");
+            // started in the same instant as the parent: still a child
+            Dictionary<int, int> same = new Dictionary<int, int>(); same[100] = 5; same[200] = 5;
+            st = Starts(same); m = TreeRoot(100, st);
+            Eq("200", Ids(ProcTree.Grow(unk, st, m, never)), "same start time");
+        }
+
+        static void ProcCritical()
+        {
+            string sys = "C:\\Windows\\System32";
+            True(ProcTree.IsCritical("csrss", "C:\\Windows\\System32\\csrss.exe", sys), "csrss in System32");
+            True(ProcTree.IsCritical("LSASS.EXE", "c:\\windows\\system32\\lsass.exe", sys), "case-insensitive, .exe");
+            True(ProcTree.IsCritical("winlogon", "(нет доступа)", sys), "unknown path counts as critical");
+            True(ProcTree.IsCritical("wininit", "", sys), "empty path counts as critical");
+            True(ProcTree.IsCritical("System", "", sys), "System");
+            True(ProcTree.IsCritical("winpeshl", "X:\\Windows\\System32\\winpeshl.exe", "X:\\Windows\\System32"), "WinPE shell");
+            True(!ProcTree.IsCritical("csrss", "C:\\Users\\u\\AppData\\Roaming\\csrss.exe", sys), "look-alike outside System32 is malware, not critical");
+            True(!ProcTree.IsCritical("svchost", "C:\\Windows\\System32\\svchost.exe", sys), "svchost not in the list");
+            True(!ProcTree.IsCritical("notepad", "C:\\Windows\\System32\\notepad.exe", sys), "notepad");
+            True(!ProcTree.IsCritical("", "", sys), "empty name");
+        }
+
+        static void WatchdogArgsCases()
+        {
+            string e = Watchdog.NewEventName();
+            True(Watchdog.ValidEventName(e) && Watchdog.ValidEventName(e + "_guard"), "fresh names valid");
+            True(e != Watchdog.NewEventName(), "random per arming");
+            True(!Watchdog.ValidEventName("RescueScanStopEvt") && !Watchdog.ValidEventName("Global\\" + e) && !Watchdog.ValidEventName(null), "fixed/foreign names rejected");
+            string exe = "C:\\Tools dir\\RescueScan.exe";
+            string[] a = ParseArgs(Watchdog.WatchdogArgs(1234, e, exe)).ToArray();
+            int pid; string evt, x;
+            True(Watchdog.ParseWatchdog(a, out pid, out evt, out x), "watchdog args round trip");
+            Eq(1234, pid, "gui pid"); Eq(e, evt, "event"); Eq(exe, x, "exe with a space");
+            True(!Watchdog.ParseWatchdog(new string[] { "--watchdog", "1234", "\"C:\\x.exe\"" }, out pid, out evt, out x), "old 3-arg form refused");
+            True(!Watchdog.ParseWatchdog(new string[] { "--watchdog", "4", e, exe }, out pid, out evt, out x), "pid 4 refused");
+            True(!Watchdog.ParseWatchdog(new string[] { "--watchdog", "1234", e, "rel.exe" }, out pid, out evt, out x), "relative exe refused");
+            int wd; bool g;
+            True(Watchdog.ParseRelaunched(ParseArgs(Watchdog.RelaunchArgs(77, e, true)).ToArray(), out wd, out evt, out g), "relaunch round trip");
+            Eq(77, wd, "watchdog pid"); Eq(e, evt, "event"); True(g, "guard on");
+            True(Watchdog.ParseRelaunched(new string[] { "--relaunched", "77", e, "0" }, out wd, out evt, out g) && !g, "guard off");
+            True(!Watchdog.ParseRelaunched(new string[] { "--relaunched", "77", e + "_guard", "0" }, out wd, out evt, out g), "guard event is not a stop event");
+            True(!Watchdog.ParseRelaunched(new string[] { "--relaunched", "x", e, "0" }, out wd, out evt, out g), "bad pid");
+            True(!Watchdog.ParseRelaunched(new string[0], out wd, out evt, out g), "no args = normal start");
+            Eq(0, Watchdog.BackoffMs(0), "no failure no wait"); Eq(500, Watchdog.BackoffMs(1), "first"); Eq(1000, Watchdog.BackoffMs(2), "second");
+            Eq(30000, Watchdog.BackoffMs(7), "cap"); Eq(30000, Watchdog.BackoffMs(40), "cap, no overflow");
+            DateTime now = DateTime.Now; List<DateTime> l = new List<DateTime>();
+            for (int i = 0; i < 5; i++) l.Add(now.AddSeconds(-10 * i));
+            True(!Watchdog.TooManyRelaunches(l, now), "5 relaunches in 2 min: still allowed");
+            l.Add(now.AddSeconds(-1));
+            True(Watchdog.TooManyRelaunches(l, now), "6th within 2 min: give up");
+            List<DateTime> old = new List<DateTime>(); for (int i = 0; i < 10; i++) old.Add(now.AddMinutes(-5));
+            True(!Watchdog.TooManyRelaunches(old, now), "old relaunches do not count");
+        }
+
+        static void LaunchModes()
+        {
+            Eq("exe", MainForm.LaunchMode("C:\\Windows\\System32\\cmd.exe"), "exe");
+            Eq("exe", MainForm.LaunchMode("D:\\Tools\\X.COM"), "com");
+            Eq("cmd", MainForm.LaunchMode("C:\\x\\fix.BAT"), "bat");
+            Eq("cmd", MainForm.LaunchMode("C:\\x\\fix.cmd"), "cmd");
+            foreach (string t in new string[] { "a.vbs", "a.js", "a.ps1", "a.hta", "a.lnk", "a.reg", "a.txt", "a.scr", "a.msi", "a", "a.exe.txt" })
+                Eq("text", MainForm.LaunchMode("C:\\x\\" + t), t + " is never executed");
+        }
+
+        static void ProcSnapshotWin()
+        {
+            WindowsOnly();
+            Dictionary<int, int> par = new Dictionary<int, int>(); Dictionary<int, string> names = new Dictionary<int, string>();
+            int err;
+            True(Native.Snapshot(par, names, out err), "snapshot ok (error " + err + ")");
+            int me = Process.GetCurrentProcess().Id;
+            True(par.ContainsKey(me), "own pid listed");
+            True(names[me].EndsWith(".exe", StringComparison.OrdinalIgnoreCase), "Unicode image name: " + names[me]);
+            True(par.Count > 5, "more than a handful of processes");
         }
     }
 }
