@@ -569,6 +569,23 @@ namespace RescueScan
         string tgtSoft = "";         // SOFTWARE root: HKLM\RS_SOFT (offline) / HKLM\SOFTWARE (live); "" = not available
         string tgtSys = "";          // SYSTEM root:   HKLM\RS_SYS  (offline) / HKLM\SYSTEM   (live); "" = not available
         List<string[]> tgtUsers = new List<string[]>();   // {name, hive root (HKLM\RS_U<n> / HKU\<SID>) or "", profile dir}
+        // Held while a RescueScan GUI runs: an RS_* mount found at start is stale (crashed run) only if no other
+        // instance is alive; a live instance's mounts must not be unloaded and replaced under its feet.
+        static Mutex instanceMutex;
+        static bool otherInstance = true;
+
+        static bool OtherInstanceAlive()
+        {
+            if (!otherInstance) return false;
+            try
+            {
+                if (instanceMutex == null) instanceMutex = new Mutex(false, "Global\\RescueScan_GUI");
+                otherInstance = !instanceMutex.WaitOne(0);
+            }
+            catch (AbandonedMutexException) { otherInstance = false; }   // the previous GUI ended without releasing it
+            catch { otherInstance = false; }
+            return otherInstance;
+        }
         string curDrive = "";
         string curPath = "";
         HashSet<string> flagged = new HashSet<string>();
@@ -587,6 +604,7 @@ namespace RescueScan
 
         public MainForm()
         {
+            OtherInstanceAlive();   // take the instance marker (UI thread) as early as possible
             Text = "RescueScan  -  scanner + task manager + explorer (WinRE)";
             Width = 1080; Height = 660; StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(860, 500);
@@ -1049,6 +1067,11 @@ namespace RescueScan
             if (!File.Exists(file)) { warn.Append("нет файла " + file + ". "); return 1; }   // reg load would CREATE an empty hive
             if (Reg.KeyExists(p))
             {
+                if (OtherInstanceAlive() && !mounted.Contains(name))
+                {
+                    warn.Append(p + " смонтирован другим запущенным RescueScan — закрой его и повтори. ");
+                    return 2;
+                }
                 Reg.RunCode("unload " + Reg.QuoteArg(p), out o);
                 if (Reg.KeyExists(p))
                 {
