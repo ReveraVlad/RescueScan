@@ -60,6 +60,8 @@ namespace RescueScan
                 psi.CreateNoWindow = true;
                 psi.RedirectStandardOutput = true;
                 psi.RedirectStandardError = true;
+                Encoding oem = OemEncoding();   // the child's new console writes OEM (866/437...), .NET would decode as ANSI
+                if (oem != null) { psi.StandardOutputEncoding = oem; psi.StandardErrorEncoding = oem; }
                 p = Process.Start(psi);
                 StreamReader so = p.StandardOutput, se = p.StandardError;
                 string[] text = new string[2];
@@ -91,6 +93,15 @@ namespace RescueScan
             {
                 if (p != null) try { p.Dispose(); } catch { }
             }
+        }
+
+        [DllImport("kernel32.dll")]
+        static extern int GetOEMCP();
+
+        static Encoding OemEncoding()
+        {
+            if (Environment.OSVersion.Platform != PlatformID.Win32NT) return null;
+            try { return Encoding.GetEncoding(GetOEMCP()); } catch { return null; }
         }
 
         // Full path of a Windows console tool. Never a planted copy next to RescueScan.exe (CreateProcess searches the
@@ -160,7 +171,7 @@ namespace RescueScan
         internal static bool SplitRoot(string path, out RegistryHive hive, out string sub)
         {
             hive = RegistryHive.LocalMachine; sub = "";
-            if (path == null) return false;
+            if (path == null || path.IndexOf('\0') >= 0) return false;   // Win32 would silently cut the path at the NUL
             int i = path.IndexOf('\\');
             string root = (i < 0 ? path : path.Substring(0, i)).ToUpperInvariant();
             sub = i < 0 ? "" : path.Substring(i + 1);
@@ -197,10 +208,14 @@ namespace RescueScan
             using (RegistryKey k = OpenKey(key, false))
             {
                 if (k == null) return res;
+                // A name that contains NUL (MITRE T1112 "hidden" values; Win32 cannot address it) is enumerated cut at
+                // the NUL: "\0x" -> "" aliases the default value, "a\0x" -> "a". Such a name shows up twice or cannot
+                // be read back; it is returned as <cut name> + "\0" so it never matches (or deletes) a real name.
+                HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (string n in Names(k, false))
                 {
                     string data, type;
-                    if (!TryGetValue(k, n, out data, out type)) { data = ""; type = ""; }
+                    if (!seen.Add(n) || !TryGetValue(k, n, out data, out type)) { res.Add(new string[] { n + "\0", "", "" }); continue; }
                     res.Add(new string[] { n, data, type });
                 }
             }
@@ -215,7 +230,8 @@ namespace RescueScan
             {
                 if (k == null) return res;
                 string bas = key.TrimEnd('\\');
-                foreach (string s in Names(k, true)) res.Add(bas + "\\" + s);
+                foreach (string s in Names(k, true))
+                    if (s.Length > 0) res.Add(bas + "\\" + s);   // "" = NUL-prefixed hidden name: would address the parent
             }
             return res;
         }
@@ -241,6 +257,7 @@ namespace RescueScan
             if (depth > PairsMaxDepth || IsLink(k)) return;
             foreach (string s in Names(k, true))
             {
+                if (s.Length == 0) continue;   // NUL-prefixed hidden name: opening "" would re-open k itself
                 if (--budget < 0) return;
                 using (RegistryKey c = OpenChild(k, s, false))
                 {
@@ -349,7 +366,7 @@ namespace RescueScan
         // = reg delete KEY /v NAME /f. false if the key or the value does not exist or the delete failed.
         public static bool DeleteValue(string key, string name)
         {
-            if (name == null) return false;
+            if (name == null || name.IndexOf('\0') >= 0) return false;   // would address another (cut) name
             try
             {
                 using (RegistryKey k = OpenKey(key, true))
@@ -403,7 +420,7 @@ namespace RescueScan
                 bool ok = true;
                 if (!IsLink(k))
                     foreach (string s in Names(k, true))
-                        if (!DeleteTree(k, s, depth + 1)) ok = false;
+                        if (s.Length == 0 || !DeleteTree(k, s, depth + 1)) ok = false;   // "": hidden NUL name, not addressable
                 return ok && NtDeleteKey(k.Handle) == 0;
             }
         }
@@ -428,7 +445,7 @@ namespace RescueScan
         static bool SetValue(string key, string name, object data, RegistryValueKind kind)
         {
             RegistryHive hive; string sub;
-            if (name == null || data == null || !SplitRoot(key, out hive, out sub) || sub.Trim('\\').Length == 0) return false;
+            if (name == null || name.IndexOf('\0') >= 0 || data == null || !SplitRoot(key, out hive, out sub) || sub.Trim('\\').Length == 0) return false;
             try
             {
                 using (RegistryKey b = RegistryKey.OpenBaseKey(hive, View))
@@ -1254,8 +1271,18 @@ namespace RescueScan
             foreach (string[] v in Reg.Values(key))
             {
                 if (v[0].Length == 0) continue; // (Default)
+                if (HiddenName(f, cat, key, v[0])) continue;
                 Add(f, cat, v[0], v[1], key, Risk(v[1]), 0, key, v[0], null);
             }
+        }
+
+        // A value name containing NUL (see Reg.Values): Win32 tools cannot read or delete it. Report, never act on it.
+        static bool HiddenName(List<Finding> f, string cat, string key, string name)
+        {
+            if (name.IndexOf('\0') < 0) return false;
+            Add(f, cat, "(скрытое имя с NUL: " + name.Replace("\0", "\\0") + ")", "(не читается через Win32; удалить — Sysinternals RegDelNull)",
+                key, "SUSPECT", 3, null, null, null);
+            return true;
         }
 
         internal static void AddValuesRisk(List<Finding> f, string cat, string key, string forceRisk)
@@ -1263,6 +1290,7 @@ namespace RescueScan
             foreach (string[] v in Reg.Values(key))
             {
                 if (v[0].Length == 0) continue; // (Default)
+                if (HiddenName(f, cat, key, v[0])) continue;
                 string r = Risk(v[1]); if (r == "") r = forceRisk;
                 Add(f, cat, v[0], v[1], key, r, 0, key, v[0], null);
             }
