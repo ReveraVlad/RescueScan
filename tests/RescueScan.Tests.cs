@@ -103,6 +103,7 @@ namespace RescueScan.Tests
                 Run("Export: CSV cells quoted, quotes doubled, formulas neutralised", CsvCells);
                 Run("Errors: Russian last-chance message", ErrorTextCases);
                 Run("Hibernation: hiberfil.sys header", HiberCases);
+                Run("Offline path mapping: env vars, \\SystemRoot, drive letter", PathMapCases);
                 Run("Process tree: real Toolhelp snapshot sees this process [win]", ProcSnapshotWin);
                 Run("SysExe: absolute System32 path [win]", SysExeWin);
                 Run("Values: raw types .NET cannot read (REG_RESOURCE_LIST, custom) [win]", RawTypesWin);
@@ -2320,6 +2321,9 @@ namespace RescueScan.Tests
             Eq("", Heur.PayloadPath("powershell.exe -e JABz"), "only an interpreter: nothing flagged");
             Eq("C:\\Program Files\\My App\\app.exe", Heur.PayloadPath("C:\\Program Files\\My App\\app.exe -min"), "unquoted path with spaces");
             Eq("C:\\x\\a.sct", Heur.PayloadPath("regsvr32 /s /i:C:\\x\\a.sct scrobj.dll"), "switch:path");
+            Eq("C:\\Users\\b\\AppData\\Roaming\\svchost.exe", Heur.PayloadPath("C:\\Users\\b\\AppData\\Roaming\\svchost.exe -k x"), "fake svchost outside Windows is the payload");
+            Eq("C:\\ProgramData\\p.dll", Heur.PayloadPath("C:\\Windows\\System32\\svchost.exe C:\\ProgramData\\p.dll"), "real svchost skipped");
+            Eq("C:\\s\\a.py", Heur.PayloadPath("C:\\Python311\\python.exe C:\\s\\a.py"), "python skipped wherever it is");
             string[] t = Heur.LnkTarget(MakeLnk("C:\\Windows\\System32\\cmd.exe", "/c start C:\\Users\\V\\a.vbs"));
             True(t != null, "lnk parsed");
             Eq("C:\\Windows\\System32\\cmd.exe", t[0], "lnk target"); Eq("/c start C:\\Users\\V\\a.vbs", t[1], "lnk arguments");
@@ -2540,6 +2544,28 @@ namespace RescueScan.Tests
             }
             finally { try { File.Delete(f); } catch { } }
             True(!Hiber.Active("") && !Hiber.Active("C") && !Hiber.Active(null), "bad drive strings");
+        }
+        static void PathMapCases()
+        {
+            string sr = "C:\\Windows", cur = "D:\\Windows", prof = "D:\\Users\\bob";
+            Eq("D:\\Users\\bob\\AppData\\Roaming\\Microsoft\\svchost.exe",
+                PathMap.Payload("C:\\Users\\bob\\AppData\\Roaming\\Microsoft\\svchost.exe -w hidden", sr, cur, prof), "target letter C: -> D:");
+            Eq("D:\\Users\\bob\\AppData\\Roaming\\x\\a.exe", PathMap.Payload("%APPDATA%\\x\\a.exe /silent", sr, cur, prof), "%APPDATA% of the value's profile");
+            Eq("D:\\Users\\bob\\AppData\\Local\\Temp\\t.exe", PathMap.Payload("%TEMP%\\t.exe", sr, cur, prof), "%TEMP%");
+            Eq("D:\\Windows\\System32\\evil.exe", PathMap.Payload("%SystemRoot%\\System32\\evil.exe", sr, cur, ""), "%SystemRoot%");
+            Eq("D:\\Windows\\x.exe", PathMap.Payload("%WINDIR%\\x.exe", sr, cur, ""), "%windir% any case");
+            Eq("D:\\ProgramData\\up\\u.exe", PathMap.Payload("\"%ProgramData%\\up\\u.exe\" -k", sr, cur, ""), "%ProgramData% quoted");
+            Eq("D:\\Program Files (x86)\\V\\t.exe", PathMap.Payload("%ProgramFiles(x86)%\\V\\t.exe", sr, cur, ""), "%ProgramFiles(x86)%");
+            Eq("D:\\Windows\\System32\\drivers\\rk.sys", PathMap.Payload("\\SystemRoot\\System32\\drivers\\rk.sys", sr, cur, ""), "\\SystemRoot\\ prefix");
+            Eq("D:\\Windows\\system32\\drivers\\rk.sys", PathMap.Payload("system32\\drivers\\rk.sys", sr, cur, ""), "relative driver path");
+            Eq("D:\\x\\rk.sys", PathMap.Payload("\\??\\C:\\x\\rk.sys", sr, cur, ""), "\\??\\ prefix");
+            Eq("E:\\tools\\a.exe", PathMap.Payload("E:\\tools\\a.exe", sr, cur, ""), "another volume left alone");
+            Eq("", PathMap.Payload("%APPDATA%\\x\\a.exe", sr, cur, ""), "user variable without a profile: no path");
+            Eq("%FOO%\\a.exe", PathMap.Expand("%FOO%\\a.exe", sr, ""), "unknown variable kept");
+            Eq("C:\\Users\\bob\\a.exe", PathMap.Payload("C:\\Users\\bob\\a.exe", sr, "C:\\Windows", "C:\\Users\\bob"), "live / same letter: unchanged");
+            Eq("D:\\Users\\bob\\a.exe", PathMap.ToCurrent("c:/Users/bob/a.exe".Replace('/', '\\'), sr, cur), "case-insensitive letter");
+            Eq("C:", PathMap.ToCurrent("C:", sr, cur), "bare drive left alone");
+            Eq("", PathMap.Payload(null, sr, cur, prof), "null value");
         }
     }
 }

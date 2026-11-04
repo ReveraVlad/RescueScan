@@ -1880,6 +1880,7 @@ namespace RescueScan
         // ---- payload of a command line / Startup shortcuts ----
         static readonly string[] Launchers = { "rundll32", "regsvr32", "powershell", "pwsh", "cmd", "wscript", "cscript", "mshta", "conhost",
             "python", "pythonw", "py", "node", "java", "javaw", "svchost", "msiexec", "explorer", "dllhost", "taskhostw", "schtasks", "start" };
+        static readonly string[] ThirdPartyLaunchers = { "python", "pythonw", "py", "node", "java", "javaw", "pwsh" };
 
         // The file a command line is ABOUT: the first absolute path that is not a launcher / interpreter
         // ("rundll32.exe C:\x\evil.dll,Start" -> C:\x\evil.dll; "powershell -File C:\a.ps1" -> C:\a.ps1); an unquoted
@@ -1901,7 +1902,10 @@ namespace RescueScan
                 x = x.TrimEnd(';', ')', '\'');
                 string nm = x.Substring(Math.Max(x.LastIndexOf('\\'), x.LastIndexOf('/')) + 1).ToLowerInvariant();
                 if (nm.EndsWith(".exe")) nm = nm.Substring(0, nm.Length - 4);
-                if (Array.IndexOf(Launchers, nm) >= 0) { i = j; continue; }
+                // a launcher is skipped only where it really lives: a "svchost.exe"/"rundll32.exe" outside the Windows
+                // folder is the payload itself (python/node/java/pwsh are installed elsewhere and always skipped)
+                if (Array.IndexOf(Launchers, nm) >= 0 && (Array.IndexOf(ThirdPartyLaunchers, nm) >= 0 || x.ToLowerInvariant().Replace('/', '\\').Contains("\\windows\\")))
+                { i = j; continue; }
                 return x;
             }
             return "";
@@ -2223,6 +2227,65 @@ namespace RescueScan
             using (System.Security.Cryptography.SHA256 h = System.Security.Cryptography.SHA256.Create())
             using (FileStream s = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read))
                 return Reg.Hex(h.ComputeHash(s)).ToLowerInvariant();
+        }
+    }
+
+    // Offline path mapping: the registry of the target stores paths AS THE TARGET SEES THEM (C:\Users\bob\..., %APPDATA%,
+    // %SystemRoot%, \SystemRoot\..., system32\drivers\x.sys), while this session sees the same volume under another letter
+    // (D: in WinPE on BIOS/MBR systems). Used for the Explorer's red "found by the scan" mark and «Кто ссылается».
+    static class PathMap
+    {
+        // Environment variables of the target (in its own letters, from its SystemRoot) plus the per-user ones for the
+        // profile the value came from (curProfile: the profile folder as THIS session sees it, "" = machine value).
+        internal static string Expand(string s, string tgtSysRoot, string curProfile)
+        {
+            if (string.IsNullOrEmpty(s)) return s ?? "";
+            string sr = (tgtSysRoot ?? "").TrimEnd('\\');
+            string sd = sr.Length >= 2 && sr[1] == ':' ? sr.Substring(0, 2) : "";
+            string t = s.Trim();
+            if (t.StartsWith("\\??\\")) t = t.Substring(4);                                         // \??\C:\x.sys
+            if (sr.Length > 0 && t.StartsWith("\\SystemRoot\\", StringComparison.OrdinalIgnoreCase)) t = sr + t.Substring(11);
+            else if (sr.Length > 0 && (t.StartsWith("system32\\", StringComparison.OrdinalIgnoreCase) || t.StartsWith("SysWOW64\\", StringComparison.OrdinalIgnoreCase)))
+                t = sr + "\\" + t;                                                                    // driver ImagePath relative to SystemRoot
+            if (t.IndexOf('%') < 0) return t;
+            Dictionary<string, string> v = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (sr.Length > 0) { v["SystemRoot"] = sr; v["windir"] = sr; }
+            if (sd.Length > 0)
+            {
+                v["SystemDrive"] = sd;
+                v["ProgramFiles"] = sd + "\\Program Files"; v["ProgramW6432"] = sd + "\\Program Files";
+                v["ProgramFiles(x86)"] = sd + "\\Program Files (x86)";
+                v["CommonProgramFiles"] = sd + "\\Program Files\\Common Files"; v["CommonProgramW6432"] = sd + "\\Program Files\\Common Files";
+                v["CommonProgramFiles(x86)"] = sd + "\\Program Files (x86)\\Common Files";
+                v["ProgramData"] = sd + "\\ProgramData"; v["ALLUSERSPROFILE"] = sd + "\\ProgramData";
+                v["PUBLIC"] = sd + "\\Users\\Public";
+            }
+            if (!string.IsNullOrEmpty(curProfile))
+            {
+                string pr = curProfile.TrimEnd('\\');
+                v["USERPROFILE"] = pr; v["APPDATA"] = pr + "\\AppData\\Roaming"; v["LOCALAPPDATA"] = pr + "\\AppData\\Local";
+                v["TEMP"] = pr + "\\AppData\\Local\\Temp"; v["TMP"] = pr + "\\AppData\\Local\\Temp";
+            }
+            return Regex.Replace(t, "%([^%\\\\]+)%", delegate(Match m) { string r; return v.TryGetValue(m.Groups[1].Value, out r) ? r : m.Value; });
+        }
+
+        // A path on the target's system drive (its own letter, e.g. C:) -> the same path under the letter this session
+        // sees (curWinDir's drive, e.g. D:). Other letters are left alone (another volume: not mappable here).
+        internal static string ToCurrent(string path, string tgtSysRoot, string curWinDir)
+        {
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(tgtSysRoot) || string.IsNullOrEmpty(curWinDir)) return path ?? "";
+            if (tgtSysRoot.Length < 2 || curWinDir.Length < 2 || tgtSysRoot[1] != ':' || curWinDir[1] != ':') return path;
+            string from = tgtSysRoot.Substring(0, 2), to = curWinDir.Substring(0, 2);
+            if (path.Length >= 3 && path.StartsWith(from, StringComparison.OrdinalIgnoreCase) && (path[2] == '\\' || path[2] == '/'))
+                return to + path.Substring(2);
+            return path;
+        }
+
+        // The payload file of a registry value, as THIS session sees it ("" = none).
+        internal static string Payload(string value, string tgtSysRoot, string curWinDir, string curProfile)
+        {
+            string p = Heur.PayloadPath(Expand(value, tgtSysRoot, curProfile));
+            return p.Length == 0 ? "" : ToCurrent(p, tgtSysRoot, curWinDir);
         }
     }
 
@@ -2764,6 +2827,8 @@ namespace RescueScan
 "   если сломан шелл), Переименовать, Карантин, Удалить, Снять скрытие (убрать H/S/R), Кто ссылается (из какой автозагрузки стартует файл).\r\n" +
 "   Запустить: .exe/.com — напрямую, БЕЗ ассоциаций (подменённый exefile не сработает с правами админа); .bat/.cmd — через cmd.exe после\r\n" +
 "   предупреждения; всё остальное НЕ выполняется, а открывается как текст в Блокноте. Программа с IFEO-перехватом не запускается.\r\n" +
+"   Красный «найден сканом» и «Кто ссылается» понимают пути цели: C:\\... из её реестра = D:\\... в WinPE, %SystemRoot%, %ProgramFiles%,\r\n" +
+"   %ProgramData%, %APPDATA%/%TEMP% профиля, \\SystemRoot\\... (другие тома не пересчитываются).\r\n" +
 "   Удалить: корни дисков и системные папки (Windows, Program Files, ProgramData, Users…) не удаляются; папка — только после второго\r\n" +
 "   подтверждения; «только чтение» снимается; имена с точкой/пробелом в конце удаляются правильно; ссылки (junction) не обходятся.\r\n" +
 "\r\n" +
@@ -3482,8 +3547,17 @@ namespace RescueScan
             Nav(curPath);
         }
 
-        // the payload file of a command line (not its interpreter: R097/R100), see Heur.PayloadPath
-        static string ExtractPath(string s) { return Heur.PayloadPath(s); }
+        // The payload of a finding's value as THIS session sees the file: the target's env vars (%SystemRoot%, %APPDATA% of
+        // the profile the value came from ...), \SystemRoot\, and its system drive letter mapped to the current one.
+        string TargetPayload(Finding x)
+        {
+            string prof = "";
+            if (x.Location != null)
+                foreach (string[] u in tgtUsers)
+                    if (u[1].Length > 0 && (x.Location.Equals(u[1], StringComparison.OrdinalIgnoreCase) || x.Location.StartsWith(u[1] + "\\", StringComparison.OrdinalIgnoreCase)))
+                    { prof = u[2]; break; }
+            return PathMap.Payload(x.Value, tgtSysRoot, tgtWinDir, prof);
+        }
 
         // ---- Scan ----
         void Scan()
@@ -3620,7 +3694,7 @@ namespace RescueScan
             foreach (Finding x in f)
             {
                 if (x.Kind == 2 && x.DelPath != null) flagged.Add(x.DelPath.ToLowerInvariant());
-                if (x.Risk == "SUSPECT") { string pp = ExtractPath(x.Value); if (pp.Length > 0) flagged.Add(pp.ToLowerInvariant()); }
+                if (x.Risk == "SUSPECT") { string pp = TargetPayload(x); if (pp.Length > 0) flagged.Add(pp.ToLowerInvariant()); }
                 AddRow(x);
             }
             Cursor.Current = Cursors.Default;
@@ -5128,7 +5202,7 @@ namespace RescueScan
                 if (x.Kind == 2 && x.DelPath != null && x.DelPath.ToLowerInvariant() == low) match = true;
                 else
                 {
-                    string vp = ExtractPath(x.Value).ToLowerInvariant();
+                    string vp = TargetPayload(x).ToLowerInvariant();
                     if (vp == low) match = true;
                     else if (x.Value != null && x.Value.ToLowerInvariant().Contains(fname) && fname.Length > 3) match = true;
                 }

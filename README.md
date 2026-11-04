@@ -87,7 +87,8 @@ the running system hijacks them through Image File Execution Options. If
 3. **Диспетчер задач** — processes with full path and risk colour. *Завершить* and
    *Завершить дерево* (see safety guards), *Поверх всех окон*, *Watchdog*.
 4. **Проводник** — shows hidden and system files; red = suspicious or referenced by a
-   SUSPECT finding. *Запустить* (programs only, see below), *Переименовать*, *Карантин*,
+   SUSPECT finding (registry paths are translated to the PE's drive letters, see Known
+   limitations). *Запустить* (programs only, see below), *Переименовать*, *Карантин*,
    *Удалить*, *Снять скрытие* (clears H/S/R), *Кто ссылается* (which autostart entry
    points at this file).
 5. **Карантин** — lists a quarantine folder (*Найти последний* searches all drives) and
@@ -246,8 +247,11 @@ escaping, and more.
   implant is out of scope — reflash the firmware.
 - Offline account changes (SAM editing) are not implemented; use chntpw / MS DaRT.
 - Heuristics are heuristics: REVIEW rows need a human; a careful attacker can look clean.
-- Path mapping between the target's drive letter (as stored in its registry) and the PE's
-  drive letter is limited to the target's own system volume.
+- Paths in the target's registry are mapped to this session's view (its `%SystemRoot%`,
+  `%ProgramFiles%`, `%ProgramData%`, `%APPDATA%`/`%TEMP%` of the profile the value came
+  from, `\SystemRoot\`, and its system drive letter → the PE's letter) for the Explorer's
+  red mark and *Кто ссылается*. Other volumes are not remapped (no `MountedDevices`
+  lookup); `%ProgramFiles%` etc. assume the default folder names.
 - The watchdog does not survive `taskkill /im` (see above); the log lives in `%TEMP%`.
 - No kernel driver: rootkits that hide from user‑mode APIs are not found.
 
