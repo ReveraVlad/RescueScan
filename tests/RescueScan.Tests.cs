@@ -53,6 +53,7 @@ namespace RescueScan.Tests
                 Run("Live mode: ProfileImagePath -> folders on the TARGET volume only", ProfileDirs);
                 Run("Detect: WinPE hidden only on X: with MiniNT; live OS labelled", TargetList);
                 Run("WOW64: System32 of the running OS via Sysnative", FsPaths);
+                Run("Quarantine: registry backups tagged with their installation / profile", HiveTags);
                 Run("Live mode: SamePath / WinTarget labels", LiveHelpers);
                 Run("Mounts: RS_* names", MountNames);
                 Run("Mounts: mount / missing file / file in use / unload all", MountBasic);
@@ -708,6 +709,28 @@ namespace RescueScan.Tests
             files.Add("E:\\WINNT\\System32\\config\\SYSTEM");
             Eq("E:\\WINNT (живая — эта ОС) | C:\\Windows (офлайн) | D:\\Windows (офлайн) | X:\\Windows (офлайн)", JoinT(MainForm.ListTargets("E:\\WINNT", false, fe)),
                "running OS in a non-standard folder is listed too");
+        }
+
+        // Quarantine: a registry backup is tagged with the installation / profile its hive belongs to; restore imports it
+        // only when the key's root is a hive of the prepared target with the same tag.
+        static void HiveTags()
+        {
+            List<string[]> users = new List<string[]> {
+                new string[] { "Ivan", "HKLM\\RS_U0", "D:\\Users\\Ivan" },
+                new string[] { "Petr", "", "D:\\Users\\Petr" },
+                new string[] { "Live", "HKU\\S-1-5-21-1-2-3-1001", "C:\\Users\\Live" } };
+            Eq("SOFTWARE D:\\Windows", MainForm.HiveTag("HKLM\\RS_SOFT\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "SOFTWARE");
+            Eq("SOFTWARE D:\\Windows", MainForm.HiveTag("hklm\\rs_soft", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "the root itself, any case");
+            Eq("SYSTEM D:\\Windows", MainForm.HiveTag("HKLM\\RS_SYS\\ControlSet001\\Services\\evil", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "SYSTEM");
+            Eq("профиль D:\\Users\\Ivan", MainForm.HiveTag("HKLM\\RS_U0\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "user hive");
+            Eq("", MainForm.HiveTag("HKLM\\RS_U1\\Software", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "a mount name not in use now");
+            Eq("", MainForm.HiveTag("HKLM\\RS_SOFTX\\a", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "prefix of another name");
+            Eq("", MainForm.HiveTag("HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users),
+               "a LIVE backup while the target is offline (WinPE's own SOFTWARE): refused");
+            Eq("", MainForm.HiveTag("HKLM\\RS_SOFT\\x", "", "HKLM\\RS_SYS", "D:\\Windows", users), "SOFTWARE not mounted");
+            Eq("SOFTWARE C:\\Windows", MainForm.HiveTag("HKLM\\SOFTWARE\\Microsoft", "HKLM\\SOFTWARE", "HKLM\\SYSTEM", "C:\\Windows", users), "live SOFTWARE");
+            Eq("профиль C:\\Users\\Live", MainForm.HiveTag("HKU\\S-1-5-21-1-2-3-1001\\Software\\x", "HKLM\\SOFTWARE", "HKLM\\SYSTEM", "C:\\Windows", users), "live logged-on user");
+            Eq("", MainForm.HiveTag("", "HKLM\\RS_SOFT", "HKLM\\RS_SYS", "D:\\Windows", users), "empty key");
         }
 
         static string JoinT(List<WinTarget> l)

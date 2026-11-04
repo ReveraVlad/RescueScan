@@ -1067,7 +1067,7 @@ namespace RescueScan
             lblQuar = new Label(); lblQuar.Left = 396; lblQuar.Top = 11; lblQuar.Width = 640; lblQuar.Text = "Папка карантина не выбрана.";
             qbar.Controls.Add(qfind); qbar.Controls.Add(qbrowse); qbar.Controls.Add(qrestore); qbar.Controls.Add(lblQuar);
             lvQuar = new ListView(); lvQuar.Dock = DockStyle.Fill; lvQuar.View = View.Details; lvQuar.CheckBoxes = true; lvQuar.FullRowSelect = true; lvQuar.GridLines = true;
-            lvQuar.Columns.Add("Тип", 70); lvQuar.Columns.Add("Оригинал / ключ", 560); lvQuar.Columns.Add("Бэкап", 340);
+            lvQuar.Columns.Add("Тип", 70); lvQuar.Columns.Add("Оригинал / ключ", 470); lvQuar.Columns.Add("Бэкап", 280); lvQuar.Columns.Add("Цель (куст)", 200);
             tpQ.Controls.Add(lvQuar); tpQ.Controls.Add(qbar);
             qfind.Click += delegate { QuarAutoFind(); };
             qbrowse.Click += delegate { QuarBrowse(); };
@@ -2292,7 +2292,7 @@ namespace RescueScan
                 string dst = Path.Combine(quarDir, "reg_" + safe + ".reg");
                 string err;
                 if (!Reg.Export(key, dst, out err)) { QLog("REG-FAIL\t" + key + "\treg export failed: " + err); NoteQuarErr(err); return false; }   // no backup -> no delete
-                QLog("REG\t" + key + "\t=>\t" + dst);
+                QLog("REG\t" + key + "\t=>\t" + dst + "\t" + HiveTag(key));   // which installation / profile: checked on restore
                 return true;
             }
             catch (Exception ex) { QLog("REG-FAIL\t" + key + "\t" + ex.Message); NoteQuarErr(ex.Message); return false; }
@@ -2376,8 +2376,9 @@ namespace RescueScan
                 if (p.Length < 4) continue;
                 if (p[0] != "FILE" && p[0] != "REG") continue;   // пропускаем *-FAIL
                 string type = p[0]; string orig = p[1]; string backup = p[3];
-                ListViewItem it = new ListViewItem(new string[] { type, orig, backup });
-                it.Tag = new string[] { type, orig, backup };
+                string tag = type == "REG" && p.Length >= 5 && p[4].Length > 0 ? p[4] : null;   // null: older manifest
+                ListViewItem it = new ListViewItem(new string[] { type, orig, backup, type == "REG" ? (tag ?? "(не указана)") : "" });
+                it.Tag = new string[] { type, orig, backup, tag };
                 if (!File.Exists(backup)) it.ForeColor = Color.Gray;   // бэкап уже убран
                 lvQuar.Items.Add(it); cnt++;
             }
@@ -2393,6 +2394,25 @@ namespace RescueScan
             int ok = 0, fail = 0;
             string why = "";
             List<ListViewItem> done = new List<ListViewItem>();
+            // A .reg backup names HKEY_LOCAL_MACHINE\RS_SOFT / RS_SYS / RS_U<n> (offline) or HKLM\SOFTWARE / HKU\<SID> (live):
+            // whatever is mounted there NOW gets the import. Import only into the same installation / profile as at backup
+            // time; a branch whose root is not a hive of the prepared target is refused (in WinPE, HKLM\SOFTWARE is WinPE's
+            // own); a different or unknown (older manifest) installation needs an explicit yes.
+            bool anyReg = false;
+            foreach (ListViewItem it in lvQuar.Items) if (it.Checked && ((string[])it.Tag)[0] == "REG") anyReg = true;
+            if (anyReg) EnsureTarget();
+            StringBuilder ask = new StringBuilder(); int asks = 0;
+            foreach (ListViewItem it in lvQuar.Items)
+            {
+                string[] e = (string[])it.Tag;
+                if (!it.Checked || e[0] != "REG") continue;
+                string now = HiveTag(e[1]);
+                if (now.Length == 0 || (e[3] != null && string.Equals(e[3], now, StringComparison.OrdinalIgnoreCase))) continue;
+                if (asks++ < 5) ask.Append("\r\n  • " + (e[3] ?? "(старый карантин: цель не записана)") + "  ->  сейчас: " + now);
+            }
+            bool other = asks == 0 || MessageBox.Show("Ветки реестра (" + asks + ") были сохранены для ДРУГОЙ установки / профиля или без отметки цели:" + ask +
+                "\r\n\r\nИмпортировать их в текущую цель «" + TargetName() + "»? Если это не та же система, изменения попадут не туда.",
+                "Восстановление", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
             foreach (ListViewItem it in lvQuar.Items)
             {
                 if (!it.Checked) continue;
@@ -2412,8 +2432,17 @@ namespace RescueScan
                     }
                     else if (e[0] == "REG")
                     {
-                        string o; r = Reg.RunCode("import " + Reg.QuoteArg(e[2]), out o) == 0;
-                        if (!r && why.Length == 0) why = Reg.OneLine(o, 220);
+                        string now = HiveTag(e[1]);
+                        if (now.Length == 0)
+                        {
+                            if (why.Length == 0) why = e[1] + " не относится к кустам текущей цели (" + TargetName() + "): выбери ту установку и нажми «Сканировать»";
+                        }
+                        else if (other || (e[3] != null && string.Equals(e[3], now, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            string o; r = Reg.RunCode("import " + Reg.QuoteArg(e[2]), out o) == 0;
+                            if (!r && why.Length == 0) why = Reg.OneLine(o, 220);
+                        }
+                        else if (why.Length == 0) why = "ветка от другой цели (" + (e[3] ?? "не указана") + ") — пропущена";
                     }
                 }
                 catch (Exception ex) { r = false; if (why.Length == 0) why = Reg.OneLine(ex.Message, 220); }
@@ -2480,6 +2509,24 @@ namespace RescueScan
             }
             if (lastFindings.Count == 0) lblStatus.Text = "Нажми «Сканировать».";
         }
+
+        // Which hive of the prepared target a key is in, as a readable tag for the quarantine manifest: "SOFTWARE D:\Windows",
+        // "SYSTEM D:\Windows", "профиль D:\Users\Ivan"; "" = none of them (e.g. HKLM\SOFTWARE while the target is offline).
+        internal static string HiveTag(string key, string soft, string sys, string winDir, List<string[]> users)
+        {
+            if (string.IsNullOrEmpty(key)) return "";
+            if (Under(key, soft)) return "SOFTWARE " + winDir;
+            if (Under(key, sys)) return "SYSTEM " + winDir;
+            foreach (string[] u in users) if (Under(key, u[1])) return "профиль " + u[2];
+            return "";
+        }
+
+        static bool Under(string key, string root)
+        {
+            return !string.IsNullOrEmpty(root) && (key.Equals(root, StringComparison.OrdinalIgnoreCase) || key.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase));
+        }
+
+        string HiveTag(string key) { return tgtReady ? HiveTag(key, tgtSoft, tgtSys, tgtWinDir, tgtUsers) : ""; }
 
         // SOFTWARE root of the target the scan used. "" = not available: actions refuse (RequireSoft) instead of
         // silently falling back to the live HKLM\SOFTWARE of the machine that runs the tool.
